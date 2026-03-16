@@ -2,7 +2,7 @@
 # /usr/local/bin/sdr_monitor.sh
 
 LOG_FILE="/var/log/sdr_monitor.log"
-SCRIPT_PATH="/home/ueeg/pythonreadersinglechannel.py"
+SCRIPT_PATH="/home/ueeg/sdr_reader_gcs_write.py"
 CREDENTIALS_FILE="/home/ueeg/ueegproject-aea2731f9c3a.json"
 VENV_PATH="/home/ueeg/sdr_venv"
 STATUS_FILE="/tmp/sdr_monitor_status.json"
