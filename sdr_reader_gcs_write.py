@@ -1,0 +1,1886 @@
+import threading
+import queue
+import time
+import json
+from collections import deque, Counter
+from dataclasses import dataclass
+import os
+import numpy as np
+try:
+    from bladerf import _bladerf
+except Exception:
+    _bladerf = None
+from scipy import signal
+from scipy.io import loadmat
+import matplotlib.pyplot as plt
+
+try:
+    import somata as _somata
+except Exception:
+    _somata = None
+
+
+@dataclass
+class DecodedPacket:
+    packet_num: int
+    is_valid: bool
+    bits: np.ndarray
+
+# Set Google Cloud credentials (required for GCS access)
+# Path is relative to this script's directory
+CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), 'ueegproject-aea2731f9c3a.json')
+if os.path.exists(CREDENTIALS_FILE):
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_FILE
+    print(f"✓ GCS credentials loaded from: {CREDENTIALS_FILE}")
+else:
+    print(f"⚠️  GCS credentials file not found: {CREDENTIALS_FILE}")
+    print("   GCS functionality will be disabled unless credentials are set via gcloud auth")
+
+class TimeStampBasedReader:
+    def __init__(
+        self,
+        sample_rate=8e6,
+        frequency=914.5e6,
+        gain=25,
+        gain_mode='manual',
+        counter=False,
+        raw=False,
+        device=1,
+        bandwidth=5e6,
+        gcs_bucket=None,
+        gcs_blob_name=None,
+        gcs_buffer_size=400,
+        gcs_channels=(1, 2, 3, 4),
+        gcs_format='binary',
+        enable_gcs_trigger=False,
+        gcs_trigger_topic_id='sdr-commands',
+        gcs_trigger_subscription_id='sdr-commands-pi-sub',
+        gcs_trigger_pull_timeout=.5,
+        enable_plotting=True,
+        enable_gcs=False,
+        enable_bandpass_filter=True,
+        enable_window_stats=False,
+        buffer_size=65536,
+        frame_length=250,
+        accepted_frame_lengths=None,
+        bits_per_channel=40,
+        channel_to_decode=3,
+        mismatch_threshold=0.001,
+        decode_scale=1/256/10/2,#0.03 / 256 * 2,
+        decoded_group_maxlen=5000,
+    ):
+        self.sample_rate = int(sample_rate)
+        self.frequency = int(frequency)
+        self.gain = gain
+        self.gain_mode = gain_mode
+        self.is_counter = bool(counter)
+        self.is_raw = bool(raw)
+        self.device_num = int(device)
+        self.bandwidth = int(bandwidth)
+        self.buffer_size = int(buffer_size)
+
+        self.enable_plotting = bool(enable_plotting)
+        self.enable_gcs = bool(enable_gcs)
+        self.enable_bandpass_filter = bool(enable_bandpass_filter)
+        self.enable_window_stats = bool(enable_window_stats)
+
+        self.gcs_bucket = gcs_bucket
+        self.gcs_blob_name = gcs_blob_name
+        self.gcs_buffer_size = gcs_buffer_size
+        self.gcs_channels = tuple(sorted(set(int(ch) for ch in gcs_channels if 1 <= int(ch) <= 4)))
+        if len(self.gcs_channels) == 0:
+            self.gcs_channels = (1, 2, 3, 4)
+        self.gcs_format = 'binary'
+        self.enable_gcs_trigger = bool(enable_gcs_trigger)
+        self.gcs_trigger_topic_id = gcs_trigger_topic_id
+        self.gcs_trigger_subscription_id = gcs_trigger_subscription_id
+        self.gcs_trigger_pull_timeout = gcs_trigger_pull_timeout
+
+        self.gcs_client = None
+        self.gcs_bucket_obj = None
+        self.gcs_subscriber = None
+        self.gcs_recording_active = False
+        self.gcs_write_buffer = []  # list of (values_row_f32, quality_packed_u16)
+        self.gcs_chunk_counter = 0
+        self.gcs_session_id = None
+        self.gcs_trigger_thread = None
+        self._gcs_trigger_duration = None
+        self._gcs_recording_start_time = None
+        self._gcs_buffer_lock = threading.RLock()
+        self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
+        self.gcs_samples_written = 0
+        # Per-channel last-good value for NaN carry-forward (shape (4,) per channel)
+        self._gcs_last_good_values = {ch: np.full(4, np.nan, dtype=np.float32) for ch in range(1, 5)}
+
+        self.frame_length = int(frame_length)
+        if accepted_frame_lengths is None:
+            accepted_frame_lengths = (self.frame_length,)
+        self.accepted_frame_lengths = tuple(sorted(set(int(v) for v in accepted_frame_lengths)))
+        if len(self.accepted_frame_lengths) == 0:
+            raise ValueError('accepted_frame_lengths must contain at least one value')
+        self.bits_per_channel = int(bits_per_channel)
+        self.channel_to_decode = int(channel_to_decode)
+        self.mismatch_threshold = float(mismatch_threshold)
+        self.decode_scale = float(decode_scale)
+
+        if self.channel_to_decode < 1 or self.channel_to_decode > 4:
+            raise ValueError('channel_to_decode must be 1..4')
+
+        self.running = False
+        self._rx_running = False
+        self._sdr_restart_requested = threading.Event()
+        self._sdr_restart_log = []  # list of {sample_idx, timestamp_utc, drop_rate, reason}
+        self._rx_thread_ref = None
+        self.sdr_watchdog_window_seconds = 60
+        self.sdr_restart_drop_threshold = 0.30
+        self.device = None
+        self.channel = None
+        self.channel2 = None
+
+        self.data_queue = queue.Queue(maxsize=64)
+        self.decoded_group_maxlen = int(decoded_group_maxlen)
+        self.decoded_groups_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
+        self.decoded_quality_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
+        self.decoded_sample_count_by_channel = {ch: 0 for ch in range(1, 5)}
+        self.mismatch_events_by_channel = {
+            ch: deque(maxlen=2000) for ch in range(1, 5)
+        }
+        self.bit_mismatch_events_by_channel = {
+            ch: deque(maxlen=2000) for ch in range(1, 5)
+        }
+        self.only_side_cause_counts_by_channel = {
+            ch: Counter() for ch in range(1, 5)
+        }
+        self.only_side_missing_packetnum_by_channel = {
+            ch: {
+                'for_only_v1': np.zeros(8, dtype=np.int64),
+                'for_only_v2': np.zeros(8, dtype=np.int64),
+            }
+            for ch in range(1, 5)
+        }
+        self.resync_drops_by_channel = {ch: 0 for ch in range(1, 5)}
+        self.packet_sequence_events = deque(maxlen=2000)
+        self.packet_sequence_anomaly_count = 0
+        self.packet_sequence_header_drops = 0
+        self.prefix_overlap_frames_skipped = 0
+        self.placeholder_inserts_cross_chunk = 0
+        self.placeholder_inserts_intra_chunk = 0
+        self.placeholder_inserts_group_builder = 0
+        self.gap_estimate_agree_count = 0
+        self.gap_estimate_disagree_count = 0
+        self.decoded_groups = self.decoded_groups_by_channel[self.channel_to_decode]
+        self.decoded_quality = self.decoded_quality_by_channel[self.channel_to_decode]
+
+        self._decode_buffer = np.array([], dtype=np.uint16)
+        self._pending_packets_by_channel = {ch: [] for ch in range(1, 5)}
+        self._synced_to_packet0_by_channel = {ch: False for ch in range(1, 5)}
+        self._last_extracted_packet_num = None  # persists across chunk calls for cross-chunk gap detection
+        self._last_extracted_frame_abs_word_start = None  # absolute word start of last extracted valid frame
+        self._extract_lookback_words = np.array([], dtype=np.uint16)  # preserves 2-word context for -2 bit alignment
+        self._words_processed_total = 0       # absolute word offset for timestamps
+        self._raw_frame_log = []              # list of (abs_word_idx, packet_num, frame_length, passed_valid)
+
+        self.capture_start_time = None
+        self.samples_captured = 0
+
+        self.output_rate_hz = 200
+        self._init_filter()
+
+        if self.enable_gcs and str(gcs_format).lower() != 'binary':
+            print(f"⚠️  gcs_format='{gcs_format}' is not supported in this reader. Forcing 'binary'.")
+        if self.enable_gcs and not self.enable_gcs_trigger:
+            self.enable_gcs_trigger = True
+            print('⚠️  Trigger-only mode enabled for GCS. Recording will start only after a trigger message.')
+        if self.is_raw:
+            print('⚠️  raw=True is not supported in this timestamp-based decoder; treating stream as packet mode.')
+
+    def _init_gcs_clients(self):
+        if not self.enable_gcs:
+            return
+        if not self.gcs_bucket or not self.gcs_blob_name:
+            raise ValueError('enable_gcs=True requires gcs_bucket and gcs_blob_name.')
+        try:
+            from google.cloud import storage, pubsub_v1
+        except Exception as exc:
+            raise ImportError(f'Google Cloud packages not available: {exc}')
+
+        if self.gcs_client is None:
+            self.gcs_client = storage.Client()
+            self.gcs_bucket_obj = self.gcs_client.bucket(self.gcs_bucket)
+
+        if self.enable_gcs_trigger:
+            if not self.gcs_trigger_subscription_id:
+                raise ValueError('enable_gcs_trigger=True requires gcs_trigger_subscription_id.')
+            if self.gcs_subscriber is None:
+                self.gcs_subscriber = pubsub_v1.SubscriberClient()
+
+    def _start_gcs_recording(self):
+        with self._gcs_buffer_lock:
+            self.gcs_recording_active = True
+            self.gcs_write_buffer = []
+            self.gcs_chunk_counter = 0
+            self.gcs_session_id = time.strftime('%Y%m%d_%H%M%S')
+            self.gcs_samples_written = 0
+            self._gcs_recording_start_time = time.time()
+            self._gcs_last_good_values = {ch: np.full(4, np.nan, dtype=np.float32) for ch in range(1, 5)}
+        # Update blob/temp names from trigger message if blob was updated
+        self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
+        print(f'GCS recording started (session={self.gcs_session_id}, blob={self.gcs_blob_name}).')
+
+    def _stop_gcs_recording(self):
+        with self._gcs_buffer_lock:
+            was_active = bool(self.gcs_recording_active)
+            self.gcs_recording_active = False
+            self._gcs_recording_start_time = None
+        if was_active:
+            try:
+                self._flush_gcs_buffer(force=True)
+            except Exception as exc:
+                print(f'GCS flush error during stop: {exc}')
+            print('GCS recording stopped.')
+
+    def _handle_gcs_trigger_message(self, payload: str):
+        text = (payload or '').strip()
+        # Default: treat plain text as a command word
+        command = text.lower()
+        msg = {}
+        try:
+            msg = json.loads(text)
+            # Support both "command" and "action" keys
+            command = str(msg.get('command', msg.get('action', command))).lower()
+        except Exception:
+            pass
+
+        # Optionally update blob name and session duration from message
+        if 'blob' in msg and msg['blob']:
+            self.gcs_blob_name = str(msg['blob'])
+            print(f'GCS blob name updated to: {self.gcs_blob_name}')
+        if 'duration_seconds' in msg:
+            try:
+                self._gcs_trigger_duration = float(msg['duration_seconds'])
+                print(f'GCS trigger duration set to: {self._gcs_trigger_duration}s')
+            except Exception:
+                pass
+
+        if command in ('start', 'record', 'resume'):
+            if not self.gcs_recording_active:
+                self._start_gcs_recording()
+        elif command in ('stop', 'pause', 'end'):
+            self._stop_gcs_recording()
+
+    def _poll_gcs_triggers(self):
+        if not self.enable_gcs or not self.enable_gcs_trigger or self.gcs_subscriber is None:
+            return
+        subscription_path = self.gcs_subscriber.subscription_path(
+            self.gcs_client.project,
+            self.gcs_trigger_subscription_id,
+        )
+        print(f'GCS trigger poller started (subscription={subscription_path})')
+        while self.running:
+            try:
+                response = self.gcs_subscriber.pull(
+                    request={
+                        'subscription': subscription_path,
+                        'max_messages': 10,
+                    },
+                    timeout=float(self.gcs_trigger_pull_timeout),
+                )
+                ack_ids = []
+                for received in response.received_messages:
+                    ack_ids.append(received.ack_id)
+                    data = received.message.data.decode('utf-8', errors='ignore')
+                    print(f'GCS trigger message received: {data!r}')
+                    self._handle_gcs_trigger_message(data)
+                if ack_ids:
+                    self.gcs_subscriber.acknowledge(request={'subscription': subscription_path, 'ack_ids': ack_ids})
+            except Exception as exc:
+                print(f'GCS trigger poll error: {exc}')
+                time.sleep(0.5)
+
+            # Duration check: auto-stop if recording has run past the requested duration
+            if (
+                self.gcs_recording_active
+                and self._gcs_trigger_duration is not None
+                and self._gcs_recording_start_time is not None
+                and (time.time() - self._gcs_recording_start_time) >= self._gcs_trigger_duration
+            ):
+                elapsed = time.time() - self._gcs_recording_start_time
+                print(
+                    f'GCS recording duration ({self._gcs_trigger_duration}s) elapsed '
+                    f'(actual={elapsed:.1f}s) — stopping recording.'
+                )
+                self._stop_gcs_recording()
+
+    def _append_gcs_group(self, group_values: dict, group_quality: dict):
+        """Append one decoded group (4 time slots) as 4 rows to the GCS write buffer.
+        Each row stores selected channel values plus one packed quality field.
+        Quality codes use 4 bits per channel packed into a uint16 in gcs_channels order.
+        Carry-forward fills NaN values slot-by-slot per channel from last known good value.
+        """
+        if not self.enable_gcs:
+            return
+        rows_to_add = []
+        for s in range(4):
+            vals_row = []
+            packed_quality = np.uint16(0)
+            for ch_idx, ch in enumerate(self.gcs_channels):
+                v = float(group_values[ch][s]) if ch in group_values else np.nan
+                q = int(group_quality[ch][s]) if ch in group_quality else 0
+                last = self._gcs_last_good_values[ch]
+                if np.isnan(v):
+                    v = float(last[s])  # carry-forward (may still be NaN at very start)
+                else:
+                    last[s] = np.float32(v)  # update carry-forward
+                vals_row.append(np.float32(v if not np.isnan(v) else 0.0))
+                packed_quality = np.uint16(packed_quality | ((q & 0xF) << (4 * ch_idx)))
+            rows_to_add.append((np.asarray(vals_row, dtype=np.float32), packed_quality))
+
+        should_flush = False
+        with self._gcs_buffer_lock:
+            if not self.gcs_recording_active:
+                return
+            self.gcs_write_buffer.extend(rows_to_add)
+            if len(self.gcs_write_buffer) >= int(self.gcs_buffer_size):
+                should_flush = True
+        if should_flush:
+            self._flush_gcs_buffer(force=False)
+
+    def _flush_gcs_buffer(self, force=False):
+        if not self.enable_gcs or self.gcs_bucket_obj is None:
+            return
+        if not self.gcs_blob_name or not self.gcs_temp_name:
+            return
+
+        with self._gcs_buffer_lock:
+            if len(self.gcs_write_buffer) == 0:
+                return
+            if not force and len(self.gcs_write_buffer) < int(self.gcs_buffer_size):
+                return
+            buffer_snapshot = list(self.gcs_write_buffer)
+            self.gcs_write_buffer = []
+
+        # --- START OF NEW, EFFICIENT LOGIC ---
+        
+        # 1. Create the new data chunk as a NumPy array
+        n_channels = len(self.gcs_channels)
+        row_dtype = np.dtype([
+            ('values', np.float32, (n_channels,)),
+            ('quality_packed', np.uint16),
+        ])
+        new_data_chunk = np.empty(len(buffer_snapshot), dtype=row_dtype)
+        for i, (vals_row, packed_quality) in enumerate(buffer_snapshot):
+            new_data_chunk['values'][i] = vals_row
+            new_data_chunk['quality_packed'][i] = packed_quality
+
+        # 2. Convert the NumPy chunk to raw bytes
+        new_bytes = new_data_chunk.tobytes()
+
+        # 3. Upload the new raw byte chunk to a temporary, unique blob
+        # Using a unique name for the temp blob prevents race conditions
+        temp_blob_name = f"{self.gcs_blob_name}.temp.{self.gcs_session_id}.{self.gcs_chunk_counter}"
+        temp_blob = self.gcs_bucket_obj.blob(temp_blob_name)
+        temp_blob.upload_from_string(new_bytes, content_type='application/octet-stream')
+        
+        # 4. Use GCS Compose to append the new chunk to the main blob
+        main_blob = self.gcs_bucket_obj.blob(self.gcs_blob_name)
+        
+        try:
+            # Check if the main blob exists to decide whether to compose or rename
+            # This is a lightweight metadata call
+            if main_blob.exists():
+                # Append temp_blob to the end of main_blob
+                main_blob.compose([main_blob, temp_blob])
+            else:
+                # If it's the first chunk, just rename the temp blob to become the main blob
+                self.gcs_bucket_obj.rename_blob(temp_blob, new_name=self.gcs_blob_name)
+                # Re-fetch the blob object after renaming
+                main_blob = self.gcs_bucket_obj.blob(self.gcs_blob_name)
+
+            # 5. Clean up the temporary chunk blob
+            temp_blob.delete()
+
+        except Exception as exc:
+            print(f'GCS compose/append error: {exc}')
+            # Clean up temp blob on failure too
+            try:
+                if temp_blob.exists(): temp_blob.delete()
+            except Exception: pass
+            with self._gcs_buffer_lock:
+                self.gcs_write_buffer = buffer_snapshot + self.gcs_write_buffer
+            return
+            
+        # --- END OF NEW, EFFICIENT LOGIC ---
+
+        n_samples = len(new_data_chunk)
+        self.gcs_samples_written += n_samples
+        self.gcs_chunk_counter += 1
+        self._write_gcs_metadata() # This MUST be called after updating samples_written
+        
+        print(
+            f"GCS append: gs://{self.gcs_bucket}/{self.gcs_blob_name} "
+            f"(+{n_samples} samples, total={self.gcs_samples_written})"
+        )
+
+    def _write_gcs_metadata(self):
+        """Write/update metadata describing the current GCS binary layout."""
+        if not self.enable_gcs or self.gcs_bucket_obj is None or not self.gcs_blob_name:
+            return
+
+        try:
+            meta_blob_name = f"{self.gcs_blob_name}.meta"
+            meta_blob = self.gcs_bucket_obj.blob(meta_blob_name)
+
+            channel_names = [f"ch{ch}" for ch in self.gcs_channels]
+            quality_nibble_map = {
+                f"bits_{4 * idx}_{4 * idx + 3}": f"quality code for ch{ch}"
+                for idx, ch in enumerate(self.gcs_channels)
+            }
+
+            metadata = {
+                'format': 'numpy_binary_structured',
+                'sample_rate_hz': int(self.output_rate_hz),
+                'gcs_channels': list(self.gcs_channels),
+                'channel_names': channel_names,
+                'row_description': 'Each row is one decoded sample time-step across selected channels.',
+                'dtype': {
+                    'values': f"float32[{len(self.gcs_channels)}]",
+                    'quality_packed': 'uint16',
+                },
+                'fields': ['values', 'quality_packed'],
+                'values_field_order': channel_names,
+                'quality_packed_format': {
+                    'bits_per_channel': 4,
+                    'packing_order': channel_names,
+                    'quality_code_map': {
+                        '0': 'no_packet',
+                        '1': 'only_v1',
+                        '2': 'only_v2',
+                        '3': 'both_match',
+                        '5': 'mismatch_picked_v1',
+                        '6': 'mismatch_picked_v2',
+                    },
+                    'bit_layout': quality_nibble_map,
+                },
+                'nan_fill_policy': 'carry_forward_per_channel_per_slot; leading NaN values are written as 0.0 until first valid sample',
+                'gcs_samples_written': int(self.gcs_samples_written),
+                'gcs_chunk_counter': int(self.gcs_chunk_counter),
+                'session_id': self.gcs_session_id,
+                'blob_name': self.gcs_blob_name,
+                'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'sdr_restart_log': list(self._sdr_restart_log),
+                'notes': 'Load with numpy.load(). Structured array field `values` contains channel amplitudes; `quality_packed` stores one 4-bit quality code per selected channel.',
+            }
+
+            meta_blob.upload_from_string(json.dumps(metadata, indent=2), content_type='application/json')
+        except Exception as exc:
+            print(f'Error writing GCS metadata: {exc}')
+
+    def _setup_gcs(self):
+        if not self.enable_gcs:
+            return False
+        if self.gcs_client is not None and self.gcs_bucket_obj is not None:
+            return True
+        if not self.gcs_bucket:
+            print('⚠️  enable_gcs=True but gcs_bucket is not set.')
+            return False
+        try:
+            from google.cloud import storage
+            self.gcs_client = storage.Client()
+            self.gcs_bucket_obj = self.gcs_client.bucket(self.gcs_bucket)
+        except Exception as exc:
+            print(f'⚠️  Could not initialize GCS storage client: {exc}')
+            return False
+
+        if self.enable_gcs_trigger and self.gcs_subscriber is None:
+            try:
+                from google.cloud import pubsub_v1
+                self.gcs_subscriber = pubsub_v1.SubscriberClient()
+            except Exception as exc:
+                print(f'⚠️  Could not initialize Pub/Sub subscriber client: {exc}')
+                self.gcs_subscriber = None
+        return True
+
+    def _poll_gcs_trigger(self):
+        """Single-shot poll used outside the trigger thread (e.g. before an upload)."""
+        if not self.enable_gcs_trigger or self.gcs_subscriber is None or not self.gcs_trigger_subscription_id:
+            return
+        subscription_path = self.gcs_subscriber.subscription_path(
+            self.gcs_client.project,
+            self.gcs_trigger_subscription_id,
+        )
+        try:
+            response = self.gcs_subscriber.pull(
+                request={
+                    'subscription': subscription_path,
+                    'max_messages': 10,
+                },
+                timeout=float(self.gcs_trigger_pull_timeout),
+            )
+        except Exception as exc:
+            print(f'GCS trigger single-poll error: {exc}')
+            return
+
+        ack_ids = []
+        for msg in response.received_messages:
+            ack_ids.append(msg.ack_id)
+            try:
+                payload = msg.message.data.decode('utf-8') if msg.message.data else '{}'
+                print(f'GCS trigger message received: {payload!r}')
+                self._handle_gcs_trigger_message(payload)
+            except Exception as exc:
+                print(f'GCS trigger message parse error: {exc}')
+        if ack_ids:
+            try:
+                self.gcs_subscriber.acknowledge(
+                    request={
+                        'subscription': subscription_path,
+                        'ack_ids': ack_ids,
+                    }
+                )
+            except Exception as exc:
+                print(f'GCS trigger ack error: {exc}')
+
+    def _upload_series_to_gcs_binary(self, series: np.ndarray, quality_series: np.ndarray = None):
+        if not self.enable_gcs:
+            return
+        if not self._setup_gcs():
+            return
+        if self.enable_gcs_trigger:
+            self._poll_gcs_trigger()
+        if not self.gcs_recording_active:
+            print('GCS trigger is enabled and recording is not active; skipping upload.')
+            return
+        if series is None or len(series) == 0:
+            print('No decoded samples available for GCS upload.')
+            return
+
+        base_name = self.gcs_blob_name or f'decoded_ch{self.channel_to_decode}_{int(time.time())}'
+        series_blob_name = base_name if base_name.endswith('.bin') else f'{base_name}.bin'
+
+        try:
+            series_blob = self.gcs_bucket_obj.blob(series_blob_name)
+            series_blob.upload_from_string(np.asarray(series, dtype=np.float32).tobytes(), content_type='application/octet-stream')
+            print(f'Uploaded decoded binary to gs://{self.gcs_bucket}/{series_blob_name}')
+
+            if quality_series is not None and len(quality_series) == len(series):
+                q_blob_name = series_blob_name + '.quality.i8.bin'
+                q_blob = self.gcs_bucket_obj.blob(q_blob_name)
+                q_blob.upload_from_string(np.asarray(quality_series, dtype=np.int8).tobytes(), content_type='application/octet-stream')
+                print(f'Uploaded quality flags to gs://{self.gcs_bucket}/{q_blob_name}')
+        except Exception as exc:
+            print(f'⚠️  GCS upload failed: {exc}')
+
+    def _init_filter(self):
+        fs = self.output_rate_hz
+        nyquist = fs / 2.0
+        low = 1.0 / nyquist
+        high = 40.0 / nyquist
+        self.b_bandpass, self.a_bandpass = signal.butter(4, [low, high], btype='band')
+        zi = signal.lfilter_zi(self.b_bandpass, self.a_bandpass) * 0
+        self.filter_zi = [zi.copy(), zi.copy(), zi.copy(), zi.copy()]
+
+    def _recent_drop_rate(self):
+        """Fraction of samples in the last watchdog window that have quality 0 (no packet)."""
+        window = int(self.sdr_watchdog_window_seconds * self.output_rate_hz)
+        quality_deque = self.decoded_quality_by_channel[self.channel_to_decode]
+        if len(quality_deque) == 0:
+            return 0.0
+        recent = list(quality_deque)[-window:]
+        q = np.concatenate([np.asarray(g, dtype=np.int8) for g in recent]).reshape(-1)
+        if q.size == 0:
+            return 0.0
+        return float(np.sum(q == 0)) / float(q.size)
+
+    def _watchdog_thread_func(self):
+        """Checks drop rate every watchdog_window_seconds; requests SDR restart if too high."""
+        while self.running:
+            for _ in range(int(self.sdr_watchdog_window_seconds * 4)):
+                if not self.running:
+                    return
+                time.sleep(0.25)
+            if not self.running:
+                return
+            drop_rate = self._recent_drop_rate()
+            if drop_rate > self.sdr_restart_drop_threshold:
+                print(
+                    f'⚠️  Watchdog: drop rate {drop_rate*100:.1f}% > '
+                    f'{self.sdr_restart_drop_threshold*100:.0f}% threshold — requesting SDR restart.'
+                )
+                self._sdr_restart_requested.set()
+
+    def _restart_sdr(self):
+        """Stop the rx thread, close the device, wait 10s, then reinitialise and restart."""
+        sample_idx = self.decoded_sample_count_by_channel[self.channel_to_decode]
+        drop_rate = self._recent_drop_rate()
+        ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        entry = {
+            'timestamp_utc': ts,
+            'sample_idx_at_restart': int(sample_idx),
+            'drop_rate_pct': round(drop_rate * 100, 2),
+            'reason': 'watchdog_drop_threshold',
+        }
+        self._sdr_restart_log.append(entry)
+        print(f'⚠️  SDR restart #{len(self._sdr_restart_log)} @ {ts}  drop_rate={drop_rate*100:.1f}%')
+
+        # Update metadata immediately so the restart is recorded even if we crash later
+        self._write_gcs_metadata()
+
+        # Stop rx thread cleanly
+        self._rx_running = False
+        rx_t = self._rx_thread_ref
+        if rx_t is not None:
+            rx_t.join(timeout=5.0)
+
+        # Close device
+        try:
+            if self.channel is not None:
+                self.channel.enable = False
+            if self.channel2 is not None:
+                self.channel2.enable = False
+        except Exception:
+            pass
+        try:
+            if self.device is not None:
+                self.device.close()
+        except Exception:
+            pass
+        self.device = None
+
+        # Drain the queue so processing thread doesn't stall on old data
+        while not self.data_queue.empty():
+            try:
+                self.data_queue.get_nowait()
+            except Exception:
+                break
+
+        print('SDR stopped. Waiting 10 seconds before restart...')
+        for _ in range(40):
+            if not self.running:
+                return
+            time.sleep(0.25)
+
+        if not self.running:
+            return
+
+        try:
+            self.setup_device()
+            self._rx_running = True
+            rx_t = threading.Thread(target=self.rx_thread, daemon=True)
+            self._rx_thread_ref = rx_t
+            rx_t.start()
+            print(f'SDR restarted (restart #{len(self._sdr_restart_log)}).')
+        except Exception as exc:
+            print(f'⚠️  SDR restart failed: {exc}')
+
+    def setup_device(self):
+        if _bladerf is None:
+            raise ImportError('bladerf Python module is not available. Install it or use offline decode methods.')
+        self.device = _bladerf.BladeRF()
+        self.channel = self.device.Channel(_bladerf.CHANNEL_RX(0))
+        self.channel2 = self.device.Channel(_bladerf.CHANNEL_RX(1))
+
+        for ch in (self.channel, self.channel2):
+            ch.frequency = self.frequency
+            ch.sample_rate = self.sample_rate
+            ch.bandwidth = self.bandwidth
+            mode = self.gain_mode.lower()
+            if mode == 'manual':
+                ch.gain_mode = _bladerf.GainMode.Manual
+            elif mode == 'fastattack':
+                ch.gain_mode = _bladerf.GainMode.FastAttack_AGC
+            elif mode == 'slowattack':
+                ch.gain_mode = _bladerf.GainMode.SlowAttack_AGC
+            elif mode == 'hybrid':
+                ch.gain_mode = _bladerf.GainMode.Hybrid_AGC
+            else:
+                ch.gain_mode = _bladerf.GainMode.Manual
+            ch.gain = self.gain
+
+        self.device.sync_config(
+            layout=_bladerf.ChannelLayout.RX_X2,
+            fmt=_bladerf.Format.SC16_Q11,
+            num_buffers=16,
+            buffer_size=8192,
+            num_transfers=8,
+            stream_timeout=3500,
+        )
+
+        self.device.rx_mux = _bladerf.RXMux.Counter_32bit if self.is_counter else _bladerf.RXMux.Baseband
+
+        print('\n=== BladeRF Configuration ===')
+        print(f'  RX0: {self.channel.sample_rate/1e6:.2f} MSPS @ {self.channel.frequency/1e6:.2f} MHz')
+        print(f'  RX1: {self.channel2.sample_rate/1e6:.2f} MSPS @ {self.channel2.frequency/1e6:.2f} MHz')
+        print('  Layout: RX_X2, Format: SC16_Q11')
+        print('=============================\n')
+
+    def _extract_output_stream(self, rx_samples_u16: np.ndarray) -> np.ndarray:
+        if self.device_num == 1:
+            return rx_samples_u16[0::4].copy()
+        return rx_samples_u16[1::4].copy()
+
+    def rx_thread(self):
+        self.channel.enable = True
+        self.channel2.enable = True
+        rx_buffer = bytearray(self.buffer_size * 4 * 2)
+
+        try:
+            while self.running and self._rx_running:
+                self.device.sync_rx(rx_buffer, self.buffer_size)
+                rx_samples = np.frombuffer(rx_buffer, dtype=np.uint16)
+
+                valid_length = len(rx_samples)
+                for i in range(0, len(rx_samples) - 3, 4):
+                    if (
+                        rx_samples[i] == 0
+                        and rx_samples[i + 1] == 0
+                        and rx_samples[i + 2] == 0
+                        and rx_samples[i + 3] == 0
+                    ):
+                        valid_length = i
+                        break
+
+                if valid_length <= 0:
+                    continue
+
+                output_data = self._extract_output_stream(rx_samples[:valid_length])
+                self.samples_captured += len(output_data)
+
+                try:
+                    self.data_queue.put(output_data, timeout=0.2)
+                except queue.Full:
+                    pass
+
+        except Exception as exc:
+            print(f'RX thread error: {exc}')
+        finally:
+            self.channel.enable = False
+            self.channel2.enable = False
+            try:
+                self.data_queue.put(None, timeout=0.2)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _bin2num_20_12(bits: np.ndarray) -> float:
+        bit_string = ''.join(str(int(x)) for x in bits)
+        value = int(bit_string, 2)
+        if value >= (1 << 19):
+            value -= (1 << 20)
+        return value / (1 << 12)
+
+    def _decode_value_from_packet_bits(self, bits: np.ndarray):
+        if bits is None or len(bits) < 20:
+            return None
+        payload = bits[:20]
+        payload_reversed = payload[::-1]
+        return self._bin2num_20_12(payload_reversed) * self.decode_scale
+
+    def _pick_mismatch_value(self, v1: float, v2: float, left_neighbor, right_neighbor):
+        neighbors = []
+        if left_neighbor is not None and np.isfinite(left_neighbor):
+            neighbors.append(float(left_neighbor))
+        if right_neighbor is not None and np.isfinite(right_neighbor):
+            neighbors.append(float(right_neighbor))
+
+        if len(neighbors) > 0:
+            score_v1 = sum(abs(float(v1) - n) for n in neighbors)
+            score_v2 = sum(abs(float(v2) - n) for n in neighbors)
+            if score_v1 < score_v2:
+                return float(v1), 5, 'v1', 'neighbors'
+            if score_v2 < score_v1:
+                return float(v2), 6, 'v2', 'neighbors'
+
+        if abs(v1) <= abs(v2):
+            return float(v1), 5, 'v1', 'magnitude'
+        return float(v2), 6, 'v2', 'magnitude'
+
+    def _estimate_frames_in_gap_linear(self, distance_words: int) -> int:
+        """Estimate frame count using linear combinations of accepted frame lengths.
+
+        Finds n such that some sum of n accepted lengths is closest to distance_words.
+        For (248, 250), this corresponds to finding integers a,b >= 0 with
+        a+b=n and a*248 + b*250 close to distance_words.
+        """
+        distance_words = int(distance_words)
+        if distance_words <= 0:
+            return 1
+
+        lengths = tuple(sorted(self.accepted_frame_lengths))
+        if len(lengths) == 1:
+            return max(1, int(round(distance_words / lengths[0])))
+
+        min_len = lengths[0]
+        max_len = lengths[-1]
+        max_frames = max(1, int(np.ceil((distance_words + 2 * max_len) / min_len)))
+
+        reachable = {0}
+        best_n = 1
+        best_err = float('inf')
+
+        for frame_count in range(1, max_frames + 1):
+            next_reachable = set()
+            for base_sum in reachable:
+                for length in lengths:
+                    next_reachable.add(base_sum + length)
+
+            local_best_sum = min(next_reachable, key=lambda s: abs(s - distance_words))
+            local_err = abs(local_best_sum - distance_words)
+            if local_err < best_err:
+                best_err = local_err
+                best_n = frame_count
+                if local_err == 0:
+                    break
+
+            reachable = next_reachable
+
+        return max(1, int(best_n))
+
+    def _extract_channel_packets(self, data: np.ndarray):
+        data = np.asarray(data, dtype=np.uint16).reshape(-1)
+        prefix = self._extract_lookback_words
+        prefix_len = int(len(prefix))
+        if prefix_len > 0:
+            working_data = np.concatenate([prefix, data])
+        else:
+            working_data = data
+
+        data_bit = working_data & 1
+        packet_nums_raw = (working_data & ((1 << 4) | (1 << 5) | (1 << 6))) >> 4
+        valid_flag = (working_data & (1 << 8)) >> 8
+
+        packet_nums_for_edges = packet_nums_raw.copy()
+        valid_words = valid_flag.astype(bool)
+        if np.any(valid_words):
+            first_valid_idx = int(np.flatnonzero(valid_words)[0])
+            last_pkt = int(packet_nums_for_edges[first_valid_idx])
+            if first_valid_idx > 0:
+                packet_nums_for_edges[:first_valid_idx] = last_pkt
+            for idx in range(first_valid_idx + 1, len(packet_nums_for_edges)):
+                if valid_words[idx]:
+                    last_pkt = int(packet_nums_for_edges[idx])
+                else:
+                    packet_nums_for_edges[idx] = last_pkt
+        else:
+            return {1: [], 2: [], 3: [], 4: []}, 0
+
+        if len(packet_nums_raw) < 2:
+            return {1: [], 2: [], 3: [], 4: []}, 0
+
+        transitions = np.where(np.diff(packet_nums_for_edges) != 0)[0]
+        frame_starts = np.concatenate(([0], transitions + 1))
+        frame_ends = np.concatenate((transitions, [len(packet_nums_for_edges) - 1]))
+
+        if len(frame_starts) < 2:
+            return {1: [], 2: [], 3: [], 4: []}, 0
+
+        process_until = int(frame_starts[-1])
+        if process_until <= 0:
+            return {1: [], 2: [], 3: [], 4: []}, 0
+
+        process_until_input = process_until - prefix_len
+        if process_until_input <= 0:
+            return {1: [], 2: [], 3: [], 4: []}, 0
+
+        packet_nums_raw = packet_nums_raw[:process_until]
+        packet_nums_for_edges = packet_nums_for_edges[:process_until]
+        data_bit = data_bit[:process_until]
+        valid_flag = valid_flag[:process_until]
+
+        transitions = np.where(np.diff(packet_nums_for_edges) != 0)[0]
+        frame_starts = np.concatenate(([prefix_len], transitions+1))
+        frame_ends = np.concatenate((transitions, [len(packet_nums_for_edges) - 1]))
+        frame_lengths = frame_ends - frame_starts + 1
+
+        starts_in_fresh_data = frame_starts >= prefix_len
+        self.prefix_overlap_frames_skipped += int(np.sum(~starts_in_fresh_data))
+        valid_mask = np.isin(frame_lengths, self.accepted_frame_lengths) & starts_in_fresh_data
+        valid_frame_starts = frame_starts[valid_mask]
+
+        # Log every detected frame before the valid-length gate
+        for _fs, _fl, _fv, _fresh in zip(frame_starts, frame_lengths, valid_mask, starts_in_fresh_data):
+            if not bool(_fresh):
+                continue
+            abs_word = self._words_processed_total + int(_fs) - prefix_len
+            pkt_n = int(packet_nums_for_edges[_fs])
+            self._raw_frame_log.append((int(abs_word), pkt_n, int(_fl), bool(_fv)))
+
+        if len(valid_frame_starts) == 0:
+            consumed = int(process_until_input)
+            if consumed > 0:
+                self._extract_lookback_words = data[max(0, consumed - 2):consumed].copy()
+            return {1: [], 2: [], 3: [], 4: []}, consumed
+
+        packets_by_channel = {1: [], 2: [], 3: [], 4: []}
+        prev_start = None
+        prev_packet_num = self._last_extracted_packet_num
+        prev_abs_start = self._last_extracted_frame_abs_word_start
+
+        for start_idx in valid_frame_starts:
+            packet_num = int(packet_nums_for_edges[start_idx])
+            cur_abs_start = int(self._words_processed_total + int(start_idx) - prefix_len)
+
+            # Cross-chunk gap: first frame of this chunk vs last frame of previous chunk.
+            if prev_start is None and prev_packet_num is not None:
+                observed_step = (packet_num - prev_packet_num) % 8
+                missing_from_numbers = max(0, observed_step - 1)
+                missing_from_distance = 0
+                if prev_abs_start is not None:
+                    distance_words = int(cur_abs_start - int(prev_abs_start))
+                    expected_frames_in_gap = self._estimate_frames_in_gap_linear(distance_words)
+                    missing_from_distance = max(0, expected_frames_in_gap - 1)
+                    if missing_from_distance == missing_from_numbers:
+                        self.gap_estimate_agree_count += 1
+                    else:
+                        self.gap_estimate_disagree_count += 1
+                missing = max(missing_from_numbers, missing_from_distance)
+                if missing > 0:
+                    _ts = self._words_processed_total / self.sample_rate
+                    print(
+                        f"⚠️  Cross-chunk gap @ t={_ts:.3f}s: prev={prev_packet_num}, "
+                        f"first_fresh={packet_num}, missing_num={missing_from_numbers}, "
+                        f"missing_dist={missing_from_distance}, inserting={missing}"
+                    )
+                    last_num = prev_packet_num
+                    for _ in range(missing):
+                        last_num = (last_num + 1) % 8
+                        for ch in range(1, 5):
+                            packets_by_channel[ch].append(
+                                DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8))
+                            )
+                    self.packet_sequence_anomaly_count += missing
+                    self.placeholder_inserts_cross_chunk += int(missing)
+
+            if prev_start is not None:
+                distance = start_idx - prev_start
+                expected_frames_in_gap = self._estimate_frames_in_gap_linear(distance)
+                expected_next = (prev_packet_num + 1) % 8 if prev_packet_num is not None else None
+                expected_at_current = None
+                observed_step = None
+                missing_from_distance = 0
+                missing_from_numbers = 0
+                if prev_packet_num is not None and expected_frames_in_gap >= 1:
+                    expected_at_current = (prev_packet_num + expected_frames_in_gap) % 8
+                    observed_step = (packet_num - prev_packet_num) % 8
+                    missing_from_distance = max(0, expected_frames_in_gap - 1)
+                    if observed_step is not None and observed_step > 0:
+                        missing_from_numbers = max(0, observed_step - 1)
+                if expected_at_current is not None and packet_num != expected_at_current:
+                    self.packet_sequence_anomaly_count += 1
+                    self.packet_sequence_events.append(
+                        {
+                            'prev_packet': int(prev_packet_num),
+                            'observed_packet': int(packet_num),
+                            'expected_next': int(expected_next),
+                            'expected_at_current': int(expected_at_current),
+                            'distance_words': int(distance),
+                            'expected_frames_in_gap': int(expected_frames_in_gap),
+                            'start_idx': int(start_idx),
+                            'timestamp_s': (self._words_processed_total + int(start_idx) - prefix_len) / self.sample_rate,
+                        }
+                    )
+                    print(
+                        f"⚠️  Packet sequence anomaly: prev={prev_packet_num}, "
+                        f"expected_next={expected_next}, observed={packet_num}, "
+                        f"expected_at_current={expected_at_current}, "
+                        f"distance={distance} words (~{expected_frames_in_gap} frame(s))"
+                    )
+
+                    # If this frame should be the immediate next packet (1 frame apart)
+                    # but packet_num disagrees, treat it as a bad header and discard it.
+                    # Keep prev_start/prev_packet_num unchanged so the next frame is compared
+                    # against the last known-good packet.
+                    if expected_frames_in_gap == 1 and expected_next is not None and packet_num != expected_next:
+                        self.packet_sequence_header_drops += 1
+                        ts_drop = (self._words_processed_total + int(start_idx) - prefix_len) / self.sample_rate
+                        print(
+                            f"⚠️  Dropping out-of-order observed packet @ t={ts_drop:.3f}s: "
+                            f"expected {expected_next}, observed {packet_num}"
+                        )
+                        continue
+
+                # Insert placeholders using the stronger of distance-based and packet-number-based inference.
+                # This catches cases where malformed frame lengths make distance-based inference undercount losses.
+                missing = max(missing_from_distance, missing_from_numbers)
+                if missing > 0 and prev_packet_num is not None:
+                    if missing_from_numbers > missing_from_distance:
+                        print(
+                            f"⚠️  Packet-gap undercount by frame distance: "
+                            f"distance inferred missing={missing_from_distance}, "
+                            f"packet-number inferred missing={missing_from_numbers} "
+                            f"(prev={prev_packet_num}, observed={packet_num})"
+                        )
+                    last_num = prev_packet_num
+                    for _ in range(missing):
+                        last_num = (last_num + 1) % 8
+                        for ch in range(1, 5):
+                            packets_by_channel[ch].append(
+                                DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8))
+                            )
+                    self.placeholder_inserts_intra_chunk += int(missing)
+                    if missing_from_distance == missing_from_numbers:
+                        self.gap_estimate_agree_count += 1
+                    else:
+                        self.gap_estimate_disagree_count += 1
+
+            for ch in range(1, 5):
+                channel_offset = (ch - 1) * self.bits_per_channel
+                channel_end_offset = channel_offset + self.bits_per_channel
+                ch_start = start_idx + channel_offset -2
+                ch_end = start_idx + channel_end_offset
+                if ch_end > len(packet_nums_raw):
+                    packets_by_channel[ch].append(
+                        DecodedPacket(packet_num=packet_num, is_valid=False, bits=np.array([], dtype=np.uint8))
+                    )
+                    continue
+
+                bits_block = data_bit[ch_start:ch_end]
+                valid_block = valid_flag[ch_start:ch_end]
+                selected_bits = bits_block[valid_block == 1]
+                packets_by_channel[ch].append(
+                    DecodedPacket(packet_num=packet_num, is_valid=True, bits=selected_bits.astype(np.uint8))
+                )
+
+            prev_start = start_idx
+            prev_packet_num = packet_num
+            prev_abs_start = cur_abs_start
+
+        if prev_packet_num is not None:
+            self._last_extracted_packet_num = prev_packet_num
+            self._last_extracted_frame_abs_word_start = prev_abs_start
+
+        consumed = int(process_until_input)
+        if consumed > 0:
+            self._extract_lookback_words = data[max(0, consumed - 2):consumed].copy()
+
+        return packets_by_channel, consumed
+
+    def _build_group_with_placeholders(self, channel_idx: int):
+        pending = self._pending_packets_by_channel[channel_idx]
+        group = []
+        for expected_packet_num in range(8):
+            if len(pending) > 0 and int(pending[0].packet_num) == expected_packet_num:
+                group.append(pending.pop(0))
+            else:
+                group.append(
+                    DecodedPacket(
+                        packet_num=expected_packet_num,
+                        is_valid=False,
+                        bits=np.array([], dtype=np.uint8),
+                    )
+                )
+                self.placeholder_inserts_group_builder += 1
+        return group
+
+    def _decode_packet_groups(self, packets_by_channel):
+        # Extend pending packets for each channel (no packet dropping/resync)
+        for channel_idx, packets in packets_by_channel.items():
+            pending = self._pending_packets_by_channel[channel_idx]
+            pending.extend(packets)
+
+            if not self._synced_to_packet0_by_channel[channel_idx]:
+                if len(pending) > 0:
+                    self._synced_to_packet0_by_channel[channel_idx] = True
+
+        # Decode synchronously: all synced channels advance together one group at a time
+        synced = [ch for ch in range(1, 5) if self._synced_to_packet0_by_channel[ch]]
+        while synced:
+            if not all(len(self._pending_packets_by_channel[ch]) >= 8 for ch in synced):
+                break
+
+            group_values = {}
+            group_quality = {}
+            for channel_idx in synced:
+                group = self._build_group_with_placeholders(channel_idx)
+
+                values = np.full(4, np.nan, dtype=np.float64)
+                quality = np.zeros(4, dtype=np.int8)
+                sample_indices = np.zeros(4, dtype=np.int64)
+                mismatch_v1 = np.full(4, np.nan, dtype=np.float64)
+                mismatch_v2 = np.full(4, np.nan, dtype=np.float64)
+                mismatch_pending = np.zeros(4, dtype=bool)
+
+                for s in range(4):
+                    p1 = group[s]
+                    p2 = group[s + 4]
+                    sample_idx = self.decoded_sample_count_by_channel[channel_idx]
+                    self.decoded_sample_count_by_channel[channel_idx] += 1
+                    sample_indices[s] = int(sample_idx)
+
+                    payload_v1 = p1.bits[:20] if p1.is_valid and p1.bits is not None and len(p1.bits) >= 20 else None
+                    payload_v2 = p2.bits[:20] if p2.is_valid and p2.bits is not None and len(p2.bits) >= 20 else None
+
+                    if payload_v1 is not None and payload_v2 is not None:
+                        diff_positions = np.flatnonzero(payload_v1 != payload_v2)
+                        if diff_positions.size > 0:
+                            self.bit_mismatch_events_by_channel[channel_idx].append(
+                                {
+                                    'sample_idx': int(sample_idx),
+                                    'packet_v1': int(p1.packet_num),
+                                    'packet_v2': int(p2.packet_num),
+                                    'hamming': int(diff_positions.size),
+                                    'diff_positions': diff_positions.astype(np.int16).tolist(),
+                                    'bits_v1': ''.join(str(int(x)) for x in payload_v1),
+                                    'bits_v2': ''.join(str(int(x)) for x in payload_v2),
+                                }
+                            )
+
+                    v1 = self._decode_value_from_packet_bits(p1.bits) if p1.is_valid else None
+                    v2 = self._decode_value_from_packet_bits(p2.bits) if p2.is_valid else None
+
+                    if v1 is not None and v2 is not None:
+                        if abs(v1 - v2) < self.mismatch_threshold:
+                            values[s] = v1
+                            quality[s] = 3
+                        else:
+                            mismatch_v1[s] = float(v1)
+                            mismatch_v2[s] = float(v2)
+                            mismatch_pending[s] = True
+                    elif v1 is not None:
+                        values[s] = v1
+                        quality[s] = 1
+                        if not p2.is_valid:
+                            self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_packet_missing'] += 1
+                            self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v1'][int(p2.packet_num) % 8] += 1
+                        else:
+                            self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_payload_short'] += 1
+                    elif v2 is not None:
+                        values[s] = v2
+                        quality[s] = 2
+                        if not p1.is_valid:
+                            self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
+                            self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
+                        else:
+                            self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short'] += 1
+                    else:
+                        quality[s] = 0
+
+                prev_neighbor = None
+                if len(self.decoded_groups_by_channel[channel_idx]) > 0:
+                    prev_group = self.decoded_groups_by_channel[channel_idx][-1]
+                    if len(prev_group) > 0 and np.isfinite(prev_group[-1]):
+                        prev_neighbor = float(prev_group[-1])
+
+                for s in range(4):
+                    if not mismatch_pending[s]:
+                        continue
+
+                    left_neighbor = values[s - 1] if s > 0 and np.isfinite(values[s - 1]) else prev_neighbor
+                    right_neighbor = values[s + 1] if s < 3 and np.isfinite(values[s + 1]) else None
+                    chosen_value, chosen_quality, picked, pick_basis = self._pick_mismatch_value(
+                        float(mismatch_v1[s]),
+                        float(mismatch_v2[s]),
+                        left_neighbor,
+                        right_neighbor,
+                    )
+                    values[s] = chosen_value
+                    quality[s] = chosen_quality
+
+                    p1 = group[s]
+                    p2 = group[s + 4]
+                    delta = abs(float(mismatch_v1[s]) - float(mismatch_v2[s]))
+                    self.mismatch_events_by_channel[channel_idx].append(
+                        {
+                            'sample_idx': int(sample_indices[s]),
+                            'packet_v1': int(p1.packet_num),
+                            'packet_v2': int(p2.packet_num),
+                            'v1': float(mismatch_v1[s]),
+                            'v2': float(mismatch_v2[s]),
+                            'delta': float(delta),
+                            'picked': picked,
+                            'pick_basis': pick_basis,
+                            'left_neighbor': None if left_neighbor is None else float(left_neighbor),
+                            'right_neighbor': None if right_neighbor is None else float(right_neighbor),
+                        }
+                    )
+
+                self.decoded_groups_by_channel[channel_idx].append(values)
+                self.decoded_quality_by_channel[channel_idx].append(quality)
+                group_values[channel_idx] = values
+                group_quality[channel_idx] = quality
+
+            if any(ch in self.gcs_channels for ch in synced):
+                self._append_gcs_group(group_values, group_quality)
+
+    def processing_thread(self):
+        while self.running:
+            try:
+                chunk = self.data_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if chunk is None:
+                break
+
+            if len(chunk) == 0:
+                continue
+
+            self._decode_buffer = np.concatenate([self._decode_buffer, chunk])
+            packets, consumed = self._extract_channel_packets(self._decode_buffer)
+            if consumed > 0:
+                self._decode_packet_groups(packets)
+                self._words_processed_total += consumed
+                self._decode_buffer = self._decode_buffer[consumed:]
+
+        if len(self._decode_buffer) > 0:
+            packets, consumed = self._extract_channel_packets(np.concatenate([self._decode_buffer, np.array([0], dtype=np.uint16)]))
+            if consumed > 0:
+                self._decode_packet_groups(packets)
+                self._words_processed_total += consumed
+
+    def reset_decoder_state(self):
+        self.decoded_groups_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
+        self.decoded_quality_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
+        self.decoded_sample_count_by_channel = {ch: 0 for ch in range(1, 5)}
+        self.mismatch_events_by_channel = {
+            ch: deque(maxlen=2000) for ch in range(1, 5)
+        }
+        self.bit_mismatch_events_by_channel = {
+            ch: deque(maxlen=2000) for ch in range(1, 5)
+        }
+        self.only_side_cause_counts_by_channel = {
+            ch: Counter() for ch in range(1, 5)
+        }
+        self.only_side_missing_packetnum_by_channel = {
+            ch: {
+                'for_only_v1': np.zeros(8, dtype=np.int64),
+                'for_only_v2': np.zeros(8, dtype=np.int64),
+            }
+            for ch in range(1, 5)
+        }
+        self.resync_drops_by_channel = {ch: 0 for ch in range(1, 5)}
+        self.packet_sequence_events = deque(maxlen=2000)
+        self.packet_sequence_anomaly_count = 0
+        self.packet_sequence_header_drops = 0
+        self.prefix_overlap_frames_skipped = 0
+        self.placeholder_inserts_cross_chunk = 0
+        self.placeholder_inserts_intra_chunk = 0
+        self.placeholder_inserts_group_builder = 0
+        self.gap_estimate_agree_count = 0
+        self.gap_estimate_disagree_count = 0
+        self.decoded_groups = self.decoded_groups_by_channel[self.channel_to_decode]
+        self.decoded_quality = self.decoded_quality_by_channel[self.channel_to_decode]
+        self._decode_buffer = np.array([], dtype=np.uint16)
+        self._pending_packets_by_channel = {ch: [] for ch in range(1, 5)}
+        self._synced_to_packet0_by_channel = {ch: False for ch in range(1, 5)}
+        self._last_extracted_packet_num = None  # persists across chunk calls for cross-chunk gap detection
+        self._last_extracted_frame_abs_word_start = None  # absolute word start of last extracted valid frame
+        self._extract_lookback_words = np.array([], dtype=np.uint16)  # preserves 2-word context for -2 bit alignment
+        self._words_processed_total = 0       # absolute word offset for timestamps
+        self._raw_frame_log = []              # list of (abs_word_idx, packet_num, frame_length, passed_valid)
+        self.gcs_write_buffer = []
+
+    def decode_from_word_stream(self, word_stream, reset=True):
+        if reset:
+            self.reset_decoder_state()
+
+        words = np.asarray(word_stream).reshape(-1)
+        if words.size == 0:
+            return self.get_decoded_arrays()
+
+        if np.iscomplexobj(words):
+            words = np.real(words)
+
+        words_u16 = words.astype(np.uint16, copy=False)
+        self._decode_buffer = np.concatenate([self._decode_buffer, words_u16])
+
+        packets, consumed = self._extract_channel_packets(self._decode_buffer)
+        if consumed > 0:
+            self._decode_packet_groups(packets)
+            self._words_processed_total += consumed
+            self._decode_buffer = self._decode_buffer[consumed:]
+
+        if len(self._decode_buffer) > 0:
+            padded = np.concatenate([self._decode_buffer, np.array([0], dtype=np.uint16)])
+            packets, consumed = self._extract_channel_packets(padded)
+            if consumed > 0:
+                self._decode_packet_groups(packets)
+                self._words_processed_total += consumed
+            self._decode_buffer = np.array([], dtype=np.uint16)
+
+        return self.get_decoded_arrays()
+
+    @staticmethod
+    def _unwrap_mat_scalar(value):
+        while isinstance(value, np.ndarray) and value.size == 1:
+            value = value.item()
+        return value
+
+    def _extract_matlab_word_stream(self, mat_data, variable_name=None):
+        if variable_name and variable_name in mat_data:
+            candidate = mat_data[variable_name]
+            return np.asarray(candidate).reshape(-1)
+
+        for key in ('output_data', 'data_words', 'packet_words'):
+            if key in mat_data:
+                return np.asarray(mat_data[key]).reshape(-1)
+
+        sim_out = mat_data.get('simOut')
+        if sim_out is not None:
+            sim_out = self._unwrap_mat_scalar(sim_out)
+            sim_concat = getattr(sim_out, 'sim_concat', None)
+            if sim_concat is not None:
+                sim_concat = self._unwrap_mat_scalar(sim_concat)
+                sim_data = getattr(sim_concat, 'Data', None)
+                if sim_data is not None:
+                    return np.asarray(sim_data).reshape(-1)
+
+        sim_concat = mat_data.get('sim_concat')
+        if sim_concat is not None:
+            sim_concat = self._unwrap_mat_scalar(sim_concat)
+            sim_data = getattr(sim_concat, 'Data', None)
+            if sim_data is not None:
+                return np.asarray(sim_data).reshape(-1)
+
+        raise ValueError(
+            'Could not find MATLAB word stream. Provide variable_name or export one of: output_data, data_words, packet_words.'
+        )
+
+    def decode_from_mat_file(self, mat_path, variable_name=None, reset=True):
+        try:
+            mat_data = loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+            words = self._extract_matlab_word_stream(mat_data, variable_name=variable_name)
+        except NotImplementedError:
+            import h5py
+
+            with h5py.File(mat_path, 'r') as mat_file:
+                key = variable_name if variable_name else 'output_data'
+                if key not in mat_file:
+                    raise ValueError(
+                        f'MAT v7.3 file requires dataset name. Could not find "{key}" in {mat_path}.'
+                    )
+                words = np.array(mat_file[key]).reshape(-1)
+
+        return self.decode_from_word_stream(words, reset=reset)
+
+    def decode_from_bin_file(
+        self,
+        bin_path,
+        reset=True,
+        file_format='auto',
+        dtype=np.uint16,
+        byteorder='little',
+        matlab_scale=2048.0,
+        matlab_select='first_row',
+    ):
+        raw = np.fromfile(bin_path, dtype=dtype)
+        print(len(raw), 'raw samples read from binary file.')
+        if raw.size == 0:
+            return self.decode_from_word_stream(raw, reset=reset)
+
+        if byteorder == 'big':
+            raw = raw.byteswap().newbyteorder()
+
+        fmt = file_format.lower()
+        if fmt not in ('auto', 'word_stream', 'rx_x2_interleaved', 'matlab_float32_2xn'):
+            raise ValueError("file_format must be 'auto', 'word_stream', 'rx_x2_interleaved', or 'matlab_float32_2xn'")
+
+        if fmt == 'matlab_float32_2xn':
+            float_raw = np.fromfile(bin_path, dtype=np.float32)
+            if float_raw.size < 2:
+                return self.decode_from_word_stream(np.array([], dtype=np.uint16), reset=reset)
+
+            usable = (float_raw.size // 2) * 2
+            float_raw = float_raw[:usable]
+
+            # Match MATLAB: int16(round(fread(..., [2 N], 'float32') * 2048))
+            mat_2xn = float_raw.reshape((2, -1), order='F')
+            mat_i16 = np.round(mat_2xn * float(matlab_scale)).astype(np.int16)
+
+            select_mode = str(matlab_select).lower()
+            if select_mode in ('first_column', 'col0', 'column0'):
+                selected = mat_i16[:, 0]
+            elif select_mode in ('first_row', 'row0', 'channel1'):
+                selected = mat_i16[0, :]
+            elif select_mode in ('second_row', 'row1', 'channel2'):
+                selected = mat_i16[1, :]
+            else:
+                raise ValueError("matlab_select must be 'first_column', 'first_row', or 'second_row'")
+
+            words = selected.astype(np.uint16, copy=False)
+            return self.decode_from_word_stream(words, reset=reset)
+
+        if fmt == 'word_stream':
+            words = raw.astype(np.uint16, copy=False)
+            return self.decode_from_word_stream(words, reset=reset)
+
+        if fmt == 'rx_x2_interleaved':
+            if raw.size < 4:
+                return self.decode_from_word_stream(np.array([], dtype=np.uint16), reset=reset)
+            usable = (raw.size // 4) * 4
+            interleaved = raw[:usable].astype(np.uint16, copy=False)
+            words = self._extract_output_stream(interleaved)
+            return self.decode_from_word_stream(words, reset=reset)
+
+        # auto: if divisible by 4, assume raw BladeRF RX_X2 dump; otherwise direct word stream
+        if raw.size % 4 == 0:
+            interleaved = raw.astype(np.uint16, copy=False)
+            words = self._extract_output_stream(interleaved)
+        else:
+            words = raw.astype(np.uint16, copy=False)
+
+        return self.decode_from_word_stream(words, reset=reset)
+
+    def decode_from_file(
+        self,
+        input_path,
+        variable_name=None,
+        reset=True,
+        bin_file_format='auto',
+        matlab_scale=2048.0,
+        matlab_select='first_row',
+    ):
+        lower = input_path.lower()
+        if lower.endswith('.mat'):
+            return self.decode_from_mat_file(input_path, variable_name=variable_name, reset=reset)
+        if lower.endswith('.bin'):
+            return self.decode_from_bin_file(
+                input_path,
+                reset=reset,
+                file_format=bin_file_format,
+                matlab_scale=matlab_scale,
+                matlab_select=matlab_select,
+            )
+        if lower.endswith('.npy'):
+            words = np.load(input_path)
+            return self.decode_from_word_stream(words, reset=reset)
+        if lower.endswith('.csv'):
+            words = np.loadtxt(input_path, delimiter=',')
+            return self.decode_from_word_stream(words, reset=reset)
+        raise ValueError('Unsupported file type. Use .bin, .mat, .npy, or .csv')
+
+    @staticmethod
+    def _normalize_channel_index(channel_idx, default_channel):
+        idx = default_channel if channel_idx is None else int(channel_idx)
+        if idx < 1 or idx > 4:
+            raise ValueError('channel index must be 1..4')
+        return idx
+
+    def get_decoded_arrays(self, channel_idx=None):
+        idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
+        channel_groups = self.decoded_groups_by_channel[idx]
+        channel_quality = self.decoded_quality_by_channel[idx]
+        if len(channel_groups) == 0:
+            return np.empty((0, 4), dtype=np.float64), np.empty((0, 4), dtype=np.int8)
+        values = np.vstack(channel_groups)
+        quality = np.vstack(channel_quality)
+        return values, quality
+
+    def get_channel_series(self, channel_idx=None):
+        idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
+        values, quality = self.get_decoded_arrays(idx)
+        if values.size == 0:
+            return np.array([]), np.array([])
+
+        # MATLAB parity: final_out = reshape(samples, [], 1)
+        # Here, values has shape (num_groups, 4) where 4 are sample positions in time,
+        # not separate channels. Flatten in row-major order to recover 200 Hz stream.
+        series = values.reshape(-1).copy()
+        quality_series = quality.reshape(-1).copy()
+
+        nan_mask = np.isnan(series)
+        if np.any(nan_mask):
+            valid_idx = np.where(~nan_mask)[0]
+            if len(valid_idx) > 1:
+                series[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, series[valid_idx])
+
+        # MATLAB parity: subtract mean before visualization/spectral analysis
+        if len(series) > 0:
+            series = series - np.mean(series)
+
+        if self.enable_bandpass_filter and len(series) > 16:
+            series, self.filter_zi[idx - 1] = signal.lfilter(
+                self.b_bandpass,
+                self.a_bandpass,
+                series,
+                zi=self.filter_zi[idx - 1],
+            )
+
+        return series, quality_series
+
+    def get_all_channel_series(self):
+        return {ch: self.get_channel_series(ch) for ch in range(1, 5)}
+
+    def save_raw_frame_log(self, path: str = 'raw_frame_log.csv') -> None:
+        """Write every detected frame (before valid-length gate) to a CSV.
+
+        Columns:
+          abs_word_idx  - absolute word position in the incoming stream
+          timestamp_s   - abs_word_idx / sample_rate
+          packet_num    - 3-bit header value (0-7)
+          frame_length  - measured frame length in words
+          passed_valid  - 1 if frame_length is in accepted_frame_lengths, else 0
+        """
+        log = self._raw_frame_log
+        if not log:
+            print('Raw frame log is empty — nothing to save.')
+            return
+        import csv
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['abs_word_idx', 'timestamp_s', 'packet_num', 'frame_length', 'passed_valid'])
+            for abs_word, pkt_n, fl, passed in log:
+                writer.writerow([abs_word, abs_word / self.sample_rate, pkt_n, fl, int(passed)])
+        print(f'Raw frame log saved: {path}  ({len(log)} frames)')
+
+    def print_stats(self, channel_idx=None):
+        idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
+        values, quality = self.get_decoded_arrays(idx)
+        total = quality.size
+        if total == 0:
+            print(f'No samples decoded for channel {idx}.')
+            return
+
+        print('\n=== Decoded Sample Statistics ===')
+        print(f'Channel: {idx}')
+        print(f'Total samples: {total}')
+        print(f'  No packet (0):               {np.sum(quality == 0):6d} ({100*np.sum(quality == 0)/total:5.1f}%)')
+        print(f'  Only v1 (1):                 {np.sum(quality == 1):6d} ({100*np.sum(quality == 1)/total:5.1f}%)')
+        print(f'  Only v2 (2):                 {np.sum(quality == 2):6d} ({100*np.sum(quality == 2)/total:5.1f}%)')
+        print(f'  Match both (3):              {np.sum(quality == 3):6d} ({100*np.sum(quality == 3)/total:5.1f}%)')
+        print(f'  Mismatch picked v1 (5):      {np.sum(quality == 5):6d} ({100*np.sum(quality == 5)/total:5.1f}%)')
+        print(f'  Mismatch picked v2 (6):      {np.sum(quality == 6):6d} ({100*np.sum(quality == 6)/total:5.1f}%)')
+        print(f'  Packet drops (resync off):   {self.resync_drops_by_channel[idx]:6d}')
+        print(f'  Sequence anomalies:          {self.packet_sequence_anomaly_count:6d}')
+        print(f'  Header anomaly drops:        {self.packet_sequence_header_drops:6d}')
+        print(f'  Prefix-overlap frames skipped: {self.prefix_overlap_frames_skipped:4d}')
+        print(f'  Placeholder inserts (cross): {self.placeholder_inserts_cross_chunk:6d}')
+        print(f'  Placeholder inserts (intra): {self.placeholder_inserts_intra_chunk:6d}')
+        print(f'  Placeholder inserts (group): {self.placeholder_inserts_group_builder:6d}')
+        print(
+            f'  Gap estimate agree/disagree: {self.gap_estimate_agree_count:6d}/{self.gap_estimate_disagree_count:6d}'
+        )
+        print(f"  Accepted frame lengths:      {','.join(str(v) for v in self.accepted_frame_lengths)}")
+
+        match_count = int(np.sum(quality == 3))
+        if (
+            match_count == int(total)
+            and (
+                self.resync_drops_by_channel[idx] > 0
+                or self.packet_sequence_anomaly_count > 0
+                or self.packet_sequence_header_drops > 0
+            )
+        ):
+            print('  Note: quality percentages are computed after resync/sequence handling; dropped packets are not included in these percentages.')
+
+        only_v1_count = int(np.sum(quality == 1))
+        only_v2_count = int(np.sum(quality == 2))
+        one_sided_total = only_v1_count + only_v2_count
+        if one_sided_total > 0:
+            causes = self.only_side_cause_counts_by_channel[idx]
+            print('  One-sided decode causes:')
+            c1 = int(causes.get('only_v1_v2_packet_missing', 0))
+            c2 = int(causes.get('only_v1_v2_payload_short', 0))
+            c3 = int(causes.get('only_v2_v1_packet_missing', 0))
+            c4 = int(causes.get('only_v2_v1_payload_short', 0))
+            print(f'    only_v1 <- v2 packet missing: {c1:6d} ({100*c1/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v1 <- v2 payload short : {c2:6d} ({100*c2/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v2 <- v1 packet missing: {c3:6d} ({100*c3/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v2 <- v1 payload short : {c4:6d} ({100*c4/max(one_sided_total,1):5.1f}% of one-sided)')
+
+            miss_hist = self.only_side_missing_packetnum_by_channel[idx]
+            miss_for_only_v1 = miss_hist['for_only_v1']
+            miss_for_only_v2 = miss_hist['for_only_v2']
+            if np.any(miss_for_only_v1) or np.any(miss_for_only_v2):
+                fmt_v1 = ', '.join([f"{pn}:{int(cnt)}" for pn, cnt in enumerate(miss_for_only_v1) if int(cnt) > 0])
+                fmt_v2 = ', '.join([f"{pn}:{int(cnt)}" for pn, cnt in enumerate(miss_for_only_v2) if int(cnt) > 0])
+                if fmt_v1:
+                    print(f'    missing pkt num seen by only_v1 (v2 side): {fmt_v1}')
+                if fmt_v2:
+                    print(f'    missing pkt num seen by only_v2 (v1 side): {fmt_v2}')
+
+        known = np.array([0, 1, 2, 3, 5, 6], dtype=np.int8)
+        unknown_count = np.sum(~np.isin(quality, known))
+        if unknown_count > 0:
+            print(f'  Unknown quality codes:       {unknown_count:6d} ({100*unknown_count/total:5.1f}%)')
+
+        bit_mismatch_events = list(self.bit_mismatch_events_by_channel[idx])
+        if bit_mismatch_events:
+            print('\nBit-level mismatch details (latest events, before float conversion):')
+            max_rows = 20
+            events_to_show = bit_mismatch_events[-max_rows:]
+            if len(bit_mismatch_events) > len(events_to_show):
+                print(f'  Showing last {len(events_to_show)} of {len(bit_mismatch_events)} bit mismatch events')
+            for ev in events_to_show:
+                shown_pos = ev['diff_positions'][:12]
+                suffix = '...' if len(ev['diff_positions']) > len(shown_pos) else ''
+                ts = ev['sample_idx'] / self.output_rate_hz
+                print(
+                    f"  sample_idx={ev['sample_idx']:6d} @ t={ts:.3f}s "
+                    f"pkt(v1,v2)=({ev['packet_v1']},{ev['packet_v2']}) "
+                    f"hamming={ev['hamming']:2d} diff_pos={shown_pos}{suffix}"
+                )
+                print(f"    bits_v1={ev['bits_v1']}")
+                print(f"    bits_v2={ev['bits_v2']}")
+
+        seq_events = list(self.packet_sequence_events)
+        if seq_events:
+            print('\nPacket sequence anomalies (latest events):')
+            max_rows = 20
+            events_to_show = seq_events[-max_rows:]
+            if len(seq_events) > len(events_to_show):
+                print(f'  Showing last {len(events_to_show)} of {len(seq_events)} sequence anomalies')
+            for ev in events_to_show:
+                ts = ev.get('timestamp_s')
+                ts_str = f" @ t={ts:.3f}s" if ts is not None else ''
+                print(
+                    f"  idx={ev['start_idx']:7d}{ts_str} prev={ev['prev_packet']} "
+                    f"expected_next={ev['expected_next']} observed={ev['observed_packet']} "
+                    f"expected_at_current={ev['expected_at_current']} "
+                    f"distance={ev['distance_words']} (~{ev['expected_frames_in_gap']} frame(s))"
+                )
+
+        mismatch_events = list(self.mismatch_events_by_channel[idx])
+        if mismatch_events:
+            print('\nValue mismatch details (latest events):')
+            basis_counts = Counter(ev.get('pick_basis', 'unknown') for ev in mismatch_events)
+            print(
+                f"  pick basis counts: neighbors={basis_counts.get('neighbors', 0)}, "
+                f"magnitude={basis_counts.get('magnitude', 0)}, "
+                f"unknown={basis_counts.get('unknown', 0)}"
+            )
+            max_rows = 30
+            events_to_show = mismatch_events[-max_rows:]
+            if len(mismatch_events) > len(events_to_show):
+                print(f'  Showing last {len(events_to_show)} of {len(mismatch_events)} mismatch events')
+            for ev in events_to_show:
+                ts = ev['sample_idx'] / self.output_rate_hz
+                pick_basis = ev.get('pick_basis', 'unknown')
+                left_neighbor = ev.get('left_neighbor', None)
+                right_neighbor = ev.get('right_neighbor', None)
+                left_str = 'None' if left_neighbor is None else f"{float(left_neighbor):+.6f}"
+                right_str = 'None' if right_neighbor is None else f"{float(right_neighbor):+.6f}"
+                print(
+                    f"  sample_idx={ev['sample_idx']:6d} @ t={ts:.3f}s "
+                    f"pkt(v1,v2)=({ev['packet_v1']},{ev['packet_v2']}) "
+                    f"v1={ev['v1']:+.6f} v2={ev['v2']:+.6f} "
+                    f"delta={ev['delta']:.6f} picked={ev['picked']} "
+                    f"basis={pick_basis} neighbors(L,R)=({left_str},{right_str})"
+                )
+
+    def _multitaper_spectrogram(self, series, fs, window_sec=2.0, step_sec=0.5, time_bandwidth=3.0, num_tapers=5):
+        nperseg = max(32, int(round(window_sec * fs)))
+        step = max(1, int(round(step_sec * fs)))
+        if len(series) < nperseg:
+            return np.array([]), np.array([]), np.empty((0, 0))
+
+        nfft = max(256, nperseg)
+
+        if _somata is not None:
+            try:
+                if hasattr(_somata, 'multitaper_spectrogram') and callable(_somata.multitaper_spectrogram):
+                    f, t, sxx = _somata.multitaper_spectrogram(
+                        series,
+                        fs=fs,
+                        window_length=window_sec,
+                        step=step_sec,
+                        time_bandwidth=time_bandwidth,
+                        num_tapers=num_tapers,
+                    )
+                    return np.asarray(f), np.asarray(t), np.asarray(sxx)
+            except Exception:
+                pass
+
+                # DPSS multitaper fallback with proper one-sided PSD normalization.
+        tapers = signal.windows.dpss(nperseg, NW=time_bandwidth, Kmax=num_tapers, sym=False)
+        starts = np.arange(0, len(series) - nperseg + 1, step)
+        freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+        times = (starts + (nperseg // 2)) / fs
+        sxx = np.zeros((len(freqs), len(starts)), dtype=np.float64)
+
+        for idx, start in enumerate(starts):
+            segment = series[start:start + nperseg]
+            tapered_fft_power = []
+            for taper in tapers:
+                tapered = (segment - np.mean(segment)) * taper
+                spec = np.fft.rfft(tapered, n=nfft)
+                # PSD normalization: V^2/Hz (similar convention to scipy/matlab one-sided PSD)
+                scale = fs * np.sum(taper ** 2)
+                psd = (np.abs(spec) ** 2) / scale
+                if nfft % 2 == 0:
+                    psd[1:-1] *= 2.0
+                else:
+                    psd[1:] *= 2.0
+                tapered_fft_power.append(psd)
+            sxx[:, idx] = np.mean(np.vstack(tapered_fft_power), axis=0)
+
+        return freqs, times, sxx
+
+    def _multitaper_psd(self, series, fs, time_bandwidth=3.5, num_tapers=None, nfft=None):
+        if len(series) < 32:
+            return np.array([]), np.array([])
+
+        data = np.asarray(series, dtype=np.float64)
+        data = data - np.mean(data)
+
+        if num_tapers is None:
+            num_tapers = max(3, int(2 * time_bandwidth) - 1)
+
+        if nfft is None:
+            nfft = max(256, 1 << int(np.ceil(np.log2(len(data)))))
+
+        tapers = signal.windows.dpss(len(data), NW=time_bandwidth, Kmax=num_tapers, sym=False)
+        freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+        psd_accum = np.zeros(len(freqs), dtype=np.float64)
+
+        for taper in tapers:
+            tapered = data * taper
+            spec = np.fft.rfft(tapered, n=nfft)
+            scale = fs * np.sum(taper ** 2)
+            psd = (np.abs(spec) ** 2) / scale
+            if nfft % 2 == 0:
+                psd[1:-1] *= 2.0
+            else:
+                psd[1:] *= 2.0
+            psd_accum += psd
+
+        return freqs, psd_accum / len(tapers)
+
+    def plot_channel(self, channel_idx=None, matlab_compare_path=None, matlab_var='data'):
+        idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
+        series, quality_series = self.get_channel_series(idx)
+        if len(series) == 0:
+            print('No decoded data to plot.')
+            return
+
+        fs_output = self.output_rate_hz
+        t = np.arange(len(series)) / fs_output
+
+        csv_path = f'/home/joannas/bladeRF/hdl/pythonscripts/time_domain_python_ch{idx}.csv'
+        export_matrix = np.column_stack((t, series, quality_series))
+        np.savetxt(
+            csv_path,
+            export_matrix,
+            delimiter=',',
+            header=(
+                'time_s,amplitude,quality_code | '
+                'quality mapping: 0=no_packet, 1=only_v1, 2=only_v2, '
+                '3=both_match, 5=mismatch_picked_v1, 6=mismatch_picked_v2'
+            ),
+            comments='',
+        )
+        print(f'Exported decoded time-domain CSV: {csv_path}')
+
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.plot(t, series, linewidth=0.7, color='red', alpha=0.85)
+        ax.set_title(f'Time series – Channel {idx}')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Amplitude')
+        ax.grid(True, alpha=0.4)
+        fig.tight_layout()
+
+        plt.show()
+
+    def start_capture(self, duration_seconds=None):
+        if self.enable_gcs:
+            self._init_gcs_clients()
+
+        self.setup_device()
+
+        self.running = True
+        self._rx_running = True
+        self._sdr_restart_requested.clear()
+        self.capture_start_time = time.time()
+
+        rx_t = threading.Thread(target=self.rx_thread, daemon=True)
+        self._rx_thread_ref = rx_t
+        proc_t = threading.Thread(target=self.processing_thread, daemon=True)
+        watchdog_t = threading.Thread(target=self._watchdog_thread_func, daemon=True)
+        trig_t = None
+
+        if self.enable_gcs and self.enable_gcs_trigger:
+            trig_t = threading.Thread(target=self._poll_gcs_triggers, daemon=True)
+
+        rx_t.start()
+        proc_t.start()
+        watchdog_t.start()
+        if trig_t is not None:
+            trig_t.start()
+
+        print('Capture started (MATLAB-style timestamp/frame decoder active).')
+
+        try:
+            end_time = None if duration_seconds is None else time.time() + float(duration_seconds)
+            while self.running:
+                if end_time is not None and time.time() >= end_time:
+                    break
+                if self._sdr_restart_requested.is_set():
+                    self._sdr_restart_requested.clear()
+                    self._restart_sdr()
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            print('Stopping capture (KeyboardInterrupt).')
+        finally:
+            self.running = False
+            self._rx_running = False
+            self._stop_gcs_recording()
+            try:
+                self.data_queue.put(None, timeout=0.1)
+            except Exception:
+                pass
+            rx_t.join(timeout=3.0)
+            proc_t.join(timeout=3.0)
+            if trig_t is not None:
+                trig_t.join(timeout=1.0)
+
+            self.print_stats()
+            self.save_raw_frame_log(
+                os.path.join(os.path.dirname(__file__), 'raw_frame_log.csv')
+            )
+            if self.enable_plotting:
+                self.plot_channel(self.channel_to_decode)
+            elif self.enable_gcs:
+                series, quality_series = self.get_channel_series(self.channel_to_decode)
+                self._upload_series_to_gcs_binary(series, quality_series)
+
+            try:
+                if self.device is not None:
+                    self.device.close()
+            except Exception:
+                pass
+
+
+if __name__ == '__main__':
+    reader = TimeStampBasedReader(
+        sample_rate=8e6,
+        frequency=914.5e6,
+        gain_mode='manual',
+        gain=30,
+        counter=False,
+        raw=False,
+        device=1,
+        bandwidth=1.5e6,
+        enable_plotting=True,
+        enable_bandpass_filter=False,
+        frame_length=250,
+        accepted_frame_lengths=(248, 250),
+        bits_per_channel=40,
+        channel_to_decode=2,
+        gcs_bucket="ueegbucket",  # Set to your GCS bucket
+        gcs_blob_name="ada_eyesclosed.npy",  # Output file name (.csv for CSV, .npy for binary)
+        gcs_buffer_size=400,  # Write every 400 samples (2 seconds at 200 Hz)
+        gcs_channels=[2, 3],  # List of channels to save (1-4)
+        gcs_format='binary',  # 'csv' or 'binary' - binary is much faster and more compact
+        # Pub/Sub trigger configuration (for trigger-controlled recording)
+        enable_gcs_trigger=True,  # Set to True to enable trigger-controlled recording
+        enable_gcs=True,
+        gcs_trigger_topic_id="sdr-commands",  # Pub/Sub topic id in same project as storage
+        gcs_trigger_subscription_id="sdr-commands-pi-sub",  # Optional existing subscription id; None = auto-create 
+    )
+
+    reader.start_capture(duration_seconds=None)
+    # reader.decode_from_file(
+    #     '/home/joannas/joannacheckalpha.bin',
+    #     bin_file_format='matlab_float32_2xn',
+    #     matlab_scale=2048.0,
+    #     matlab_select='first_row',
+    # )
+    # reader.print_stats()
+    # reader.plot_channel(3)
