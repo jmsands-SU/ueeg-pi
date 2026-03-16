@@ -1,0 +1,20 @@
+[Unit]
+Description=SDR Script Monitor with GCS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/sdr_monitor.sh
+Restart=always
+RestartSec=30
+User=ueeg
+WorkingDirectory=/home/ueeg
+Environment="PYTHONUNBUFFERED=1"
+Environment="GOOGLE_APPLICATION_CREDENTIALS=/home/ueeg/ueegproject-aea2731f9c3a.json"
+StandardOutput=file:/var/log/sdr_service.log
+StandardError=file:/var/log/sdr_service.log
+
+[Install]
+WantedBy=multi-user.target
