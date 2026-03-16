@@ -172,15 +172,9 @@ start_python_script() {
     
     # Load FPGA
     log "Loading FPGA..."
-    if [ -f /home/ueeg/hostedxA4.rbf ]; then
-        bladeRF-cli -l /home/ueeg/hostedxA4.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
-    elif [ -f /usr/share/Nuand/bladeRF/hostedxA4.rbf ]; then
-        bladeRF-cli -l /usr/share/Nuand/bladeRF/hostedxA4.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
-    elif [ -f /home/ueeg/hostedxA9.rbf ]; then
-        bladeRF-cli -l /home/ueeg/hostedxA9.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
-    elif [ -f /usr/share/Nuand/bladeRF/hostedxA9.rbf ]; then
-        bladeRF-cli -l /usr/share/Nuand/bladeRF/hostedxA9.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
-    fi
+
+    bladeRF-cli -l /home/ueeg/RMSxA4-2026-02-13_15.39.41/RMSxA4.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
+
     
     log "Successfully loaded FPGA bitstream!"
     sleep 3
