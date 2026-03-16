@@ -2,8 +2,8 @@
 # /usr/local/bin/sdr_monitor.sh
 
 LOG_FILE="/var/log/sdr_monitor.log"
-SCRIPT_PATH="/home/ueeg/sdr_reader_gcs_write.py"
-CREDENTIALS_FILE="/home/ueeg/ueegproject-aea2731f9c3a.json"
+SCRIPT_PATH="/home/ueeg/ueeg-pi/sdr_reader_gcs_write.py"
+CREDENTIALS_FILE="/home/ueeg/ueeg-pi/ueegproject-aea2731f9c3a.json"
 VENV_PATH="/home/ueeg/sdr_venv"
 STATUS_FILE="/tmp/sdr_monitor_status.json"
 MAX_RESTART_ATTEMPTS=3
@@ -173,7 +173,7 @@ start_python_script() {
     # Load FPGA
     log "Loading FPGA..."
 
-    bladeRF-cli -l /home/ueeg/RMSxA4-2026-02-13_15.39.41/RMSxA4.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
+    bladeRF-cli -l /home/ueeg/ueeg-pi/RMSxA4-2026-02-13_15.39.41/RMSxA4.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
 
     
     log "Successfully loaded FPGA bitstream!"
@@ -395,7 +395,7 @@ while true; do
             log "BladeRF reconnected! Reloading FPGA and restarting..."
             
 
-            bladeRF-cli -l /home/ueeg/RMSxA4-2026-02-13_15.39.41/RMSxA4.rbf 2>&1 | tee -a "$LOG_FILE" || true
+            bladeRF-cli -l /home/ueeg/ueeg-pi/RMSxA4-2026-02-13_15.39.41/RMSxA4.rbf 2>&1 | tee -a "$LOG_FILE" || true
             sleep 3
             
             if restart_script; then
