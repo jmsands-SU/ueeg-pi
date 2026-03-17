@@ -23,7 +23,7 @@ echo ""
 echo "Step 1: Installing system dependencies..."
 
 sudo apt update
-sudo apt install -y python3-dev libffi-dev build-essential libssl-dev wireless-tools
+sudo apt install -y python3-dev libffi-dev build-essential libssl-dev wireless-tools bladerf libbladerf-dev
 
 echo "✓ System dependencies installed"
 
@@ -31,7 +31,7 @@ echo ""
 echo "Step 2: Installing Python packages..."
 
 pip3 install --break-system-packages --upgrade pip
-pip3 install --break-system-packages google-cloud-storage google-cloud-pubsub
+pip3 install --break-system-packages google-cloud-storage google-cloud-pubsub scipy numpy matplotlib
 
 echo "✓ Python packages installed"
 
