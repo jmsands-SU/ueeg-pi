@@ -79,10 +79,10 @@ sudo touch /var/log/sdr_monitor.log
 sudo touch /var/log/sdr_service.log
 sudo touch /var/log/sdr_python.log
 sudo touch /var/log/network_monitor.log
-sudo chown $$CURRENT_USER:$$CURRENT_USER /var/log/sdr_monitor.log
-sudo chown $$CURRENT_USER:$$CURRENT_USER /var/log/sdr_service.log
-sudo chown $$CURRENT_USER:$$CURRENT_USER /var/log/sdr_python.log
-sudo chown $$CURRENT_USER:$$CURRENT_USER /var/log/network_monitor.log
+sudo chown ${CURRENT_USER}:${CURRENT_USER} /var/log/sdr_monitor.log
+sudo chown ${CURRENT_USER}:${CURRENT_USER} /var/log/sdr_service.log
+sudo chown ${CURRENT_USER}:${CURRENT_USER} /var/log/sdr_python.log
+sudo chown ${CURRENT_USER}:${CURRENT_USER} /var/log/network_monitor.log
 
 echo "✓ Log files created"
 
