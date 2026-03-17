@@ -27,9 +27,7 @@ sudo apt install -y \
     python3-dev python3-venv git cmake libusb-1.0-0-dev pkg-config \
     libffi-dev build-essential libssl-dev wireless-tools \
     python3-numpy python3-scipy python3-cffi \
-    libopenblas-dev libatlas-base-dev gfortran \
-    bladerf libbladerf-dev libbladerf2 \
-    bladerf-fpga-hostedxA4 bladerf-fpga-hostedxA9
+    bladerf libbladerf-dev
 
 echo "✓ System dependencies installed"
 
