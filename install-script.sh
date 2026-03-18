@@ -24,50 +24,11 @@ echo ""
 echo "Step 1: Installing System Dependencies..."
 sudo apt update
 sudo apt install -y \
-    python3-dev python3-venv git cmake libusb-1.0-0-dev pkg-config \
-    libffi-dev build-essential libssl-dev wireless-tools \
-    python3-numpy python3-scipy python3-cffi \
-    bladerf libbladerf-dev
+    python3-dev python3-venv git cmake libusb-1.0-0-dev pkg-config \ 
+    python3-numpy python3-scipy python3-matplotlib \
+    bladerf libbladerf-dev python3-bladerf
 
 echo "✓ System dependencies installed"
-
-echo ""
-echo "Step 2: Building and Installing BladeRF from Source..."
-if [ ! -d "${USER_HOME}/bladeRF" ]; then
-    cd "${USER_HOME}"
-    git clone https://github.com/Nuand/bladeRF.git
-fi
-cd "${USER_HOME}/bladeRF/host"
-mkdir -p build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local ../
-make -j$(nproc)
-sudo make install
-echo "✓ BladeRF library built and installed"
-
-# FIX: Configure shared library path
-echo "Configuring shared library path for BladeRF..."
-sudo tee /etc/ld.so.conf.d/bladerf.conf > /dev/null << 'EOF'
-/usr/local/lib
-EOF
-sudo ldconfig
-echo "✓ Shared library cache updated"
-
-echo ""
-echo "Step 3: Installing BladeRF Python Bindings..."
-cd "${USER_HOME}/bladeRF/host/libraries/libbladeRF_bindings/python"
-echo "Installing Python bindings via direct copy..."
-# This direct copy method is more reliable than setup.py or pip on some systems
-sudo cp -r bladerf /usr/lib/python3/dist-packages/
-echo "✓ Python bindings installed"
-
-# Verify
-if python3 -c "import bladerf" 2>/dev/null; then
-    echo "✓ BladeRF Python module accessible"
-else
-    echo "✗ ERROR: BladeRF Python module still not found!"
-    exit 1
-fi
 
 echo ""
 echo "Step 4: Setting up Python Virtual Environment..."
