@@ -162,9 +162,9 @@ start_python_script() {
     log "Starting Python SDR script with venv..."
     
     # Check if already running
-    if pgrep -f "$VENV_PATH/bin/python3.*pythonreadersinglechannel" > /dev/null; then
+    if pgrep -f "$VENV_PATH/bin/python3.*" > /dev/null; then
         log "ERROR: Python script already running! Not starting another instance."
-        local existing_pid=$(pgrep -f "$VENV_PATH/bin/python3.*pythonreadersinglechannel")
+        local existing_pid=$(pgrep -f "$VENV_PATH/bin/python3.*sdr_reader_gcs_write")
         log "Existing PID: $existing_pid"
         echo $existing_pid > /tmp/sdr_script.pid
         return 0
@@ -200,7 +200,7 @@ start_python_script() {
     
     sleep 5
     
-    local python_pid=$(pgrep -f "$VENV_PATH/bin/python3.*pythonreadersinglechannel")
+    local python_pid=$(pgrep -f "$VENV_PATH/bin/python3.*sdr_reader_gcs_write")
     
     if [ -n "$python_pid" ]; then
         echo $python_pid > /tmp/sdr_script.pid
@@ -243,7 +243,7 @@ stop_python_script() {
 
 check_script_health() {
     # Look for Python running from our venv
-    local running_pid=$(pgrep -f "$VENV_PATH/bin/python3.*pythonreadersinglechannel")
+    local running_pid=$(pgrep -f "$VENV_PATH/bin/python3.*sdr_reader_gcs_write")
     
     if [ -n "$running_pid" ]; then
         echo $running_pid > /tmp/sdr_script.pid
