@@ -422,7 +422,7 @@ class TimeStampBasedReader:
         
         print(
             f"GCS append: gs://{self.gcs_bucket}/{self.gcs_blob_name} "
-            f"(+{n_samples} samples, total={self.gcs_samples_written})"
+            f"(+{n_samples} samples, total={self.gcs_samples_written} at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})"
         )
 
     def _write_gcs_metadata(self):
@@ -1851,7 +1851,7 @@ if __name__ == '__main__':
     reader = TimeStampBasedReader(
         sample_rate=8e6,
         frequency=914.5e6,
-        gain_mode='manual',
+        gain_mode='slowattack',
         gain=30,
         counter=False,
         raw=False,
