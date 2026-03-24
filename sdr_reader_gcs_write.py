@@ -373,7 +373,16 @@ class TimeStampBasedReader:
                 current_total = self.gcs_samples_written + len(self.gcs_write_buffer)
                 new_total = current_total + 4
                 interval = int(self.gcs_timestamp_log_interval)
-                if interval > 0 and (new_total // interval) > (current_total // interval):
+                # Always log sample 0
+                if current_total == 0:
+                    ts_val = group_sample_timestamps[0]
+                    if not np.isnan(ts_val):
+                        self.gcs_timestamp_log.append({
+                            'gcs_sample_idx': 0,
+                            'sample_timestamp_s': float(ts_val),
+                            'system_time_s': time.time(),
+                        })
+                elif interval > 0 and (new_total // interval) > (current_total // interval):
                     milestone = (new_total // interval) * interval
                     s_idx = max(0, min(3, milestone - current_total - 1))
                     ts_val = group_sample_timestamps[s_idx]
