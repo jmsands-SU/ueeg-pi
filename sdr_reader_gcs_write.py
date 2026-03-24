@@ -7,7 +7,8 @@ from dataclasses import dataclass
 import os
 import numpy as np
 try:
-    from bladerf import _bladerf
+    import bladerf                  # This is the high-level, user-friendly wrapper
+    from bladerf import _bladerf    # This is the low-level module with all the constants
 except Exception:
     _bladerf = None
 from scipy import signal
@@ -183,7 +184,11 @@ class TimeStampBasedReader:
         self._extract_lookback_words = np.array([], dtype=np.uint16)  # preserves 2-word context for -2 bit alignment
         self._words_processed_total = 0       # absolute word offset for timestamps
         self._raw_frame_log = []              # list of (abs_word_idx, packet_num, frame_length, passed_valid)
-
+        self._word_timestamps = []  # Stores timestamp for each word in decode buffer
+        self.gcs_timestamp_log = []  # List of {gcs_sample_idx, timestamp_utc, system_time_s}
+        self.gcs_timestamp_log_interval = 12000  # Log timestamp every 12000 samples (60 seconds at 200 Hz)
+        self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}  # Track word positions for packets
+        self._first_group_skipped = False  # Discard first decoded group (startup artifact)
         self.capture_start_time = None
         self.samples_captured = 0
 
@@ -315,7 +320,7 @@ class TimeStampBasedReader:
                 )
                 self._stop_gcs_recording()
 
-    def _append_gcs_group(self, group_values: dict, group_quality: dict):
+    def _append_gcs_group(self, group_values: dict, group_quality: dict, group_sample_timestamps=None):
         """Append one decoded group (4 time slots) as 4 rows to the GCS write buffer.
         Each row stores selected channel values plus one packed quality field.
         Quality codes use 4 bits per channel packed into a uint16 in gcs_channels order.
@@ -343,6 +348,23 @@ class TimeStampBasedReader:
         with self._gcs_buffer_lock:
             if not self.gcs_recording_active:
                 return
+
+            # Log timestamps periodically
+            if group_sample_timestamps is not None:
+                current_total = self.gcs_samples_written + len(self.gcs_write_buffer)
+                new_total = current_total + 4
+                interval = int(self.gcs_timestamp_log_interval)
+                if interval > 0 and (new_total // interval) > (current_total // interval):
+                    milestone = (new_total // interval) * interval
+                    s_idx = max(0, min(3, milestone - current_total - 1))
+                    ts_val = group_sample_timestamps[s_idx]
+                    if not np.isnan(ts_val):
+                        self.gcs_timestamp_log.append({
+                            'gcs_sample_idx': int(milestone),
+                            'sample_timestamp_s': float(ts_val),
+                            'system_time_s': time.time(),
+                        })
+
             self.gcs_write_buffer.extend(rows_to_add)
             if len(self.gcs_write_buffer) >= int(self.gcs_buffer_size):
                 should_flush = True
@@ -472,7 +494,9 @@ class TimeStampBasedReader:
                 'blob_name': self.gcs_blob_name,
                 'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 'sdr_restart_log': list(self._sdr_restart_log),
-                'notes': 'Load with numpy.load(). Structured array field `values` contains channel amplitudes; `quality_packed` stores one 4-bit quality code per selected channel.',
+                'timestamp_log': list(self.gcs_timestamp_log),
+                'timestamp_log_interval_samples': int(self.gcs_timestamp_log_interval),
+                'notes': 'Load with numpy.load(). Structured array field `values` contains channel amplitudes; `quality_packed` stores one 4-bit quality code per selected channel. timestamp_log provides periodic sample-accurate UTC synchronization checkpoints.',
             }
 
             meta_blob.upload_from_string(json.dumps(metadata, indent=2), content_type='application/json')
@@ -678,8 +702,9 @@ class TimeStampBasedReader:
 
     def setup_device(self):
         if _bladerf is None:
-            raise ImportError('bladerf Python module is not available. Install it or use offline decode methods.')
-        self.device = _bladerf.BladeRF()
+            raise ImportError('bladerf Python module is not available.')
+        self.device = bladerf.BladeRF()
+
         self.channel = self.device.Channel(_bladerf.CHANNEL_RX(0))
         self.channel2 = self.device.Channel(_bladerf.CHANNEL_RX(1))
 
@@ -698,7 +723,8 @@ class TimeStampBasedReader:
                 ch.gain_mode = _bladerf.GainMode.Hybrid_AGC
             else:
                 ch.gain_mode = _bladerf.GainMode.Manual
-            ch.gain = self.gain
+            if mode == 'manual':
+                ch.gain = self.gain
 
         self.device.sync_config(
             layout=_bladerf.ChannelLayout.RX_X2,
@@ -716,7 +742,6 @@ class TimeStampBasedReader:
         print(f'  RX1: {self.channel2.sample_rate/1e6:.2f} MSPS @ {self.channel2.frequency/1e6:.2f} MHz')
         print('  Layout: RX_X2, Format: SC16_Q11')
         print('=============================\n')
-
     def _extract_output_stream(self, rx_samples_u16: np.ndarray) -> np.ndarray:
         if self.device_num == 1:
             return rx_samples_u16[0::4].copy()
@@ -726,31 +751,47 @@ class TimeStampBasedReader:
         self.channel.enable = True
         self.channel2.enable = True
         rx_buffer = bytearray(self.buffer_size * 4 * 2)
+        meta = _bladerf.ffi.new("struct bladerf_metadata *")
 
         try:
+            print("RX thread started. Waiting for samples...")
+            
             while self.running and self._rx_running:
-                self.device.sync_rx(rx_buffer, self.buffer_size)
-                rx_samples = np.frombuffer(rx_buffer, dtype=np.uint16)
-
-                valid_length = len(rx_samples)
-                for i in range(0, len(rx_samples) - 3, 4):
-                    if (
-                        rx_samples[i] == 0
-                        and rx_samples[i + 1] == 0
-                        and rx_samples[i + 2] == 0
-                        and rx_samples[i + 3] == 0
-                    ):
-                        valid_length = i
-                        break
-
-                if valid_length <= 0:
+                
+                try:
+                    self.device.sync_rx(rx_buffer, self.buffer_size, timeout_ms=3500, meta=meta)
+                    # Capture system time immediately after sync_rx returns
+                    buffer_received_time = time.time()
+                except _bladerf.TimeoutError:
+                    print("⚠️  RX timeout (no signal). Retrying...")
+                    time.sleep(0.1)
+                    continue
+                except Exception as e:
+                    print(f"⚠️  RX error: {e}. Retrying...")
+                    time.sleep(0.1)
                     continue
 
-                output_data = self._extract_output_stream(rx_samples[:valid_length])
+                actual_count = meta.actual_count
+                if actual_count <= 0:
+                    continue
+                
+                # Use actual_count * 2 (I and Q per sample)
+                valid_length = actual_count * 2
+                rx_samples = np.frombuffer(rx_buffer, dtype=np.uint16, count=valid_length)
+                
+                output_data = self._extract_output_stream(rx_samples)
+                
+                # Calculate timestamp for FIRST word in this buffer
+                # The buffer duration represents how long it took to fill
+                # Last word arrived at buffer_received_time, first word arrived buffer_duration earlier
+                buffer_duration_s = actual_count / self.sample_rate  # self.sample_rate = 8e6
+                first_word_timestamp = buffer_received_time - buffer_duration_s
+                
                 self.samples_captured += len(output_data)
 
                 try:
-                    self.data_queue.put(output_data, timeout=0.2)
+                    # Pass data with timestamp of first word
+                    self.data_queue.put((output_data, first_word_timestamp), timeout=0.2)
                 except queue.Full:
                     pass
 
@@ -912,9 +953,10 @@ class TimeStampBasedReader:
             consumed = int(process_until_input)
             if consumed > 0:
                 self._extract_lookback_words = data[max(0, consumed - 2):consumed].copy()
-            return {1: [], 2: [], 3: [], 4: []}, consumed
+            return ({1: [], 2: [], 3: [], 4: []}, {1: [], 2: [], 3: [], 4: []}), consumed
 
         packets_by_channel = {1: [], 2: [], 3: [], 4: []}
+        packet_word_positions = {1: [], 2: [], 3: [], 4: []}  # NEW: track word positions
         prev_start = None
         prev_packet_num = self._last_extracted_packet_num
         prev_abs_start = self._last_extracted_frame_abs_word_start
@@ -951,6 +993,7 @@ class TimeStampBasedReader:
                             packets_by_channel[ch].append(
                                 DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8))
                             )
+                            packet_word_positions[ch].append(None)
                     self.packet_sequence_anomaly_count += missing
                     self.placeholder_inserts_cross_chunk += int(missing)
 
@@ -1020,6 +1063,7 @@ class TimeStampBasedReader:
                             packets_by_channel[ch].append(
                                 DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8))
                             )
+                            packet_word_positions[ch].append(None)
                     self.placeholder_inserts_intra_chunk += int(missing)
                     if missing_from_distance == missing_from_numbers:
                         self.gap_estimate_agree_count += 1
@@ -1035,6 +1079,7 @@ class TimeStampBasedReader:
                     packets_by_channel[ch].append(
                         DecodedPacket(packet_num=packet_num, is_valid=False, bits=np.array([], dtype=np.uint8))
                     )
+                    packet_word_positions[ch].append(start_idx - prefix_len)
                     continue
 
                 bits_block = data_bit[ch_start:ch_end]
@@ -1043,6 +1088,7 @@ class TimeStampBasedReader:
                 packets_by_channel[ch].append(
                     DecodedPacket(packet_num=packet_num, is_valid=True, bits=selected_bits.astype(np.uint8))
                 )
+                packet_word_positions[ch].append(start_idx - prefix_len)
 
             prev_start = start_idx
             prev_packet_num = packet_num
@@ -1056,7 +1102,7 @@ class TimeStampBasedReader:
         if consumed > 0:
             self._extract_lookback_words = data[max(0, consumed - 2):consumed].copy()
 
-        return packets_by_channel, consumed
+        return (packets_by_channel, packet_word_positions), consumed
 
     def _build_group_with_placeholders(self, channel_idx: int):
         pending = self._pending_packets_by_channel[channel_idx]
@@ -1075,11 +1121,16 @@ class TimeStampBasedReader:
                 self.placeholder_inserts_group_builder += 1
         return group
 
-    def _decode_packet_groups(self, packets_by_channel):
+    def _decode_packet_groups(self, packets_by_channel, packet_word_positions=None, word_timestamps=None):
         # Extend pending packets for each channel (no packet dropping/resync)
         for channel_idx, packets in packets_by_channel.items():
             pending = self._pending_packets_by_channel[channel_idx]
             pending.extend(packets)
+
+            # Also extend word positions if available
+            if packet_word_positions is not None:
+                positions = packet_word_positions.get(channel_idx, [])
+                self._pending_packet_word_positions[channel_idx].extend(positions)
 
             if not self._synced_to_packet0_by_channel[channel_idx]:
                 if len(pending) > 0:
@@ -1091,9 +1142,63 @@ class TimeStampBasedReader:
             if not all(len(self._pending_packets_by_channel[ch]) >= 8 for ch in synced):
                 break
 
+            # Discard the first group — it's a startup artifact where only v2 packets
+            # (4-7) are available because the decoder joined mid-stream.
+            if not self._first_group_skipped:
+                self._first_group_skipped = True
+                for channel_idx in synced:
+                    if len(self._pending_packet_word_positions[channel_idx]) >= 8:
+                        self._pending_packet_word_positions[channel_idx] = self._pending_packet_word_positions[channel_idx][8:]
+                    self._build_group_with_placeholders(channel_idx)
+                continue
+
             group_values = {}
             group_quality = {}
+            group_sample_timestamps = None  # NEW: 4 timestamps, one per sample
+
+            # Calculate timestamps for the 4 samples BEFORE processing channels
+            first_channel = synced[0]
+            if (word_timestamps is not None and
+                    len(self._pending_packet_word_positions[first_channel]) >= 8):
+
+                group_positions = self._pending_packet_word_positions[first_channel][:8]
+                group_packets = self._pending_packets_by_channel[first_channel][:8]
+
+                group_sample_timestamps = np.full(4, np.nan, dtype=np.float64)
+
+                # Find packet 0's reception time as our reference
+                packet_0_timestamp = None
+                for i, pkt in enumerate(group_packets):
+                    if pkt.packet_num == 0 and i < len(group_positions):
+                        pos = group_positions[i]
+                        if pos is not None and 0 <= pos < len(word_timestamps):
+                            packet_0_timestamp = word_timestamps[pos]
+                            break
+
+                # If packet 0 not available, use packet 7 and adjust
+                if packet_0_timestamp is None:
+                    for i, pkt in enumerate(group_packets):
+                        if pkt.packet_num == 7 and i < len(group_positions):
+                            pos = group_positions[i]
+                            if pos is not None and 0 <= pos < len(word_timestamps):
+                                packet_7_timestamp = word_timestamps[pos]
+                                # Packet 7 is sent 17.5ms after packet 0
+                                packet_0_timestamp = packet_7_timestamp - 0.0175
+                                break
+
+                if packet_0_timestamp is not None:
+                    # Sample timestamps accounting for FPGA pipeline delay
+                    # Sample 0 was captured 15ms before packet 0 was sent
+                    group_sample_timestamps[0] = packet_0_timestamp - 0.015
+                    group_sample_timestamps[1] = packet_0_timestamp - 0.010
+                    group_sample_timestamps[2] = packet_0_timestamp - 0.005
+                    group_sample_timestamps[3] = packet_0_timestamp - 0.000
+
             for channel_idx in synced:
+                # Pop the word positions for this channel's group
+                if len(self._pending_packet_word_positions[channel_idx]) >= 8:
+                    self._pending_packet_word_positions[channel_idx] = self._pending_packet_word_positions[channel_idx][8:]
+
                 group = self._build_group_with_placeholders(channel_idx)
 
                 values = np.full(4, np.nan, dtype=np.float64)
@@ -1153,10 +1258,13 @@ class TimeStampBasedReader:
                         if not p1.is_valid:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
                             self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
+                            print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} missing, p2 pkt#{p2.packet_num} valid")
                         else:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short'] += 1
+                            print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} payload short, p2 pkt#{p2.packet_num} valid")
                     else:
                         quality[s] = 0
+                        print(f"  no_packet ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} valid={p1.is_valid}, p2 pkt#{p2.packet_num} valid={p2.is_valid}")
 
                 prev_neighbor = None
                 if len(self.decoded_groups_by_channel[channel_idx]) > 0:
@@ -1203,32 +1311,78 @@ class TimeStampBasedReader:
                 group_quality[channel_idx] = quality
 
             if any(ch in self.gcs_channels for ch in synced):
-                self._append_gcs_group(group_values, group_quality)
+                self._append_gcs_group(group_values, group_quality, group_sample_timestamps)
 
     def processing_thread(self):
         while self.running:
             try:
-                chunk = self.data_queue.get(timeout=0.5)
+                item = self.data_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            if chunk is None:
+            if item is None:
                 break
+
+            # Unpack data and timestamp
+            if isinstance(item, tuple):
+                chunk, chunk_first_word_timestamp = item
+            else:
+                chunk = item
+                chunk_first_word_timestamp = None
 
             if len(chunk) == 0:
                 continue
-
+            
+            # Build timestamp array for this chunk
+            # Each word's timestamp based on its position in the chunk at 100 kHz
+            chunk_timestamps = None
+            if chunk_first_word_timestamp is not None:
+                chunk_timestamps = chunk_first_word_timestamp + np.arange(len(chunk)) / 100e3
+            
+            # Append chunk to decode buffer
             self._decode_buffer = np.concatenate([self._decode_buffer, chunk])
-            packets, consumed = self._extract_channel_packets(self._decode_buffer)
+            
+            # Append timestamps
+            if chunk_timestamps is not None:
+                if not hasattr(self, '_word_timestamps') or self._word_timestamps is None:
+                    self._word_timestamps = []
+                self._word_timestamps.extend(chunk_timestamps)
+            
+            result, consumed = self._extract_channel_packets(self._decode_buffer)
+            
             if consumed > 0:
-                self._decode_packet_groups(packets)
+                # Unpack packets and positions
+                packets_by_channel, packet_word_positions = result
+                
+                # Extract timestamps for consumed words
+                consumed_word_timestamps = None
+                if hasattr(self, '_word_timestamps') and self._word_timestamps is not None and len(self._word_timestamps) >= consumed:
+                    consumed_word_timestamps = self._word_timestamps[:consumed]
+                    self._word_timestamps = self._word_timestamps[consumed:]
+                
+                self._decode_packet_groups(
+                    packets_by_channel, 
+                    packet_word_positions=packet_word_positions,
+                    word_timestamps=consumed_word_timestamps
+                )
                 self._words_processed_total += consumed
                 self._decode_buffer = self._decode_buffer[consumed:]
 
+        # Final flush
         if len(self._decode_buffer) > 0:
-            packets, consumed = self._extract_channel_packets(np.concatenate([self._decode_buffer, np.array([0], dtype=np.uint16)]))
+            packets, consumed = self._extract_channel_packets(
+                np.concatenate([self._decode_buffer, np.array([0], dtype=np.uint16)])
+            )
             if consumed > 0:
-                self._decode_packet_groups(packets)
+                packets_by_channel, packet_word_positions = packets
+                consumed_word_timestamps = None
+                if hasattr(self, '_word_timestamps') and self._word_timestamps is not None and len(self._word_timestamps) >= consumed:
+                    consumed_word_timestamps = self._word_timestamps[:consumed]
+                self._decode_packet_groups(
+                    packets_by_channel, 
+                    packet_word_positions=packet_word_positions,
+                    word_timestamps=consumed_word_timestamps
+                )
                 self._words_processed_total += consumed
 
     def reset_decoder_state(self):
@@ -1275,6 +1429,8 @@ class TimeStampBasedReader:
         self._extract_lookback_words = np.array([], dtype=np.uint16)  # preserves 2-word context for -2 bit alignment
         self._words_processed_total = 0       # absolute word offset for timestamps
         self._raw_frame_log = []              # list of (abs_word_idx, packet_num, frame_length, passed_valid)
+        self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}
+        self._first_group_skipped = False
         self.gcs_write_buffer = []
 
     def decode_from_word_stream(self, word_stream, reset=True):
@@ -1291,17 +1447,19 @@ class TimeStampBasedReader:
         words_u16 = words.astype(np.uint16, copy=False)
         self._decode_buffer = np.concatenate([self._decode_buffer, words_u16])
 
-        packets, consumed = self._extract_channel_packets(self._decode_buffer)
+        result, consumed = self._extract_channel_packets(self._decode_buffer)
         if consumed > 0:
-            self._decode_packet_groups(packets)
+            packets_by_channel, packet_word_positions = result
+            self._decode_packet_groups(packets_by_channel, packet_word_positions=packet_word_positions)
             self._words_processed_total += consumed
             self._decode_buffer = self._decode_buffer[consumed:]
 
         if len(self._decode_buffer) > 0:
             padded = np.concatenate([self._decode_buffer, np.array([0], dtype=np.uint16)])
-            packets, consumed = self._extract_channel_packets(padded)
+            result, consumed = self._extract_channel_packets(padded)
             if consumed > 0:
-                self._decode_packet_groups(packets)
+                packets_by_channel, packet_word_positions = result
+                self._decode_packet_groups(packets_by_channel, packet_word_positions=packet_word_positions)
                 self._words_processed_total += consumed
             self._decode_buffer = np.array([], dtype=np.uint16)
 
@@ -1850,13 +2008,13 @@ class TimeStampBasedReader:
 if __name__ == '__main__':
     reader = TimeStampBasedReader(
         sample_rate=8e6,
-        frequency=914.5e6,
+        frequency=918.5e6,
         gain_mode='slowattack',
         gain=30,
         counter=False,
         raw=False,
         device=1,
-        bandwidth=1.5e6,
+        bandwidth=4e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
