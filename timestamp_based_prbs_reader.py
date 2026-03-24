@@ -46,7 +46,7 @@ class TimeStampBasedPRBSReader:
     """
 
     PRBS_BYTES_PER_COPY = 10   # 80 bits packed into 10 bytes
-    BYTES_PER_SAMPLE = 20      # v1 + v2
+    BYTES_PER_SAMPLE = 21      # v1 (10) + v2 (10) + quality (1)
 
     def __init__(
         self,
@@ -65,10 +65,11 @@ class TimeStampBasedPRBSReader:
         gcs_trigger_subscription_id='sdr-commands-pi-sub',
         gcs_trigger_pull_timeout=0.5,
         enable_gcs=False,
+        local_path=None,           # if set, also write binary + .meta sidecar locally
         buffer_size=65536,
         frame_length=250,
-        accepted_frame_lengths=None,
-        bits_per_channel=20,       # 4 * 20 = 80 bits = 10 bytes per packet
+        accepted_frame_lengths=(248, 250),
+        bits_per_channel=40,       # 4 * 20 = 80 bits = 10 bytes per packet
     ):
         self.sample_rate = int(sample_rate)
         self.frequency = int(frequency)
@@ -92,7 +93,7 @@ class TimeStampBasedPRBSReader:
         self.gcs_bucket_obj = None
         self.gcs_subscriber = None
         self.gcs_recording_active = False
-        self.gcs_write_buffer = []   # list of bytes objects (20 bytes each)
+        self.gcs_write_buffer = []   # list of bytes objects (21 bytes each)
         self.gcs_chunk_counter = 0
         self.gcs_session_id = None
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
@@ -101,6 +102,10 @@ class TimeStampBasedPRBSReader:
         self._gcs_trigger_duration = None
         self._gcs_recording_start_time = None
 
+        self.local_path = local_path
+        self._local_file = None          # open file handle during recording
+        self._local_samples_written = 0
+
         self.frame_length = int(frame_length)
         if accepted_frame_lengths is None:
             accepted_frame_lengths = (self.frame_length,)
@@ -108,7 +113,9 @@ class TimeStampBasedPRBSReader:
         if len(self.accepted_frame_lengths) == 0:
             raise ValueError('accepted_frame_lengths must contain at least one value')
         self.bits_per_channel = int(bits_per_channel)
-        self.prbs_bits = 4 * self.bits_per_channel   # total raw bits per packet (e.g. 80)
+        # prbs_bits = valid bits per packet after the 50% duty cycle valid flag filters the raw window.
+        # Raw window = 4 * bits_per_channel words; 50% duty cycle yields 2 * bits_per_channel valid bits.
+        self.prbs_bits = 2 * self.bits_per_channel   # valid bits per packet (e.g. 80)
 
         if self.prbs_bits != 80:
             print(f"⚠️  prbs_bits={self.prbs_bits} (expected 80). GCS will still write {self.prbs_bits//8} bytes per copy.")
@@ -156,6 +163,10 @@ class TimeStampBasedPRBSReader:
         self.gap_estimate_agree_count = 0
         self.gap_estimate_disagree_count = 0
         self.packet_sequence_events = deque(maxlen=2000)
+        self.quality_both = 0        # v1 valid + v2 valid  (0x03)
+        self.quality_v1_only = 0     # v1 valid only        (0x01)
+        self.quality_v2_only = 0     # v2 valid only        (0x02)
+        self.quality_none = 0        # both missing         (0x00)
 
         if self.enable_gcs and not self.enable_gcs_trigger:
             self.enable_gcs_trigger = True
@@ -184,7 +195,12 @@ class TimeStampBasedPRBSReader:
                 self.gcs_subscriber = pubsub_v1.SubscriberClient()
 
     def _start_gcs_recording(self):
+        if self.enable_gcs and self.gcs_bucket_obj is None:
+            print('WARNING: GCS start trigger received but GCS client is not initialised — recording NOT started.')
+            return
         with self._gcs_buffer_lock:
+            if self.gcs_recording_active:
+                return  # already recording; ignore duplicate trigger
             self.gcs_recording_active = True
             self.gcs_write_buffer = []
             self.gcs_chunk_counter = 0
@@ -193,6 +209,7 @@ class TimeStampBasedPRBSReader:
             self._gcs_recording_start_time = time.time()
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         print(f'GCS recording started (session={self.gcs_session_id}, blob={self.gcs_blob_name}).')
+        self._start_local_recording()
 
     def _stop_gcs_recording(self):
         with self._gcs_buffer_lock:
@@ -205,6 +222,70 @@ class TimeStampBasedPRBSReader:
             except Exception as exc:
                 print(f'GCS flush error during stop: {exc}')
             print('GCS recording stopped.')
+        self._stop_local_recording()
+
+    # -------------------------------------------------------------------------
+    # Local file recording
+    # -------------------------------------------------------------------------
+
+    def _start_local_recording(self):
+        if not self.local_path:
+            return
+        try:
+            self._local_file = open(self.local_path, 'wb')
+            self._local_samples_written = 0
+            print(f'Local recording started: {self.local_path}')
+        except Exception as exc:
+            print(f'Failed to open local file {self.local_path}: {exc}')
+            self._local_file = None
+
+    def _append_local_samples(self, sample_entries):
+        if self._local_file is None:
+            return
+        try:
+            self._local_file.write(b''.join(sample_entries))
+            self._local_file.flush()
+            self._local_samples_written += len(sample_entries)
+        except Exception as exc:
+            print(f'Local file write error: {exc}')
+
+    def _stop_local_recording(self):
+        if self._local_file is None:
+            return
+        try:
+            self._local_file.close()
+        except Exception:
+            pass
+        self._local_file = None
+        self._write_local_metadata()
+        print(f'Local recording stopped: {self.local_path} ({self._local_samples_written} samples)')
+
+    def _write_local_metadata(self):
+        if not self.local_path:
+            return
+        try:
+            prbs_bytes = self.prbs_bits // 8
+            metadata = {
+                'format': 'prbs_raw_binary',
+                'prbs_bits_per_packet': int(self.prbs_bits),
+                'bytes_per_copy': int(prbs_bytes),
+                'bytes_per_sample': int(self.BYTES_PER_SAMPLE),
+                'layout': {
+                    f'bytes_0_{prbs_bytes - 1}': 'v1 PRBS bits packed MSB-first',
+                    f'bytes_{prbs_bytes}_{2 * prbs_bytes - 1}': 'v2 PRBS bits packed MSB-first',
+                    f'byte_{2 * prbs_bytes}': 'quality flags: bit0=v1_valid, bit1=v2_valid',
+                },
+                'samples_written': int(self._local_samples_written),
+                'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'timestamp_log': list(self.gcs_timestamp_log),
+                'timestamp_log_interval_samples': int(self.gcs_timestamp_log_interval),
+            }
+            meta_path = self.local_path + '.meta'
+            with open(meta_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            print(f'Local metadata written: {meta_path}')
+        except Exception as exc:
+            print(f'Error writing local metadata: {exc}')
 
     def _handle_gcs_trigger_message(self, payload: str):
         text = (payload or '').strip()
@@ -224,8 +305,7 @@ class TimeStampBasedPRBSReader:
             except Exception:
                 pass
         if command in ('start', 'record', 'resume'):
-            if not self.gcs_recording_active:
-                self._start_gcs_recording()
+            self._start_gcs_recording()
         elif command in ('stop', 'pause', 'end'):
             self._stop_gcs_recording()
 
@@ -274,6 +354,7 @@ class TimeStampBasedPRBSReader:
 
         group_sample_timestamps: optional np.array of 4 float64 UTC timestamps.
         """
+        self._append_local_samples(sample_entries)
         if not self.enable_gcs:
             return
         should_flush = False
@@ -369,11 +450,13 @@ class TimeStampBasedPRBSReader:
                 'layout': {
                     f'bytes_0_{prbs_bytes - 1}': 'v1 PRBS bits packed (packet 0/1/2/3 for samples 0/1/2/3)',
                     f'bytes_{prbs_bytes}_{2 * prbs_bytes - 1}': 'v2 PRBS bits packed (packet 4/5/6/7 for samples 0/1/2/3)',
+                    f'byte_{2 * prbs_bytes}': 'quality flags: bit0=v1_valid, bit1=v2_valid (0x00=both missing, 0x01=v1 only, 0x02=v2 only, 0x03=both)',
                 },
                 'decode_hint': (
                     f'raw = np.frombuffer(blob, dtype=np.uint8).reshape(-1, {self.BYTES_PER_SAMPLE}); '
                     f'v1 = np.unpackbits(raw[:, :{prbs_bytes}], axis=1); '
-                    f'v2 = np.unpackbits(raw[:, {prbs_bytes}:], axis=1)'
+                    f'v2 = np.unpackbits(raw[:, {prbs_bytes}:{2*prbs_bytes}], axis=1); '
+                    f'quality = raw[:, {2*prbs_bytes}]'
                 ),
                 'gcs_samples_written': int(self.gcs_samples_written),
                 'gcs_chunk_counter': int(self.gcs_chunk_counter),
@@ -541,8 +624,16 @@ class TimeStampBasedPRBSReader:
         valid_words = valid_flag.astype(bool)
         if np.any(valid_words):
             first_valid_idx = int(np.flatnonzero(valid_words)[0])
+            last_pkt = int(packet_nums_for_edges[first_valid_idx])
             if first_valid_idx > 0:
-                packet_nums_for_edges[:first_valid_idx] = packet_nums_for_edges[first_valid_idx]
+                packet_nums_for_edges[:first_valid_idx] = last_pkt
+            for idx in range(first_valid_idx + 1, len(packet_nums_for_edges)):
+                if valid_words[idx]:
+                    last_pkt = int(packet_nums_for_edges[idx])
+                else:
+                    packet_nums_for_edges[idx] = last_pkt
+        else:
+            return ([], []), 0
 
         transitions = np.where(np.diff(packet_nums_for_edges) != 0)[0]
         frame_starts_all = np.concatenate(([0], transitions + 1))
@@ -617,7 +708,8 @@ class TimeStampBasedPRBSReader:
                     _ts = self._words_processed_total / self.sample_rate
                     print(
                         f"⚠️  Cross-chunk gap @ t={_ts:.3f}s: prev={prev_packet_num}, "
-                        f"first_fresh={packet_num}, inserting={missing}"
+                        f"first_fresh={packet_num}, missing_num={missing_from_numbers}, "
+                        f"missing_dist={missing_from_distance}, inserting={missing}"
                     )
                     last_num = prev_packet_num
                     for _ in range(missing):
@@ -670,9 +762,11 @@ class TimeStampBasedPRBSReader:
                     else:
                         self.gap_estimate_disagree_count += 1
 
-            # Extract all PRBS bits for this packet
+            # Extract all PRBS bits for this packet.
+            # Raw window spans 4 * bits_per_channel words; the valid flag (50% duty cycle)
+            # selects prbs_bits (= 2 * bits_per_channel) valid bits from that window.
             prbs_start = start_idx - 2
-            prbs_end = start_idx + self.prbs_bits
+            prbs_end = start_idx + 4 * self.bits_per_channel
             if prbs_end > len(packet_nums_raw):
                 packets.append(PRBSPacket(packet_num=packet_num, is_valid=False, bits=np.array([], dtype=np.uint8)))
                 packet_word_positions.append(start_idx - prefix_len)
@@ -719,7 +813,7 @@ class TimeStampBasedPRBSReader:
           sample s (0-3):
             v1 = group[s]      (packet 0-3)
             v2 = group[s + 4]  (packet 4-7)
-          GCS entry: pack(v1.bits[:prbs_bits]) + pack(v2.bits[:prbs_bits])  = 20 bytes
+          GCS entry: pack(v1.bits[:prbs_bits]) + pack(v2.bits[:prbs_bits])  = 10 bytes each (+ 1 quality byte)
         """
         self._pending_packets.extend(packets)
         if packet_word_positions is not None:
@@ -775,17 +869,26 @@ class TimeStampBasedPRBSReader:
                 p1 = group[s]
                 p2 = group[s + 4]
 
-                if p1.is_valid and len(p1.bits) >= self.prbs_bits:
-                    v1_bytes = np.packbits(p1.bits[:self.prbs_bits]).tobytes()
-                else:
-                    v1_bytes = bytes(prbs_bytes)
+                v1_valid = p1.is_valid and len(p1.bits) >= self.prbs_bits
+                v2_valid = p2.is_valid and len(p2.bits) >= self.prbs_bits
 
-                if p2.is_valid and len(p2.bits) >= self.prbs_bits:
-                    v2_bytes = np.packbits(p2.bits[:self.prbs_bits]).tobytes()
-                else:
-                    v2_bytes = bytes(prbs_bytes)
+                v1_bytes = np.packbits(p1.bits[:self.prbs_bits]).tobytes() if v1_valid else bytes(prbs_bytes)
+                v2_bytes = np.packbits(p2.bits[:self.prbs_bits]).tobytes() if v2_valid else bytes(prbs_bytes)
 
-                sample_entries.append(v1_bytes + v2_bytes)
+                # Quality byte: bit 0 = v1 valid, bit 1 = v2 valid
+                # 0x00=both missing, 0x01=v1 only, 0x02=v2 only, 0x03=both
+                quality_val = int(v1_valid) | (int(v2_valid) << 1)
+                quality_byte = bytes([quality_val])
+                if quality_val == 3:
+                    self.quality_both += 1
+                elif quality_val == 1:
+                    self.quality_v1_only += 1
+                elif quality_val == 2:
+                    self.quality_v2_only += 1
+                else:
+                    self.quality_none += 1
+
+                sample_entries.append(v1_bytes + v2_bytes + quality_byte)
                 self.decoded_sample_count += 1
 
             self._append_gcs_samples(sample_entries, group_sample_timestamps)
@@ -871,6 +974,10 @@ class TimeStampBasedPRBSReader:
         self.gap_estimate_agree_count = 0
         self.gap_estimate_disagree_count = 0
         self.packet_sequence_events = deque(maxlen=2000)
+        self.quality_both = 0
+        self.quality_v1_only = 0
+        self.quality_v2_only = 0
+        self.quality_none = 0
         self.gcs_write_buffer = []
 
     # -------------------------------------------------------------------------
@@ -898,6 +1005,11 @@ class TimeStampBasedPRBSReader:
         if trig_t is not None:
             trig_t.start()
 
+        # Start local recording immediately if local_path is set and GCS is not
+        # managing the start/stop lifecycle via triggers.
+        if self.local_path and not self.enable_gcs:
+            self._start_local_recording()
+
         print('PRBS capture started.')
         try:
             end_time = None if duration_seconds is None else time.time() + float(duration_seconds)
@@ -923,6 +1035,7 @@ class TimeStampBasedPRBSReader:
 
     def print_stats(self):
         print('\n=== PRBS Decoder Statistics ===')
+        
         print(f'  Total samples decoded:       {self.decoded_sample_count}')
         print(f'  Sequence anomalies:          {self.packet_sequence_anomaly_count}')
         print(f'  Header anomaly drops:        {self.packet_sequence_header_drops}')
@@ -933,6 +1046,13 @@ class TimeStampBasedPRBSReader:
         print(f'  Gap estimate agree/disagree: {self.gap_estimate_agree_count}/{self.gap_estimate_disagree_count}')
         print(f'  prbs_bits per packet:        {self.prbs_bits}')
         print(f'  GCS samples written:         {self.gcs_samples_written}')
+        total_q = self.quality_both + self.quality_v1_only + self.quality_v2_only + self.quality_none
+        if total_q > 0:
+            print(f'\n  --- Sample quality ---')
+            print(f'  Both copies valid (0x03):    {self.quality_both:6d}  ({100*self.quality_both/total_q:.1f}%)')
+            print(f'  V1 only           (0x01):    {self.quality_v1_only:6d}  ({100*self.quality_v1_only/total_q:.1f}%)')
+            print(f'  V2 only           (0x02):    {self.quality_v2_only:6d}  ({100*self.quality_v2_only/total_q:.1f}%)')
+            print(f'  Both missing      (0x00):    {self.quality_none:6d}  ({100*self.quality_none/total_q:.1f}%)')
 
 
 # ---------------------------------------------------------------------------
@@ -942,15 +1062,19 @@ class TimeStampBasedPRBSReader:
 if __name__ == '__main__':
     reader = TimeStampBasedPRBSReader(
         sample_rate=8e6,
-        frequency=914.5e6,
+        frequency=919.1e6,
         gain_mode='slowattack',
         gain=30,
         device=1,
         frame_length=250,
-        bits_per_channel=20,    # 4 * 20 = 80 bits = 10 bytes per packet
-        gcs_bucket='your-bucket',
+        bandwidth=1.5e6,
+        accepted_frame_lengths=(248, 250),
+        bits_per_channel=40,    # 4 * 20 = 80 bits = 10 bytes per packet
+        gcs_bucket='ueegbucket',
         gcs_blob_name='prbs_test/run001',
-        enable_gcs=True,
+        enable_gcs=False,
+        local_path = "prbs_test_local.bin",
+        enable_gcs_trigger=False
     )
     reader.start_capture()
     reader.print_stats()

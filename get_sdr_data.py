@@ -10,6 +10,12 @@ from scipy import signal
 
 LEGACY_ERROR_MASK = 0x0F
 
+# Default PRBS-34 pattern used by the EEG chip
+_PRBS_PATTERN = np.array([
+    0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0,
+    0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1,
+], dtype=np.uint8)
+
 def _parse_dtype_from_meta(metadata):
     """
     Parses the human-readable dtype dictionary from metadata into a NumPy dtype object.
@@ -60,6 +66,140 @@ def find_all_clean_runs(mask):
     if current_start is not None: runs.append((current_start, len(mask)))
     return runs
 
+def _parse_prbs_metadata(metadata):
+    """Returns (bytes_per_sample, bytes_per_copy) if this is a PRBS file, else (None, None)."""
+    if metadata.get('format') == 'prbs_raw_binary':
+        return int(metadata.get('bytes_per_sample', 20)), int(metadata.get('bytes_per_copy', 10))
+    return None, None
+
+def _prbs_errors_for_row(bits_row, pattern):
+    """Best-alignment error count for a single 1-D uint8 bit array vs pattern."""
+    n, p = len(bits_row), len(pattern)
+    idx = np.arange(n)
+    best = -1
+    for offset in range(p):
+        m = int(np.sum(bits_row == pattern[(idx + offset) % p]))
+        if m > best:
+            best = m
+    return n - best
+
+
+def _prbs_ber_single_copy(v_bits, v_valid, pattern, bit_slice):
+    """BER using only one copy; missing samples count as all-wrong."""
+    n_bits = bit_slice.stop - bit_slice.start
+    total_errors = total_bits = 0
+    for i in range(len(v_bits)):
+        total_bits += n_bits
+        if not v_valid[i]:
+            total_errors += n_bits
+        else:
+            total_errors += _prbs_errors_for_row(v_bits[i, bit_slice], pattern)
+    ber = total_errors / total_bits if total_bits else 0.0
+    return total_errors, total_bits, ber
+
+
+def _prbs_ber_diversity(v_primary, v_primary_valid, v_secondary, v_secondary_valid, pattern, bit_slice):
+    """BER using primary copy, falling back to secondary; both missing = all-wrong."""
+    n_bits = bit_slice.stop - bit_slice.start
+    total_errors = total_bits = 0
+    for i in range(len(v_primary)):
+        total_bits += n_bits
+        if v_primary_valid[i]:
+            total_errors += _prbs_errors_for_row(v_primary[i, bit_slice], pattern)
+        elif v_secondary_valid[i]:
+            total_errors += _prbs_errors_for_row(v_secondary[i, bit_slice], pattern)
+        else:
+            total_errors += n_bits
+    ber = total_errors / total_bits if total_bits else 0.0
+    return total_errors, total_bits, ber
+
+
+def _analyze_prbs_data(raw_bytes, bytes_per_sample, bytes_per_copy):
+    """
+    Parse PRBS binary data; returns (errors_per_sample, ber, quality, prbs_stats).
+
+    Layout: v1 (bytes_per_copy) | v2 (bytes_per_copy) | quality byte (1).
+    Quality byte: bit 0 = v1 valid, bit 1 = v2 valid.
+
+    prbs_stats contains per-strategy BER for both full 80-bit and CH2+CH3 (bits 20:60).
+    """
+    raw = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(-1, bytes_per_sample)
+    v1 = np.unpackbits(raw[:, :bytes_per_copy], axis=1)
+    v2 = np.unpackbits(raw[:, bytes_per_copy:2 * bytes_per_copy], axis=1)
+
+    if bytes_per_sample > 2 * bytes_per_copy:
+        quality = raw[:, 2 * bytes_per_copy]
+        v1_valid = (quality & 0x01).astype(bool)
+        v2_valid = (quality & 0x02).astype(bool)
+    else:
+        quality = None
+        v1_valid = ~np.all(raw[:, :bytes_per_copy] == 0, axis=1)
+        v2_valid = ~np.all(raw[:, bytes_per_copy:2 * bytes_per_copy] == 0, axis=1)
+
+    pattern = _PRBS_PATTERN
+    N = len(v1)
+    n_bits_full = v1.shape[1]
+    full_slice = slice(0, n_bits_full)
+    ch23_slice = slice(20, 60)
+
+    # Legacy errors_per_sample (v1 preferred, full bits, for backward compat)
+    errors_per_sample = np.full(N, -1, dtype=np.int32)
+    total_errors = total_bits = 0
+    for i in range(N):
+        if v1_valid[i]:
+            bits = v1[i]
+        elif v2_valid[i]:
+            bits = v2[i]
+        else:
+            errors_per_sample[i] = n_bits_full
+            total_errors += n_bits_full
+            total_bits += n_bits_full
+            continue
+        err = _prbs_errors_for_row(bits, pattern)
+        errors_per_sample[i] = err
+        total_errors += err
+        total_bits += n_bits_full
+    ber = total_errors / total_bits if total_bits > 0 else 0.0
+
+    # Availability counts
+    n_v1_miss = int(np.sum(~v1_valid))
+    n_v2_miss = int(np.sum(~v2_valid))
+    n_both_miss = int(np.sum(~v1_valid & ~v2_valid))
+    n_both_pres = int(np.sum(v1_valid & v2_valid))
+
+    def _stats(t_err, t_bits, n_miss):
+        return {"errors": int(t_err), "bits": int(t_bits),
+                "ber": float(t_err / t_bits) if t_bits else 0.0,
+                "missing_samples": int(n_miss)}
+
+    def _strategy_stats(bit_slice):
+        e1, b1, _ = _prbs_ber_single_copy(v1, v1_valid, pattern, bit_slice)
+        e2, b2, _ = _prbs_ber_single_copy(v2, v2_valid, pattern, bit_slice)
+        ed1, bd1, _ = _prbs_ber_diversity(v1, v1_valid, v2, v2_valid, pattern, bit_slice)
+        ed2, bd2, _ = _prbs_ber_diversity(v2, v2_valid, v1, v1_valid, pattern, bit_slice)
+        n_miss_v1 = int(np.sum(~v1_valid))
+        n_miss_v2 = int(np.sum(~v2_valid))
+        n_miss_both = int(np.sum(~v1_valid & ~v2_valid))
+        return {
+            "v1_only":    _stats(e1,       b1,       n_miss_v1),
+            "v2_only":    _stats(e2,       b2,       n_miss_v2),
+            "div_v1_v2":  _stats(ed1,      bd1,      n_miss_both),
+            "div_v2_v1":  _stats(ed2,      bd2,      n_miss_both),
+            "combined":   _stats(e1 + e2,  b1 + b2,  -1),
+        }
+
+    prbs_stats = {
+        "total_samples": N,
+        "n_v1_missing": n_v1_miss,
+        "n_v2_missing": n_v2_miss,
+        "n_both_missing": n_both_miss,
+        "n_both_present": n_both_pres,
+        "ch23": _strategy_stats(ch23_slice),
+        "full": _strategy_stats(full_slice),
+    }
+
+    return errors_per_sample, ber, quality.tolist() if quality is not None else None, prbs_stats
+
 def _apply_lowpass_filter(data_array, fs, corner_hz=30.0, order=4):
     """Applies a zero-phase low-pass filter to the data."""
     if data_array.ndim == 1: data_array = data_array.reshape(-1, 1)
@@ -94,8 +234,10 @@ def get_sdr_data(request):
             print("INFO: Entering Time Range Fetch mode.")
             meta_blob = bucket.blob(f"{blob_name}.meta")
             if not meta_blob.exists(): raise FileNotFoundError("Time range fetch requires a .meta file.")
-            
+
             metadata = json.loads(meta_blob.download_as_text())
+            if metadata.get('format') == 'prbs_raw_binary':
+                return (json.dumps({"error": "Time-range fetch is not supported for PRBS data. Use start_index/end_index instead."}), 400, headers)
             sample_rate = metadata.get("sample_rate_hz")
             dtype = _parse_dtype_from_meta(metadata)
             if not dtype or not sample_rate: raise ValueError("Could not construct dtype or find sample_rate.")
@@ -140,6 +282,29 @@ def get_sdr_data(request):
             
             sample_rate = metadata.get("sample_rate_hz", 200.0)
             dtype = _parse_dtype_from_meta(metadata)
+
+            bytes_per_sample_prbs, bytes_per_copy_prbs = _parse_prbs_metadata(metadata)
+            if bytes_per_sample_prbs is not None:
+                print("INFO: Detected PRBS raw binary format.")
+                total_samples = len(binary_content) // bytes_per_sample_prbs
+                start_idx = int(request_args.get("start_index", 0))
+                end_idx = int(request_args.get("end_index", total_samples))
+                start_byte = start_idx * bytes_per_sample_prbs
+                end_byte = end_idx * bytes_per_sample_prbs
+                errors_per_sample, ber, quality, prbs_stats = _analyze_prbs_data(
+                    binary_content[start_byte:end_byte], bytes_per_sample_prbs, bytes_per_copy_prbs
+                )
+                return (json.dumps({
+                    "format": "prbs_raw_binary",
+                    "total_samples": total_samples,
+                    "bytes_per_sample": bytes_per_sample_prbs,
+                    "start_index": start_idx,
+                    "end_index": start_idx + len(errors_per_sample),
+                    "ber": ber,
+                    "errors_per_sample": errors_per_sample.tolist(),
+                    "quality": quality,
+                    "prbs_stats": prbs_stats,
+                }), 200, headers)
 
             if dtype:
                 print("INFO: Detected structured .bin format from parsed metadata.")

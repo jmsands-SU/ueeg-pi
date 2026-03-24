@@ -64,6 +64,8 @@ class TimeStampBasedReader:
         buffer_size=65536,
         frame_length=250,
         accepted_frame_lengths=None,
+        bit_clock_hz=100_000,
+        frame_length_counts=None,
         bits_per_channel=40,
         channel_to_decode=3,
         mismatch_threshold=0.001,
@@ -119,6 +121,12 @@ class TimeStampBasedReader:
         self.accepted_frame_lengths = tuple(sorted(set(int(v) for v in accepted_frame_lengths)))
         if len(self.accepted_frame_lengths) == 0:
             raise ValueError('accepted_frame_lengths must contain at least one value')
+        self.bit_clock_hz = int(bit_clock_hz)
+        # frame_length_counts: dict of {frame_length: count_in_repeating_pattern}
+        # e.g. {250: 18, 248: 1} for 18 gaps of 250 words and 1 gap of 248 per cycle.
+        # If None, uses frame_length as the average (nominal rate).
+        self.frame_length_counts = {int(k): int(v) for k, v in frame_length_counts.items()} \
+            if frame_length_counts else None
         self.bits_per_channel = int(bits_per_channel)
         self.channel_to_decode = int(channel_to_decode)
         self.mismatch_threshold = float(mismatch_threshold)
@@ -192,7 +200,14 @@ class TimeStampBasedReader:
         self.capture_start_time = None
         self.samples_captured = 0
 
-        self.output_rate_hz = 200
+        if self.frame_length_counts:
+            total_words = sum(fl * cnt for fl, cnt in self.frame_length_counts.items())
+            total_gaps = sum(self.frame_length_counts.values())
+            avg_frame_length = total_words / total_gaps
+        else:
+            avg_frame_length = float(self.frame_length)
+        # 4 EEG samples per group of 8 packets; each inter-packet gap = avg_frame_length words
+        self.output_rate_hz = self.bit_clock_hz * 4.0 / (8.0 * avg_frame_length)
         self._init_filter()
 
         if self.enable_gcs and str(gcs_format).lower() != 'binary':
@@ -224,7 +239,12 @@ class TimeStampBasedReader:
                 self.gcs_subscriber = pubsub_v1.SubscriberClient()
 
     def _start_gcs_recording(self):
+        if self.enable_gcs and self.gcs_bucket_obj is None:
+            print('WARNING: GCS start trigger received but GCS client is not initialised — recording NOT started.')
+            return
         with self._gcs_buffer_lock:
+            if self.gcs_recording_active:
+                return  # already recording; ignore duplicate trigger
             self.gcs_recording_active = True
             self.gcs_write_buffer = []
             self.gcs_chunk_counter = 0
@@ -272,8 +292,7 @@ class TimeStampBasedReader:
                 pass
 
         if command in ('start', 'record', 'resume'):
-            if not self.gcs_recording_active:
-                self._start_gcs_recording()
+            self._start_gcs_recording()
         elif command in ('stop', 'pause', 'end'):
             self._stop_gcs_recording()
 
@@ -464,7 +483,10 @@ class TimeStampBasedReader:
 
             metadata = {
                 'format': 'numpy_binary_structured',
-                'sample_rate_hz': int(self.output_rate_hz),
+                'sample_rate_hz': float(self.output_rate_hz),
+                'sample_rate_hz_nominal': 200.0,
+                'bit_clock_hz': self.bit_clock_hz,
+                'frame_length_counts': self.frame_length_counts,
                 'gcs_channels': list(self.gcs_channels),
                 'channel_names': channel_names,
                 'row_description': 'Each row is one decoded sample time-step across selected channels.',
@@ -2019,6 +2041,7 @@ if __name__ == '__main__':
         enable_bandpass_filter=False,
         frame_length=250,
         accepted_frame_lengths=(248, 250),
+        frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
         channel_to_decode=2,
         gcs_bucket="ueegbucket",  # Set to your GCS bucket

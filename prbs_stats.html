@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PRBS Stats Viewer</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            max-width: 900px;
+            margin: 2em auto;
+            background: #f8f9fa;
+            color: #212529;
+        }
+        h1 { text-align: center; color: #343a40; }
+        .controls {
+            display: flex;
+            gap: 0.75em;
+            align-items: center;
+            padding: 1em;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            margin-bottom: 1.5em;
+            flex-wrap: wrap;
+        }
+        .controls input {
+            padding: 10px;
+            font-size: 1rem;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            flex: 1;
+            min-width: 150px;
+        }
+        .controls button {
+            padding: 10px 20px;
+            font-size: 1rem;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .controls button:disabled { background: #6c757d; cursor: default; }
+        #status {
+            text-align: center;
+            padding: 0.75em;
+            border-radius: 4px;
+            margin-bottom: 1.5em;
+            font-weight: 500;
+        }
+        .status-error { background: #f8d7da; color: #721c24; }
+        .status-ok    { background: #d4edda; color: #155724; }
+        .status-info  { background: #d1ecf1; color: #0c5460; }
+        .card {
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            padding: 1.5em;
+            margin-bottom: 1.5em;
+        }
+        .card h2 {
+            margin: 0 0 1em 0;
+            font-size: 1.1rem;
+            color: #495057;
+            border-bottom: 1px solid #dee2e6;
+            padding-bottom: 0.5em;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 1em;
+        }
+        .summary-item {
+            background: #f8f9fa;
+            border-radius: 6px;
+            padding: 0.75em 1em;
+        }
+        .summary-item .label { font-size: 0.8rem; color: #6c757d; margin-bottom: 0.2em; }
+        .summary-item .value { font-size: 1.3rem; font-weight: 700; color: #212529; }
+        .summary-item .sub   { font-size: 0.75rem; color: #6c757d; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+        }
+        th {
+            text-align: left;
+            padding: 8px 12px;
+            background: #f1f3f5;
+            font-weight: 600;
+            border-bottom: 2px solid #dee2e6;
+        }
+        th.right, td.right { text-align: right; }
+        td { padding: 8px 12px; border-bottom: 1px solid #f1f3f5; }
+        tr:last-child td { border-bottom: none; }
+        .best { background: #d4edda; font-weight: 600; }
+        .pill {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .pill-good { background: #d4edda; color: #155724; }
+        .pill-bad  { background: #f8d7da; color: #721c24; }
+        .availability-bar {
+            display: flex;
+            height: 18px;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 0.5em;
+        }
+        .bar-both  { background: #28a745; }
+        .bar-v1    { background: #ffc107; }
+        .bar-v2    { background: #17a2b8; }
+        .bar-none  { background: #dc3545; }
+        .bar-legend { display: flex; gap: 1em; flex-wrap: wrap; margin-top: 0.4em; font-size: 0.78rem; color: #495057; }
+        .bar-legend span::before { content: '■ '; }
+        .bar-legend .l-both::before  { color: #28a745; }
+        .bar-legend .l-v1::before    { color: #ffc107; }
+        .bar-legend .l-v2::before    { color: #17a2b8; }
+        .bar-legend .l-none::before  { color: #dc3545; }
+        #results { display: none; }
+    </style>
+</head>
+<body>
+
+<h1>PRBS Stats Viewer</h1>
+
+<div class="controls">
+    <input type="text" id="bucketName" placeholder="GCS Bucket" value="ueegbucket">
+    <input type="text" id="blobName"   placeholder="Blob name (e.g. recording.bin)">
+    <button id="analyzeBtn">Analyze</button>
+</div>
+
+<div id="status" class="status-info">Enter a bucket and blob name, then click Analyze.</div>
+
+<div id="results">
+
+    <!-- Sample availability -->
+    <div class="card">
+        <h2>Sample Availability</h2>
+        <div class="summary-grid" id="availGrid"></div>
+        <div class="availability-bar" id="availBar" style="margin-top:1em;"></div>
+        <div class="bar-legend">
+            <span class="l-both">Both copies</span>
+            <span class="l-v1">v1 only</span>
+            <span class="l-v2">v2 only</span>
+            <span class="l-none">Neither</span>
+        </div>
+    </div>
+
+    <!-- CH2+CH3 BER headline -->
+    <div class="card">
+        <h2>CH2+CH3 Bit Error Rate (bits 20–59)</h2>
+        <div class="summary-grid" id="berGrid"></div>
+    </div>
+
+    <!-- Strategy table CH23 -->
+    <div class="card">
+        <h2>Copy-Selection Strategy Comparison — CH2+CH3</h2>
+        <table id="stratTable">
+            <thead>
+                <tr>
+                    <th>Strategy</th>
+                    <th class="right">Errors / Bits</th>
+                    <th class="right">BER</th>
+                    <th class="right">vs worst single</th>
+                </tr>
+            </thead>
+            <tbody id="stratBody"></tbody>
+        </table>
+    </div>
+
+    <!-- Full 80-bit table -->
+    <div class="card">
+        <h2>Full 80-bit BER (all 4 channels)</h2>
+        <table id="fullTable">
+            <thead>
+                <tr>
+                    <th>Strategy</th>
+                    <th class="right">Errors / Bits</th>
+                    <th class="right">BER</th>
+                    <th class="right">vs worst single</th>
+                </tr>
+            </thead>
+            <tbody id="fullBody"></tbody>
+        </table>
+    </div>
+
+</div>
+
+<script>
+    const API_BASE_URL = "https://get-sdr-data-108359996380.us-west1.run.app/";
+
+    document.getElementById('analyzeBtn').addEventListener('click', analyze);
+    document.getElementById('blobName').addEventListener('keydown', e => { if (e.key === 'Enter') analyze(); });
+
+    function pct(n, d) { return d ? (n / d * 100).toFixed(2) + '%' : '—'; }
+    function fmt(n)    { return n.toLocaleString(); }
+
+    async function analyze() {
+        const bucket = document.getElementById('bucketName').value.trim();
+        const blob   = document.getElementById('blobName').value.trim();
+        if (!bucket || !blob) { setStatus('Please enter both a bucket and blob name.', 'error'); return; }
+
+        document.getElementById('results').style.display = 'none';
+        setStatus('Fetching PRBS data…', 'info');
+        document.getElementById('analyzeBtn').disabled = true;
+
+        try {
+            const url = `${API_BASE_URL}?bucket=${encodeURIComponent(bucket)}&blob=${encodeURIComponent(blob)}`;
+            const resp = await fetch(url);
+            const data = await resp.json();
+
+            if (!resp.ok || data.error) throw new Error(data.error || `Server error ${resp.status}`);
+            if (data.format !== 'prbs_raw_binary') throw new Error(`Not a PRBS file (format="${data.format}")`);
+            if (!data.prbs_stats) throw new Error('Server did not return prbs_stats. Re-deploy get_sdr_data.');
+
+            renderResults(data.prbs_stats);
+            setStatus(`Analyzed ${fmt(data.prbs_stats.total_samples)} samples from ${blob}`, 'ok');
+            document.getElementById('results').style.display = 'block';
+        } catch (err) {
+            setStatus(`Error: ${err.message}`, 'error');
+        } finally {
+            document.getElementById('analyzeBtn').disabled = false;
+        }
+    }
+
+    function renderResults(s) {
+        const N = s.total_samples;
+        const nBoth    = s.n_both_present;
+        const nV1only  = N - s.n_v1_missing - nBoth;
+        const nV2only  = N - s.n_v2_missing - nBoth;
+        const nNeither = s.n_both_missing;
+
+        // --- Availability summary ---
+        const availGrid = document.getElementById('availGrid');
+        availGrid.innerHTML = [
+            ['Total samples', fmt(N), ''],
+            ['Both present',  fmt(nBoth),    pct(nBoth, N)],
+            ['v1 only',       fmt(nV1only),  pct(nV1only, N)],
+            ['v2 only',       fmt(nV2only),  pct(nV2only, N)],
+            ['Neither',       fmt(nNeither), pct(nNeither, N)],
+        ].map(([label, val, sub]) => `
+            <div class="summary-item">
+                <div class="label">${label}</div>
+                <div class="value">${val}</div>
+                ${sub ? `<div class="sub">${sub}</div>` : ''}
+            </div>`).join('');
+
+        const bar = document.getElementById('availBar');
+        bar.innerHTML = [
+            ['bar-both', nBoth],
+            ['bar-v1',   nV1only],
+            ['bar-v2',   nV2only],
+            ['bar-none', nNeither],
+        ].map(([cls, n]) => `<div class="${cls}" style="width:${(n/N*100).toFixed(2)}%"></div>`).join('');
+
+        // --- CH23 headline ---
+        renderBerGrid(s.ch23, N);
+
+        // --- Strategy tables ---
+        renderStratTable(document.getElementById('stratBody'), s.ch23, N);
+        renderStratTable(document.getElementById('fullBody'),  s.full,  N);
+    }
+
+    function renderBerGrid(ch, N) {
+        const d = ch;
+        const bestDiv = d.div_v1_v2.ber <= d.div_v2_v1.ber ? d.div_v1_v2 : d.div_v2_v1;
+        const worstSingle = Math.max(d.v1_only.ber, d.v2_only.ber);
+
+        const combinedBer = d.combined.errors / d.combined.bits;
+        const divGain = worstSingle > 0 ? ((worstSingle - bestDiv.ber) / worstSingle * 100).toFixed(1) : '—';
+
+        document.getElementById('berGrid').innerHTML = [
+            ['Combined BER<br><small>(v1+v2 as independent)</small>',
+                `${(combinedBer * 100).toFixed(4)}%`,
+                `${fmt(d.combined.errors)} / ${fmt(d.combined.bits)} bits`],
+            ['Best diversity BER<br><small>(per-sample copy selection)</small>',
+                `${(bestDiv.ber * 100).toFixed(4)}%`,
+                `${fmt(bestDiv.errors)} / ${fmt(bestDiv.bits)} bits`],
+            ['Diversity gain<br><small>(vs worst single copy)</small>',
+                `${divGain}%`, ''],
+        ].map(([label, val, sub]) => `
+            <div class="summary-item">
+                <div class="label">${label}</div>
+                <div class="value">${val}</div>
+                ${sub ? `<div class="sub">${sub}</div>` : ''}
+            </div>`).join('');
+    }
+
+    function renderStratTable(tbody, s, N) {
+        const worstBer = Math.max(s.v1_only.ber, s.v2_only.ber);
+        const bestBer  = Math.min(s.div_v1_v2.ber, s.div_v2_v1.ber);
+
+        const rows = [
+            ['Combined (v1+v2 independent)', s.combined],
+            ['v1 only',                      s.v1_only],
+            ['v2 only',                      s.v2_only],
+            ['v1→v2 diversity',              s.div_v1_v2],
+            ['v2→v1 diversity',              s.div_v2_v1],
+        ];
+
+        tbody.innerHTML = rows.map(([label, r]) => {
+            const isBest = Math.abs(r.ber - bestBer) < 1e-12 && label.includes('diversity');
+            const improvement = (r === s.combined || worstBer === 0)
+                ? '—'
+                : `${((worstBer - r.ber) / worstBer * 100).toFixed(1)}%`;
+            const pillClass = r.ber <= worstBer ? 'pill-good' : 'pill-bad';
+            return `<tr class="${isBest ? 'best' : ''}">
+                <td>${label}${isBest ? ' ★' : ''}</td>
+                <td class="right">${fmt(r.errors)} / ${fmt(r.bits)}</td>
+                <td class="right">${(r.ber * 100).toFixed(4)}%</td>
+                <td class="right">${r === s.combined ? '—' :
+                    `<span class="pill ${pillClass}">${improvement}</span>`}</td>
+            </tr>`;
+        }).join('');
+    }
+
+    function setStatus(msg, type) {
+        const el = document.getElementById('status');
+        el.textContent = msg;
+        el.className = type === 'error' ? 'status-error' : type === 'ok' ? 'status-ok' : 'status-info';
+    }
+</script>
+
+</body>
+</html>
