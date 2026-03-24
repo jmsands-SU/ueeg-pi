@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDR Interactive Viewer</title>
+    
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+
+    <script>
+      var module = {}; // Shim for dsp.js
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/dsp.js/dsp.min.js"></script>
+    <script>
+      if (module.exports) { Object.keys(module.exports).forEach(function(key) { window[key] = module.exports[key]; }); }
+    </script>
+    
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 95%; margin: 2em auto; background-color: #f8f9fa; color: #212529; }
+        h1 { text-align: center; color: #343a40; }
+        .controls { display: flex; justify-content: center; gap: 1em; align-items: center; margin-bottom: 1em; flex-wrap: wrap; padding: 1em; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .controls input, .controls select, .controls button { padding: 10px; font-size: 1rem; border: 1px solid #ced4da; border-radius: 4px; }
+        .controls button { background-color: #007bff; color: white; cursor: pointer; font-weight: 600; }
+        .controls .load-btn { background-color: #17a2b8; }
+        .controls label { font-size: 0.9rem; color: #495057; display: flex; align-items: center; gap: 0.5em; cursor: pointer;}
+        .control-group { display: flex; align-items: center; gap: 0.5em; border-left: 1px solid #ccc; padding-left: 1em; }
+        #status { text-align: center; font-weight: 500; padding: 1em; border-radius: 4px; }
+        .stats-and-segments { display: flex; flex-direction: column; align-items: center; gap: 2em; margin-bottom: 2em; }
+        .stats-container { background-color: white; padding: 1.5em; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); width: fit-content; }
+        .stats-container h2 { margin-top: 0; text-align: center; font-size: 1.2rem; }
+        .stats-table { border-collapse: collapse; width: 100%; }
+        .stats-table td { padding: 8px 12px; border-bottom: 1px solid #dee2e6; }
+        .stats-table td:last-child { text-align: right; font-weight: 600; }
+        .segment-selector { text-align: center; }
+        .plot-container { display: flex; flex-direction: column; gap: 3em; margin-top: 2em; }
+        .plot { width: 100%; height: 450px; margin: auto; }
+        .fft-controls { border-top: 1px solid #e9ecef; margin-top: 1em; padding-top: 1em; display: flex; justify-content: center; gap: 1em; align-items: center;}
+    </style>
+</head>
+<body>
+
+    <!-- HTML Body (unchanged) -->
+    <h1>SDR Interactive Viewer</h1>
+    <div class="controls">
+        <input type="text" id="bucketName" placeholder="GCS Bucket Name" value="ueegbucket">
+        <input type="text" id="blobName" placeholder="Blob Name (e.g., my-rec.bin)">
+        <div class="control-group"><button id="analyzeButton">Analyze File</button><label><input type="checkbox" id="showAllDataToggle">Show all data</label></div>
+        <div class="control-group"><label>Load last</label><input type="number" id="lastTimeValue" value="5" style="width: 60px;"><select id="lastTimeUnits"><option value="1">Seconds</option><option value="60" selected>Minutes</option><option value="3600">Hours</option></select><button id="loadRecentButton" class="load-btn">Load</button></div>
+        <div class="control-group"><label>Load range from</label><input type="number" id="startTimeValue" value="1" style="width: 60px;"><label>to</label><input type="number" id="endTimeValue" value="6" style="width: 60px;"><select id="rangeTimeUnits"><option value="1">Seconds</option><option value="60" selected>Minutes</option><option value="3600">Hours</option></select><button id="loadRangeButton" class="load-btn">Load Range</button></div>
+        <div class="control-group"><label title="Applies a 30Hz low-pass filter on the server."><input type="checkbox" id="applyLpFilterToggle">Apply 30Hz LP Filter</label></div>
+    </div>
+    <div id="status">Enter a blob name and choose an action.</div>
+    <div class="stats-and-segments">
+        <div class="stats-container" id="qualityStatsContainer" style="display: none;"><h2>File Quality Statistics</h2><table class="stats-table"><tbody id="qualityStatsBody"></tbody></table></div>
+        <div class="segment-selector" id="segmentSelectorContainer" style="display: none;"><label for="segmentDropdown" style="margin-right: 10px; font-weight: bold;">Select a Segment:</label><select id="segmentDropdown"></select></div>
+    </div>
+    <div class="plot-container">
+        <div id="timePlot" class="plot"></div>
+        <div id="fftPlot" class="plot"></div>
+        <div class="fft-controls" id="fftControlsContainer" style="display: none;">
+             <label><input type="checkbox" id="fftLinearToggle">Linear Y-Axis</label>
+             <span class="control-group">
+                <label for="fftFreqMin">Freq Range:</label>
+                <input type="number" id="fftFreqMin" placeholder="Min" style="width: 80px;">
+                <label for="fftFreqMax">to</label>
+                <input type="number" id="fftFreqMax" placeholder="Max" style="width: 80px;">
+                <label>Hz</label>
+                <button id="setFreqRangeButton">Set</button>
+             </span>
+             <span class="control-group">
+                <button id="autoscaleYButton">Autoscale Y</button>
+             </span>
+        </div>
+    </div>
+
+    <!-- MAIN APPLICATION SCRIPT -->
+    <script>
+        // --- All element references and event listeners ---
+        const API_BASE_URL = "https://get-sdr-data-108359996380.us-west1.run.app/";
+        const analyzeBtn = document.getElementById('analyzeButton');
+        const showAllDataToggle = document.getElementById('showAllDataToggle');
+        const loadRecentButton = document.getElementById('loadRecentButton');
+        const lastTimeValueInput = document.getElementById('lastTimeValue');
+        const lastTimeUnitsSelect = document.getElementById('lastTimeUnits');
+        const loadRangeButton = document.getElementById('loadRangeButton');
+        const startTimeValueInput = document.getElementById('startTimeValue');
+        const endTimeValueInput = document.getElementById('endTimeValue');
+        const rangeTimeUnitsSelect = document.getElementById('rangeTimeUnits');
+        const applyLpFilterToggle = document.getElementById('applyLpFilterToggle');
+        const segmentContainer = document.getElementById('segmentSelectorContainer');
+        const segmentDropdown = document.getElementById('segmentDropdown');
+        const statusDiv = document.getElementById('status');
+        const qualityStatsContainer = document.getElementById('qualityStatsContainer');
+        const qualityStatsBody = document.getElementById('qualityStatsBody');
+        const timePlotDiv = document.getElementById('timePlot');
+        const fftPlotDiv = document.getElementById('fftPlot');
+        const fftControlsContainer = document.getElementById('fftControlsContainer');
+        const fftLinearToggle = document.getElementById('fftLinearToggle');
+        const fftFreqMinInput = document.getElementById('fftFreqMin');
+        const fftFreqMaxInput = document.getElementById('fftFreqMax');
+        const setFreqRangeButton = document.getElementById('setFreqRangeButton');
+        const autoscaleYButton = document.getElementById('autoscaleYButton');
+        let currentSegments = [], currentSampleRate = 200.0, fullSegmentChannelData = [];
+
+        analyzeBtn.addEventListener('click', analyzeFile);
+        loadRecentButton.addEventListener('click', loadRecentTime);
+        loadRangeButton.addEventListener('click', loadTimeRange);
+        segmentDropdown.addEventListener('change', (event) => { plotSelectedSegment(parseInt(event.target.value, 10)); });
+        fftLinearToggle.addEventListener('change', updateFftPlot);
+        setFreqRangeButton.addEventListener('click', updateFftPlot);
+        autoscaleYButton.addEventListener('click', autoscaleFftY);
+
+        // --- Core Application Functions ---
+        async function analyzeFile() { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const showAll = showAllDataToggle.checked; resetUI(); if (!bucket || !blob) { statusDiv.textContent = "Please enter Bucket and Blob Name."; return; } statusDiv.textContent = "Analyzing file..."; const mode = showAll ? 'all_data' : 'clean_only'; const discoveryUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&analysis_mode=${mode}`; try { const response = await fetch(discoveryUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } if (data.quality_stats) { displayQualityStats(data.quality_stats); } currentSegments = data.available_segments; currentSampleRate = data.sample_rate; if (currentSegments && currentSegments.length > 0) { const message = showAll ? "File loaded." : `Found ${currentSegments.length} clean segment(s).`; statusDiv.textContent = message + " Select below to plot."; populateDropdown(); segmentContainer.style.display = 'block'; if (showAll) { plotSelectedSegment(0); } } else { statusDiv.textContent = "No clean segments found meeting the threshold."; } } catch (error) { console.error("Error analyzing file:", error); statusDiv.textContent = `Error: ${error.message}`; } }
+        async function loadRecentTime() { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const timeValue = lastTimeValueInput.value; const unitMultiplier = lastTimeUnitsSelect.value; const unitText = lastTimeUnitsSelect.options[lastTimeUnitsSelect.selectedIndex].text; const applyFilter = applyLpFilterToggle.checked; resetUI(); if (!bucket || !blob || !timeValue) { statusDiv.textContent = "Please enter all required fields."; return; } const totalSeconds = timeValue * unitMultiplier; statusDiv.textContent = `Fetching the last ${timeValue} ${unitText}...`; const filterParam = applyFilter ? '&apply_lp_filter=true' : ''; const fetchUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&last_seconds=${totalSeconds}${filterParam}`; try { const response = await fetch(fetchUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } await plotData(data.segment_data, data.sample_rate, `Last ${timeValue} ${unitText} of Recording`); } catch(error) { console.error("Error loading recent time:", error); statusDiv.textContent = `Error: ${error.message}`; } }
+        async function loadTimeRange() { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const startTime = startTimeValueInput.value; const endTime = endTimeValueInput.value; const unitMultiplier = rangeTimeUnitsSelect.value; const unitText = rangeTimeUnitsSelect.options[rangeTimeUnitsSelect.selectedIndex].text.toLowerCase(); const applyFilter = applyLpFilterToggle.checked; resetUI(); if (!bucket || !blob || !startTime || !endTime) { statusDiv.textContent = "Please enter all required fields for range."; return; } const startSeconds = startTime * unitMultiplier; const endSeconds = endTime * unitMultiplier; if (startSeconds >= endSeconds) { statusDiv.textContent = "Start time must be less than end time."; return; } statusDiv.textContent = `Fetching range from ${startTime} to ${endTime} ${unitText}...`; const filterParam = applyFilter ? '&apply_lp_filter=true' : ''; const fetchUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&start_time_sec=${startSeconds}&end_time_sec=${endSeconds}${filterParam}`; try { const response = await fetch(fetchUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } await plotData(data.segment_data, data.sample_rate, `Time Range: ${startTime}-${endTime} ${unitText}`); } catch(error) { console.error("Error loading time range:", error); statusDiv.textContent = `Error: ${error.message}`; } }
+        async function plotSelectedSegment(index) { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const segment = currentSegments[index]; const applyFilter = applyLpFilterToggle.checked; statusDiv.textContent = `Loading data for Segment ${index + 1}...`; const filterParam = applyFilter ? '&apply_lp_filter=true' : ''; const dataFetchUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&start_index=${segment.start}&end_index=${segment.end}${filterParam}`; try { const response = await fetch(dataFetchUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } await plotData(data.segment_data, data.sample_rate, `Time Domain - Segment ${index + 1}`); } catch(error) { console.error("Error plotting segment:", error); statusDiv.textContent = `Error: ${error.message}`; } }
+        
+        // --- UI and Plotting Functions ---
+        function displayQualityStats(stats) { const total = stats.total_samples; if (!total || total === 0) return; const formatRow = (label, count) => `<tr><td>${label}</td><td>${count.toLocaleString()} (${((count / total) * 100).toFixed(2)}%)</td></tr>`; let tableHTML = ''; if(stats.missed_packet > 0) tableHTML += formatRow('Missed Packets', stats.missed_packet); if(stats.v1_only > 0) tableHTML += formatRow('Single (v1 only)', stats.v1_only); if(stats.v2_only > 0) tableHTML += formatRow('Single (v2 only)', stats.v2_only); if(stats.matched > 0) tableHTML += formatRow('Matched (v1 & v2)', stats.matched); if(stats.mismatch_v1 > 0) tableHTML += formatRow('Mismatch (picked v1)', stats.mismatch_v1); if(stats.mismatch_v2 > 0) tableHTML += formatRow('Mismatch (picked v2)', stats.mismatch_v2); tableHTML += `<tr><td><strong>Total Samples</strong></td><td><strong>${total.toLocaleString()}</strong></td></tr>`; qualityStatsBody.innerHTML = tableHTML; qualityStatsContainer.style.display = 'block'; }
+        function populateDropdown() { segmentDropdown.innerHTML = ''; const showAll = showAllDataToggle.checked; currentSegments.forEach((segment, index) => { const option = document.createElement('option'); option.value = index; option.textContent = (showAll && currentSegments.length === 1) ? `Full File (${segment.duration_sec.toFixed(1)}s)` : `Segment ${index + 1} (${segment.duration_sec.toFixed(1)}s)`; segmentDropdown.appendChild(option); }); }
+        function resetUI() { Plotly.purge(timePlotDiv); Plotly.purge(fftPlotDiv); segmentContainer.style.display = 'none'; segmentDropdown.innerHTML = ''; qualityStatsContainer.style.display = 'none'; qualityStatsBody.innerHTML = ''; fftControlsContainer.style.display = 'none'; fftFreqMinInput.value = ''; fftFreqMaxInput.value = ''; statusDiv.textContent = "Enter a blob name and choose an action."; }
+        
+        async function plotData(channelData, sampleRate, plotTitle) {
+            if (!channelData || channelData.length === 0) { statusDiv.textContent = "No data returned to plot."; return; }
+            fullSegmentChannelData = channelData; currentSampleRate = sampleRate;
+            const time_axis = Array.from({length: fullSegmentChannelData.length}, (_, i) => i / currentSampleRate);
+            const timePlotData = []; const fftPlotData = [];
+            const isLinear = fftLinearToggle.checked;
+            const yAxisTitle = isLinear ? 'PSD (V²/Hz)' : 'PSD (dB/Hz)';
+            const numChannels = fullSegmentChannelData[0].length;
+            for (let i = 0; i < numChannels; i++) {
+                const channelDataForFFT = fullSegmentChannelData.map(row => row[i]);
+                timePlotData.push({ x: time_axis, y: channelDataForFFT, mode: 'lines', name: `CH${i + 1}` });
+                const { freqs, psdValues } = calculateWelchPSD(channelDataForFFT, currentSampleRate);
+                // THE FIX: Use a much smaller epsilon value (1e-24)
+                const yValues = isLinear ? psdValues : psdValues.map(v => 10 * Math.log10(v + 1e-24));
+                const fftTrace = { x: freqs, y: yValues, mode: 'lines', name: `CH${i + 1}` };
+                fftTrace.psdValues = psdValues;
+                fftPlotData.push(fftTrace);
+            }
+            const timeLayout = { title: plotTitle, xaxis: { title: 'Time (s)' }, yaxis: { title: 'Amplitude' }};
+            const fftLayout = { title: "Power Spectral Density (Welch's Method)", xaxis: { title: 'Frequency (Hz)', type: 'log' }, yaxis: { title: yAxisTitle }};
+            await Plotly.newPlot(timePlotDiv, timePlotData, timeLayout);
+            await Plotly.newPlot(fftPlotDiv, fftPlotData, fftLayout);
+            fftControlsContainer.style.display = 'flex';
+            updateFftPlot();
+            statusDiv.textContent = `Displaying data. Click legend to toggle channels.`;
+            timePlotDiv.removeAllListeners(); fftPlotDiv.removeAllListeners(); // Clear all listeners
+            timePlotDiv.on('plotly_relayout', debouncedRelayoutHandler);
+            timePlotDiv.on('plotly_legendclick', handleLegendClick);
+            fftPlotDiv.on('plotly_legendclick', handleLegendClick);
+        }
+
+        function updateFftPlot() {
+            if (!fftPlot.data || fftPlot.data.length === 0) return;
+            const isLinear = fftLinearToggle.checked;
+            const new_y_data = [];
+            for(let i=0; i<fftPlot.data.length; i++) {
+                const trace = fftPlot.data[i];
+                if (trace.psdValues) {
+                    // THE FIX: Use a much smaller epsilon value (1e-24)
+                    new_y_data.push(isLinear ? trace.psdValues : trace.psdValues.map(v => 10 * Math.log10(v + 1e-24)));
+                }
+            }
+            const layoutUpdate = { 'yaxis.title': isLinear ? 'PSD (V²/Hz)' : 'PSD (dB/Hz)' };
+            const minFreq = parseFloat(fftFreqMinInput.value);
+            const maxFreq = parseFloat(fftFreqMaxInput.value);
+            const range = [ (isNaN(minFreq) || minFreq <= 0) ? null : Math.log10(minFreq), (isNaN(maxFreq) || maxFreq <= 0) ? null : Math.log10(maxFreq) ];
+            if (range[0] !== null || range[1] !== null) { layoutUpdate['xaxis.range'] = range; }
+            Plotly.update('fftPlot', { y: new_y_data }, layoutUpdate);
+        }
+        
+        function autoscaleFftY() {
+            if (!fftPlot.data || fftPlot.data.length === 0) return;
+            const layout = fftPlot.layout;
+            const xRange = layout.xaxis.range;
+            if (!xRange) { Plotly.relayout('fftPlot', {'yaxis.autorange': true}); return; }
+            const minFreq = Math.pow(10, xRange[0]);
+            const maxFreq = Math.pow(10, xRange[1]);
+            let overallMinY = Infinity, overallMaxY = -Infinity;
+            for (const trace of fftPlot.data) {
+                if (trace.visible === 'legendonly') continue;
+                for (let i = 0; i < trace.x.length; i++) {
+                    if (trace.x[i] >= minFreq && trace.x[i] <= maxFreq) {
+                        const val = trace.y[i];
+                        if (val < overallMinY) overallMinY = val;
+                        if (val > overallMaxY) overallMaxY = val;
+                    }
+                }
+            }
+            if (isFinite(overallMinY) && isFinite(overallMaxY)) {
+                const range = overallMaxY - overallMinY;
+                const padding = range * 0.05 || 0.1;
+                Plotly.relayout('fftPlot', {'yaxis.range': [overallMinY - padding, overallMaxY + padding]});
+            } else {
+                Plotly.relayout('fftPlot', {'yaxis.autorange': true});
+            }
+        }
+        
+        let debounceTimer; 
+        const debouncedRelayoutHandler = (eventData) => { clearTimeout(debounceTimer); debounceTimer = setTimeout(() => { handleRelayout(eventData); }, 300); };
+        
+        function handleRelayout(eventData) {
+            if (!eventData || !eventData['xaxis.range[0]']) return;
+            const timeRange = [eventData['xaxis.range[0]'], eventData['xaxis.range[1]']];
+            const startIndex = Math.max(0, Math.floor(timeRange[0] * currentSampleRate));
+            const endIndex = Math.min(fullSegmentChannelData.length, Math.ceil(timeRange[1] * currentSampleRate));
+            const selectedData = fullSegmentChannelData.slice(startIndex, endIndex);
+            if (selectedData.length < 2) { Plotly.react(fftPlotDiv, [], {title: 'Not enough data for PSD'}); return; }
+            const newFftTraces = [];
+            const numChannels = fullSegmentChannelData[0] ? fullSegmentChannelData[0].length : 0;
+            const isLinear = fftLinearToggle.checked;
+            for (let i=0; i < numChannels; i++) {
+                if (timePlotDiv.data[i].visible !== 'legendonly') {
+                    const channelSelectedData = selectedData.map(row => row[i]);
+                    const { freqs, psdValues } = calculateWelchPSD(channelSelectedData, currentSampleRate);
+                    // THE FIX: Use a much smaller epsilon value (1e-24)
+                    const yValues = isLinear ? psdValues : psdValues.map(v => 10 * Math.log10(v + 1e-24));
+                    const newTrace = { x: freqs, y: yValues, mode: 'lines', name: `CH${i + 1}` };
+                    newTrace.psdValues = psdValues;
+                    newFftTraces.push(newTrace);
+                }
+            }
+            const yAxisTitle = isLinear ? 'PSD (V²/Hz)' : 'PSD (dB/Hz)';
+            Plotly.react(fftPlotDiv, newFftTraces, { title: `PSD of visible region (${timeRange[0].toFixed(2)}s to ${timeRange[1].toFixed(2)}s)`, xaxis: { title: 'Frequency (Hz)', type: 'log' }, yaxis: { title: yAxisTitle } });
+        }
+        
+        function handleLegendClick(eventData) { const curveNumber = eventData.curveNumber; let newVisibility = eventData.data[curveNumber].visible === 'legendonly' ? true : 'legendonly'; Plotly.restyle(timePlotDiv, { visible: newVisibility }, [curveNumber]); Plotly.restyle(fftPlotDiv,  { visible: newVisibility }, [curveNumber]); return false; }
+        
+        // --- DSP Functions ---
+        function calculateWelchPSD(dataArray, sampleRate, segmentLength, overlapFactor) { const n = dataArray.length; overlapFactor = overlapFactor || 0.5; segmentLength = segmentLength || Math.min(n, 2048); if (n < segmentLength) { const single = calculateSingleFFT(dataArray, sampleRate); return { freqs: single.freqs, psdValues: single.magnitudes.map(amp => amp*amp) }; } const overlap = Math.floor(segmentLength * overlapFactor); const step = segmentLength - overlap; const N = Math.pow(2, Math.ceil(Math.log2(segmentLength))); const totalSpectrum = new Float32Array(N / 2).fill(0); let numSegments = 0; for (let i = 0; i <= n - segmentLength; i += step) { const segment = dataArray.slice(i, i + segmentLength); const mean = segment.reduce((a, b) => a + b, 0) / segmentLength; const realInput = new Float32Array(N); for (let j = 0; j < segmentLength; j++) { const window = 0.5 * (1 - Math.cos(2 * Math.PI * j / (segmentLength - 1))); realInput[j] = (segment[j] - mean) * window; } const imagInput = new Float32Array(N); fft_in_place(realInput, imagInput); for (let k = 0; k < N / 2; k++) { totalSpectrum[k] += realInput[k]**2 + imagInput[k]**2; } numSegments++; } if (numSegments === 0) return { freqs: [], psdValues: [] }; const freqs = []; const psdValues = []; const windowCorrection = 1.0 / (segmentLength * 0.375 * sampleRate); for (let i = 1; i < N / 2; i++) { const avgPower = totalSpectrum[i] / numSegments; psdValues.push(avgPower * windowCorrection * 2); freqs.push(i * sampleRate / N); } return { freqs, psdValues }; }
+        function calculateSingleFFT(dataArray, sampleRate) { const n = dataArray.length; if (n < 2) { return { freqs: [], magnitudes: [] }; } const N = Math.pow(2, Math.ceil(Math.log2(n))); const realInput = new Float32Array(N); const imagInput = new Float32Array(N); const mean = dataArray.reduce((a, b) => a + b, 0) / n; for(let i=0; i<n; i++) { const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1))); realInput[i] = (dataArray[i] - mean) * window; } fft_in_place(realInput, imagInput); const mags = []; const freqs = []; for (let i = 1; i < N / 2; i++) { const mag = Math.sqrt(realInput[i]**2 + imagInput[i]**2) / (n/2); mags.push(mag); freqs.push(i * sampleRate / N); } return {freqs, magnitudes: mags}; }
+        function fft_in_place(real, imag) { const n = real.length; if (n === 0) return; const logN = Math.log2(n); if (logN % 1 !== 0) throw new Error("FFT size must be a power of 2."); for (let i = 0; i < n; i++) { let j = 0; for (let k = 0; k < logN; k++) { if ((i >> k) & 1) j |= 1 << (logN - 1 - k); } if (j > i) { [real[i], real[j]] = [real[j], real[i]]; [imag[i], imag[j]] = [imag[j], imag[i]]; } } for (let size = 2; size <= n; size *= 2) { const halfSize = size / 2; const angle = -2 * Math.PI / size; for (let i = 0; i < n; i += size) { for (let j = 0; j < halfSize; j++) { const k = i + j; const l = k + halfSize; const w_real = Math.cos(angle * j); const w_imag = Math.sin(angle * j); const t_real = real[l] * w_real - imag[l] * w_imag; const t_imag = real[l] * w_imag + imag[l] * w_real; real[l] = real[k] - t_real; imag[l] = imag[k] - t_imag; real[k] += t_real; imag[k] += t_imag; } } } }
+
+    </script>
+</body>
+</html>
