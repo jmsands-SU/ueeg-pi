@@ -322,10 +322,12 @@ def main() -> None:
     best_diversity = min(ber_d1, ber_d2)
     best_diversity_label = "v1→v2" if ber_d1 <= ber_d2 else "v2→v1"
 
-    def _improvement(ber_new, ber_ref):
-        if ber_ref == 0:
+    def _db(ber_new, ber_ref):
+        """10*log10(BER_new / BER_ref). Negative = improvement."""
+        if ber_ref == 0 or ber_new == 0:
             return "—"
-        return f"{(ber_ref - ber_new) / ber_ref * 100:+.1f}%"
+        import math
+        return f"{10 * math.log10(ber_new / ber_ref):+.1f} dB"
 
     baseline = max(ber_v1, ber_v2)   # worst single copy = natural baseline
     baseline_label = "v2" if ber_v1 <= ber_v2 else "v1"
@@ -340,13 +342,14 @@ def main() -> None:
         ("v2→v1 diversity", t_err_d2, t_bits_d2, ber_d2),
     ]:
         counts = f"{t_err}/{t_bits}"
-        print(f"  {lbl:<22}  {counts:>18}  {ber:>10.6f}  {_improvement(ber, baseline):>16}")
+        print(f"  {lbl:<22}  {counts:>18}  {ber:>10.6f}  {_db(ber, baseline):>16}")
 
     print(f"\n  Best single copy:    {best_single_label}  (BER {best_single:.6f})")
     print(f"  Best diversity:      {best_diversity_label}  (BER {best_diversity:.6f})")
     if best_single > 0:
-        gain = (best_single - best_diversity) / best_single * 100
-        print(f"  Diversity gain over best single copy: {gain:+.1f}%")
+        import math
+        gain_db = 10 * math.log10(best_diversity / best_single)
+        print(f"  Diversity gain over best single copy: {gain_db:+.1f} dB")
 
     # Per-sample detail (optional)
     if args.show_first > 0 and diversity_rows is not None:

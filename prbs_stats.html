@@ -268,13 +268,16 @@
         renderStratTable(document.getElementById('fullBody'),  s.full,  N);
     }
 
+    function db(ber_new, ber_ref) {
+        if (!ber_ref || !ber_new) return '—';
+        return (10 * Math.log10(ber_new / ber_ref)).toFixed(1) + ' dB';
+    }
+
     function renderBerGrid(ch, N) {
         const d = ch;
         const bestDiv = d.div_v1_v2.ber <= d.div_v2_v1.ber ? d.div_v1_v2 : d.div_v2_v1;
         const worstSingle = Math.max(d.v1_only.ber, d.v2_only.ber);
-
         const combinedBer = d.combined.errors / d.combined.bits;
-        const divGain = worstSingle > 0 ? ((worstSingle - bestDiv.ber) / worstSingle * 100).toFixed(1) : '—';
 
         document.getElementById('berGrid').innerHTML = [
             ['Combined BER<br><small>(v1+v2 as independent)</small>',
@@ -284,7 +287,7 @@
                 `${(bestDiv.ber * 100).toFixed(4)}%`,
                 `${fmt(bestDiv.errors)} / ${fmt(bestDiv.bits)} bits`],
             ['Diversity gain<br><small>(vs worst single copy)</small>',
-                `${divGain}%`, ''],
+                db(bestDiv.ber, worstSingle), ''],
         ].map(([label, val, sub]) => `
             <div class="summary-item">
                 <div class="label">${label}</div>
@@ -307,16 +310,15 @@
 
         tbody.innerHTML = rows.map(([label, r]) => {
             const isBest = Math.abs(r.ber - bestBer) < 1e-12 && label.includes('diversity');
-            const improvement = (r === s.combined || worstBer === 0)
-                ? '—'
-                : `${((worstBer - r.ber) / worstBer * 100).toFixed(1)}%`;
-            const pillClass = r.ber <= worstBer ? 'pill-good' : 'pill-bad';
+            const isRef  = r === s.combined;
+            const dbVal  = (isRef || !worstBer) ? '—' : db(r.ber, worstBer);
+            const pillClass = (!isRef && r.ber < worstBer) ? 'pill-good' : 'pill-bad';
             return `<tr class="${isBest ? 'best' : ''}">
                 <td>${label}${isBest ? ' ★' : ''}</td>
                 <td class="right">${fmt(r.errors)} / ${fmt(r.bits)}</td>
                 <td class="right">${(r.ber * 100).toFixed(4)}%</td>
-                <td class="right">${r === s.combined ? '—' :
-                    `<span class="pill ${pillClass}">${improvement}</span>`}</td>
+                <td class="right">${isRef ? '—' :
+                    `<span class="pill ${pillClass}">${dbVal}</span>`}</td>
             </tr>`;
         }).join('');
     }

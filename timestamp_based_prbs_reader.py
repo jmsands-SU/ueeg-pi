@@ -1072,9 +1072,9 @@ if __name__ == '__main__':
         bits_per_channel=40,    # 4 * 20 = 80 bits = 10 bytes per packet
         gcs_bucket='ueegbucket',
         gcs_blob_name='prbs_test/run001',
-        enable_gcs=False,
+        enable_gcs=True,
         local_path = "prbs_test_local.bin",
-        enable_gcs_trigger=False
+        enable_gcs_trigger=True
     )
     reader.start_capture()
     reader.print_stats()
