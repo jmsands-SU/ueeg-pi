@@ -250,6 +250,7 @@ class TimeStampBasedReader:
             self.gcs_chunk_counter = 0
             self.gcs_session_id = time.strftime('%Y%m%d_%H%M%S')
             self.gcs_samples_written = 0
+            self.gcs_timestamp_log = []
             self._gcs_recording_start_time = time.time()
             self._gcs_last_good_values = {ch: np.full(4, np.nan, dtype=np.float32) for ch in range(1, 5)}
         # Update blob/temp names from trigger message if blob was updated
@@ -315,6 +316,7 @@ class TimeStampBasedReader:
                 )
                 ack_ids = []
                 for received in response.received_messages:
+                    
                     ack_ids.append(received.ack_id)
                     data = received.message.data.decode('utf-8', errors='ignore')
                     print(f'GCS trigger message received: {data!r}')
@@ -433,11 +435,17 @@ class TimeStampBasedReader:
         # Using a unique name for the temp blob prevents race conditions
         temp_blob_name = f"{self.gcs_blob_name}.temp.{self.gcs_session_id}.{self.gcs_chunk_counter}"
         temp_blob = self.gcs_bucket_obj.blob(temp_blob_name)
-        temp_blob.upload_from_string(new_bytes, content_type='application/octet-stream')
-        
+        try:
+            temp_blob.upload_from_string(new_bytes, content_type='application/octet-stream')
+        except Exception as exc:
+            print(f'GCS compose/append error: {exc}')
+            with self._gcs_buffer_lock:
+                self.gcs_write_buffer = buffer_snapshot + self.gcs_write_buffer
+            return
+
         # 4. Use GCS Compose to append the new chunk to the main blob
         main_blob = self.gcs_bucket_obj.blob(self.gcs_blob_name)
-        
+
         try:
             # Check if the main blob exists to decide whether to compose or rename
             # This is a lightweight metadata call
@@ -445,24 +453,30 @@ class TimeStampBasedReader:
                 # Append temp_blob to the end of main_blob
                 main_blob.compose([main_blob, temp_blob])
             else:
-                # If it's the first chunk, just rename the temp blob to become the main blob
+                # If it's the first chunk, just rename the temp blob to become the main blob.
+                # rename_blob is a server-side copy+delete, so the temp blob will no longer
+                # exist afterwards — do NOT call temp_blob.delete() after this path.
                 self.gcs_bucket_obj.rename_blob(temp_blob, new_name=self.gcs_blob_name)
-                # Re-fetch the blob object after renaming
                 main_blob = self.gcs_bucket_obj.blob(self.gcs_blob_name)
-
-            # 5. Clean up the temporary chunk blob
-            temp_blob.delete()
-
+                temp_blob = None  # already gone; skip delete below
         except Exception as exc:
             print(f'GCS compose/append error: {exc}')
-            # Clean up temp blob on failure too
+            # Try to clean up the orphaned temp blob, then requeue
             try:
-                if temp_blob.exists(): temp_blob.delete()
-            except Exception: pass
+                temp_blob.delete()
+            except Exception:
+                pass
             with self._gcs_buffer_lock:
                 self.gcs_write_buffer = buffer_snapshot + self.gcs_write_buffer
             return
-            
+
+        # 5. Clean up the temporary chunk blob (only needed after compose, not after rename)
+        if temp_blob is not None:
+            try:
+                temp_blob.delete()
+            except Exception:
+                pass  # 404 here just means it was already cleaned up; not an error
+
         # --- END OF NEW, EFFICIENT LOGIC ---
 
         n_samples = len(new_data_chunk)
@@ -786,7 +800,38 @@ class TimeStampBasedReader:
 
         try:
             print("RX thread started. Waiting for samples...")
-            
+
+            # ── Ring-buffer drain ──────────────────────────────────────────────
+            # Discard stale pre-buffered data so that the first real sync_rx call
+            # returns freshly-captured samples.  Measure sync_rx call duration
+            # before and after to confirm whether the ring was pre-filled.
+            drain_calls = (16 * 8192 + self.buffer_size - 1) // self.buffer_size  # ceil(ring / batch)
+            print(f"Draining BladeRF ring buffer ({drain_calls} calls)...")
+            for drain_i in range(drain_calls):
+                t0 = time.time()
+                self.device.sync_rx(rx_buffer, self.buffer_size, timeout_ms=3500, meta=meta)
+                dt = time.time() - t0
+                print(f"  drain call {drain_i}: sync_rx took {dt*1000:.1f} ms")
+            # First real call after drain — should block until fresh data arrives
+            t0 = time.time()
+            self.device.sync_rx(rx_buffer, self.buffer_size, timeout_ms=3500, meta=meta)
+            dt = time.time() - t0
+            print(f"  first post-drain sync_rx took {dt*1000:.1f} ms  ← should be ~{self.buffer_size/100:.0f} ms if ring was pre-filled")
+            # Re-enter the main loop; this buffer is fresh so process it normally
+            buffer_received_time = time.time()
+            actual_count = meta.actual_count
+            if actual_count > 0:
+                rx_samples = np.frombuffer(rx_buffer, dtype=np.uint16, count=actual_count * 2)
+                output_data = self._extract_output_stream(rx_samples)
+                buffer_duration_s = len(output_data) / 100e3
+                first_word_timestamp = buffer_received_time - buffer_duration_s
+                self.samples_captured += len(output_data)
+                try:
+                    self.data_queue.put((output_data, first_word_timestamp), timeout=0.2)
+                except queue.Full:
+                    pass
+            # ── End drain ──────────────────────────────────────────────────────
+
             while self.running and self._rx_running:
                 
                 try:
@@ -815,7 +860,7 @@ class TimeStampBasedReader:
                 # Calculate timestamp for FIRST word in this buffer
                 # The buffer duration represents how long it took to fill
                 # Last word arrived at buffer_received_time, first word arrived buffer_duration earlier
-                buffer_duration_s = actual_count / self.sample_rate  # self.sample_rate = 8e6
+                buffer_duration_s = len(output_data) / 100e3
                 first_word_timestamp = buffer_received_time - buffer_duration_s
                 
                 self.samples_captured += len(output_data)
@@ -1942,7 +1987,7 @@ class TimeStampBasedReader:
         fs_output = self.output_rate_hz
         t = np.arange(len(series)) / fs_output
 
-        csv_path = f'/home/joannas/bladeRF/hdl/pythonscripts/time_domain_python_ch{idx}.csv'
+        csv_path = f'/home/joannas/bladeRF/hdl/pythonscripts/time_domain_python_artifact_ch{idx}.csv'
         export_matrix = np.column_stack((t, series, quality_series))
         np.savetxt(
             csv_path,
@@ -2039,20 +2084,20 @@ class TimeStampBasedReader:
 if __name__ == '__main__':
     reader = TimeStampBasedReader(
         sample_rate=8e6,
-        frequency=918.5e6,
+        frequency=914.5e6,
         gain_mode='slowattack',
         gain=30,
         counter=False,
         raw=False,
         device=1,
-        bandwidth=4e6,
+        bandwidth=1.5e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
         accepted_frame_lengths=(248, 250),
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
-        channel_to_decode=2,
+        channel_to_decode=3,
         gcs_bucket="ueegbucket",  # Set to your GCS bucket
         gcs_blob_name="ada_eyesclosed.npy",  # Output file name (.csv for CSV, .npy for binary)
         gcs_buffer_size=400,  # Write every 400 samples (2 seconds at 200 Hz)
