@@ -92,7 +92,17 @@ echo "✓ udev rules configured"
 
 
 echo ""
-echo "Step 10: Enabling and Starting Services..."
+echo "Step 10: Installing btberry (WiFi config via Bluetooth)..."
+sudo rfkill unblock bluetooth
+if curl -sL https://raw.githubusercontent.com/nksan/Rpi-SetWiFi-viaBluetooth/main/btwifisetInstall.sh | sudo bash; then
+    echo "✓ btberry installed"
+else
+    echo "⚠️  btberry install failed (no internet, or upstream unavailable) — skipping."
+    echo "   To install manually later: curl -sL https://raw.githubusercontent.com/nksan/Rpi-SetWiFi-viaBluetooth/main/btwifisetInstall.sh | sudo bash"
+fi
+
+echo ""
+echo "Step 11: Enabling and Starting Services..."
 sudo systemctl daemon-reload
 sudo systemctl enable network-monitor.service sdr-monitor.service
 sudo systemctl restart network-monitor.service

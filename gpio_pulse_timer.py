@@ -30,7 +30,7 @@ try:
 except ImportError:
     sys.exit("pigpio not found. Install with: pip install pigpio  (and run: sudo pigpiod)")
 
-PULSE_WIDTH_US = 10_000  # 10 ms pulse
+PULSE_WIDTH_S = 0.010  # 10 ms pulse
 
 
 def run(pin: int, out_path: str, min_interval: float, max_interval: float):
@@ -64,7 +64,9 @@ def run(pin: int, out_path: str, min_interval: float, max_interval: float):
         time.sleep(interval)
 
         now = time.time()
-        pig.gpio_trigger(pin, PULSE_WIDTH_US, 1)
+        pig.write(pin, 1)
+        time.sleep(PULSE_WIDTH_S)
+        pig.write(pin, 0)
 
         utc = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
         subsec = f"{now % 1:.3f}"[1:]

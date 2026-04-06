@@ -197,6 +197,7 @@ class TimeStampBasedReader:
         self.gcs_timestamp_log_interval = 12000  # Log timestamp every 12000 samples (60 seconds at 200 Hz)
         self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}  # Track word positions for packets
         self._first_group_skipped = False  # Discard first decoded group (startup artifact)
+        self._force_timestamp_after_restart = False  # Set True after SDR restart to force a checkpoint
         self.capture_start_time = None
         self.samples_captured = 0
 
@@ -384,6 +385,16 @@ class TimeStampBasedReader:
                             'sample_timestamp_s': float(ts_val),
                             'system_time_s': time.time(),
                         })
+                elif self._force_timestamp_after_restart:
+                    ts_val = group_sample_timestamps[0]
+                    if not np.isnan(ts_val):
+                        self.gcs_timestamp_log.append({
+                            'gcs_sample_idx': int(current_total),
+                            'sample_timestamp_s': float(ts_val),
+                            'system_time_s': time.time(),
+                            'reason': 'sdr_restart',
+                        })
+                    self._force_timestamp_after_restart = False
                 elif interval > 0 and (new_total // interval) > (current_total // interval):
                     milestone = (new_total // interval) * interval
                     s_idx = max(0, min(3, milestone - current_total - 1))
@@ -533,6 +544,8 @@ class TimeStampBasedReader:
                     'bit_layout': quality_nibble_map,
                 },
                 'nan_fill_policy': 'carry_forward_per_channel_per_slot; leading NaN values are written as 0.0 until first valid sample',
+                'decode_scale': self.decode_scale,
+                'center_frequency_hz': self.frequency,
                 'gcs_samples_written': int(self.gcs_samples_written),
                 'gcs_chunk_counter': int(self.gcs_chunk_counter),
                 'session_id': self.gcs_session_id,
@@ -741,6 +754,7 @@ class TimeStampBasedReader:
             rx_t = threading.Thread(target=self.rx_thread, daemon=True)
             self._rx_thread_ref = rx_t
             rx_t.start()
+            self._force_timestamp_after_restart = True
             print(f'SDR restarted (restart #{len(self._sdr_restart_log)}).')
         except Exception as exc:
             print(f'⚠️  SDR restart failed: {exc}')
@@ -801,36 +815,36 @@ class TimeStampBasedReader:
         try:
             print("RX thread started. Waiting for samples...")
 
-            # ── Ring-buffer drain ──────────────────────────────────────────────
-            # Discard stale pre-buffered data so that the first real sync_rx call
-            # returns freshly-captured samples.  Measure sync_rx call duration
-            # before and after to confirm whether the ring was pre-filled.
-            drain_calls = (16 * 8192 + self.buffer_size - 1) // self.buffer_size  # ceil(ring / batch)
-            print(f"Draining BladeRF ring buffer ({drain_calls} calls)...")
-            for drain_i in range(drain_calls):
-                t0 = time.time()
-                self.device.sync_rx(rx_buffer, self.buffer_size, timeout_ms=3500, meta=meta)
-                dt = time.time() - t0
-                print(f"  drain call {drain_i}: sync_rx took {dt*1000:.1f} ms")
-            # First real call after drain — should block until fresh data arrives
-            t0 = time.time()
-            self.device.sync_rx(rx_buffer, self.buffer_size, timeout_ms=3500, meta=meta)
-            dt = time.time() - t0
-            print(f"  first post-drain sync_rx took {dt*1000:.1f} ms  ← should be ~{self.buffer_size/100:.0f} ms if ring was pre-filled")
-            # Re-enter the main loop; this buffer is fresh so process it normally
-            buffer_received_time = time.time()
-            actual_count = meta.actual_count
-            if actual_count > 0:
-                rx_samples = np.frombuffer(rx_buffer, dtype=np.uint16, count=actual_count * 2)
-                output_data = self._extract_output_stream(rx_samples)
-                buffer_duration_s = len(output_data) / 100e3
-                first_word_timestamp = buffer_received_time - buffer_duration_s
-                self.samples_captured += len(output_data)
-                try:
-                    self.data_queue.put((output_data, first_word_timestamp), timeout=0.2)
-                except queue.Full:
-                    pass
-            # ── End drain ──────────────────────────────────────────────────────
+            # # ── Ring-buffer drain ──────────────────────────────────────────────
+            # # Discard stale pre-buffered data so that the first real sync_rx call
+            # # returns freshly-captured samples.  Measure sync_rx call duration
+            # # before and after to confirm whether the ring was pre-filled.
+            # drain_calls = (16 * 8192 + self.buffer_size - 1) // self.buffer_size  # ceil(ring / batch)
+            # print(f"Draining BladeRF ring buffer ({drain_calls} calls)...")
+            # for drain_i in range(drain_calls):
+            #     t0 = time.time()
+            #     self.device.sync_rx(rx_buffer, self.buffer_size, timeout_ms=3500, meta=meta)
+            #     dt = time.time() - t0
+            #     print(f"  drain call {drain_i}: sync_rx took {dt*1000:.1f} ms")
+            # # First real call after drain — should block until fresh data arrives
+            # t0 = time.time()
+            # self.device.sync_rx(rx_buffer, self.buffer_size, timeout_ms=3500, meta=meta)
+            # dt = time.time() - t0
+            # print(f"  first post-drain sync_rx took {dt*1000:.1f} ms  ← should be ~{self.buffer_size/100:.0f} ms if ring was pre-filled")
+            # # Re-enter the main loop; this buffer is fresh so process it normally
+            # buffer_received_time = time.time()
+            # actual_count = meta.actual_count
+            # if actual_count > 0:
+            #     rx_samples = np.frombuffer(rx_buffer, dtype=np.uint16, count=actual_count * 2)
+            #     output_data = self._extract_output_stream(rx_samples)
+            #     buffer_duration_s = len(output_data) / 100e3
+            #     first_word_timestamp = buffer_received_time - buffer_duration_s
+            #     self.samples_captured += len(output_data)
+            #     try:
+            #         self.data_queue.put((output_data, first_word_timestamp), timeout=0.2)
+            #     except queue.Full:
+            #         pass
+            # # ── End drain ──────────────────────────────────────────────────────
 
             while self.running and self._rx_running:
                 
@@ -2084,13 +2098,13 @@ class TimeStampBasedReader:
 if __name__ == '__main__':
     reader = TimeStampBasedReader(
         sample_rate=8e6,
-        frequency=914.5e6,
+        frequency=902.7e6,
         gain_mode='slowattack',
         gain=30,
         counter=False,
         raw=False,
         device=1,
-        bandwidth=1.5e6,
+        bandwidth=3e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
