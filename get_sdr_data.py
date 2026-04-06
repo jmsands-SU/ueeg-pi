@@ -200,6 +200,23 @@ def _analyze_prbs_data(raw_bytes, bytes_per_sample, bytes_per_copy):
 
     return errors_per_sample, ber, quality.tolist() if quality is not None else None, prbs_stats
 
+def _raw_values_to_float(values_array, metadata):
+    """
+    Convert a raw 'values' array to float32 volts, applying sample_encoding if present.
+
+    New files (storage_dtype='int32') store the raw 20-bit signed integer; the
+    encoding is:  volts = raw_int / fixed_point_divisor * scale_factor
+    Old files store float32 volts directly and are returned unchanged.
+    """
+    enc = metadata.get("sample_encoding", {})
+    storage_dtype = enc.get("storage_dtype", metadata.get("dtype", {}).get("values", "float32"))
+    if "int32" in str(storage_dtype):
+        fixed_point_divisor = enc.get("fixed_point_divisor", 1 << 12)
+        scale_factor = enc.get("scale_factor", metadata.get("decode_scale", 1.0))
+        return (values_array.astype(np.float64) / fixed_point_divisor * scale_factor).astype(np.float32)
+    return values_array.astype(np.float32)
+
+
 def _apply_lowpass_filter(data_array, fs, corner_hz=30.0, order=4):
     """Applies a zero-phase low-pass filter to the data."""
     if data_array.ndim == 1: data_array = data_array.reshape(-1, 1)
@@ -264,7 +281,7 @@ def get_sdr_data(request):
             raw_bytes = data_blob.download_as_bytes(start=start_byte, end=end_byte)
             data_slice = np.frombuffer(raw_bytes, dtype=dtype)
             
-            segment_data_np = data_slice['values'].astype(np.float32) if 'values' in data_slice.dtype.names else np.array([])
+            segment_data_np = _raw_values_to_float(data_slice['values'], metadata) if 'values' in data_slice.dtype.names else np.array([])
             if apply_lp_filter and segment_data_np.size > 0:
                 print("INFO: Applying 30Hz low-pass filter.")
                 segment_data_np = _apply_lowpass_filter(segment_data_np, sample_rate)
@@ -309,7 +326,7 @@ def get_sdr_data(request):
             if dtype:
                 print("INFO: Detected structured .bin format from parsed metadata.")
                 loaded_array = np.frombuffer(binary_content, dtype=dtype)
-                data_only_array = loaded_array['values'].astype(np.float32)
+                data_only_array = _raw_values_to_float(loaded_array['values'], metadata)
                 first_channel_flags = loaded_array['quality_packed'] & 0x0F
                 clean_mask = (first_channel_flags > 0)
                 quality_flags_for_stats = first_channel_flags

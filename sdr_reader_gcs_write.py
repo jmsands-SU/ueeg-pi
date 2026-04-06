@@ -113,7 +113,7 @@ class TimeStampBasedReader:
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         self.gcs_samples_written = 0
         # Per-channel last-good value for NaN carry-forward (shape (4,) per channel)
-        self._gcs_last_good_values = {ch: np.full(4, np.nan, dtype=np.float32) for ch in range(1, 5)}
+        self._gcs_last_good_values = {ch: np.zeros(4, dtype=np.int32) for ch in range(1, 5)}
 
         self.frame_length = int(frame_length)
         if accepted_frame_lengths is None:
@@ -253,7 +253,7 @@ class TimeStampBasedReader:
             self.gcs_samples_written = 0
             self.gcs_timestamp_log = []
             self._gcs_recording_start_time = time.time()
-            self._gcs_last_good_values = {ch: np.full(4, np.nan, dtype=np.float32) for ch in range(1, 5)}
+            self._gcs_last_good_values = {ch: np.zeros(4, dtype=np.int32) for ch in range(1, 5)}
         # Update blob/temp names from trigger message if blob was updated
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         print(f'GCS recording started (session={self.gcs_session_id}, blob={self.gcs_blob_name}).')
@@ -342,11 +342,12 @@ class TimeStampBasedReader:
                 )
                 self._stop_gcs_recording()
 
-    def _append_gcs_group(self, group_values: dict, group_quality: dict, group_sample_timestamps=None):
+    def _append_gcs_group(self, group_values: dict, group_raw_values: dict, group_quality: dict, group_sample_timestamps=None):
         """Append one decoded group (4 time slots) as 4 rows to the GCS write buffer.
-        Each row stores selected channel values plus one packed quality field.
+        Each row stores selected channel raw int32 values plus one packed quality field.
         Quality codes use 4 bits per channel packed into a uint16 in gcs_channels order.
-        Carry-forward fills NaN values slot-by-slot per channel from last known good value.
+        Carry-forward fills missing slots (quality=0) from the last known good raw integer.
+        Leading missing values are written as 0.
         """
         if not self.enable_gcs:
             return
@@ -355,16 +356,16 @@ class TimeStampBasedReader:
             vals_row = []
             packed_quality = np.uint16(0)
             for ch_idx, ch in enumerate(self.gcs_channels):
-                v = float(group_values[ch][s]) if ch in group_values else np.nan
                 q = int(group_quality[ch][s]) if ch in group_quality else 0
                 last = self._gcs_last_good_values[ch]
-                if np.isnan(v):
-                    v = float(last[s])  # carry-forward (may still be NaN at very start)
+                if ch in group_raw_values and q != 0:
+                    r = int(group_raw_values[ch][s])
+                    last[s] = np.int32(r)
                 else:
-                    last[s] = np.float32(v)  # update carry-forward
-                vals_row.append(np.float32(v if not np.isnan(v) else 0.0))
+                    r = int(last[s])  # carry-forward (0 at very start)
+                vals_row.append(np.int32(r))
                 packed_quality = np.uint16(packed_quality | ((q & 0xF) << (4 * ch_idx)))
-            rows_to_add.append((np.asarray(vals_row, dtype=np.float32), packed_quality))
+            rows_to_add.append((np.asarray(vals_row, dtype=np.int32), packed_quality))
 
         should_flush = False
         with self._gcs_buffer_lock:
@@ -431,7 +432,7 @@ class TimeStampBasedReader:
         # 1. Create the new data chunk as a NumPy array
         n_channels = len(self.gcs_channels)
         row_dtype = np.dtype([
-            ('values', np.float32, (n_channels,)),
+            ('values', np.int32, (n_channels,)),
             ('quality_packed', np.uint16),
         ])
         new_data_chunk = np.empty(len(buffer_snapshot), dtype=row_dtype)
@@ -525,7 +526,7 @@ class TimeStampBasedReader:
                 'channel_names': channel_names,
                 'row_description': 'Each row is one decoded sample time-step across selected channels.',
                 'dtype': {
-                    'values': f"float32[{len(self.gcs_channels)}]",
+                    'values': f"int32[{len(self.gcs_channels)}]",
                     'quality_packed': 'uint16',
                 },
                 'fields': ['values', 'quality_packed'],
@@ -543,8 +544,16 @@ class TimeStampBasedReader:
                     },
                     'bit_layout': quality_nibble_map,
                 },
-                'nan_fill_policy': 'carry_forward_per_channel_per_slot; leading NaN values are written as 0.0 until first valid sample',
-                'decode_scale': self.decode_scale,
+                'nan_fill_policy': 'carry_forward_per_channel_per_slot; leading missing values written as 0 (int32 zero)',
+                'decode_scale': self.decode_scale,  # kept for backwards compatibility
+                'sample_encoding': {
+                    'storage_dtype': 'int32',
+                    'fixed_point_divisor': 1 << 12,
+                    'scale_factor': self.decode_scale,
+                    'volts_per_lsb': self.decode_scale / (1 << 12),
+                    'adc_bits': 20,
+                    'to_volts': 'raw_int / fixed_point_divisor * scale_factor',
+                },
                 'center_frequency_hz': self.frequency,
                 'gcs_samples_written': int(self.gcs_samples_written),
                 'gcs_chunk_counter': int(self.gcs_chunk_counter),
@@ -910,6 +919,18 @@ class TimeStampBasedReader:
         payload_reversed = payload[::-1]
         return self._bin2num_20_12(payload_reversed) * self.decode_scale
 
+    @staticmethod
+    def _decode_raw_int_from_packet_bits(bits: np.ndarray):
+        """Return the raw 20-bit signed integer from packet bits without any scaling."""
+        if bits is None or len(bits) < 20:
+            return None
+        payload_reversed = bits[:20][::-1]
+        bit_string = ''.join(str(int(x)) for x in payload_reversed)
+        value = int(bit_string, 2)
+        if value >= (1 << 19):
+            value -= (1 << 20)
+        return value
+
     def _pick_mismatch_value(self, v1: float, v2: float, left_neighbor, right_neighbor):
         neighbors = []
         if left_neighbor is not None and np.isfinite(left_neighbor):
@@ -1243,6 +1264,7 @@ class TimeStampBasedReader:
                 continue
 
             group_values = {}
+            group_raw_values = {}
             group_quality = {}
             group_sample_timestamps = None  # NEW: 4 timestamps, one per sample
 
@@ -1297,6 +1319,9 @@ class TimeStampBasedReader:
                 mismatch_v1 = np.full(4, np.nan, dtype=np.float64)
                 mismatch_v2 = np.full(4, np.nan, dtype=np.float64)
                 mismatch_pending = np.zeros(4, dtype=bool)
+                raw_ints = np.zeros(4, dtype=np.int32)
+                mismatch_r1 = np.zeros(4, dtype=np.int32)
+                mismatch_r2 = np.zeros(4, dtype=np.int32)
 
                 for s in range(4):
                     p1 = group[s]
@@ -1325,18 +1350,24 @@ class TimeStampBasedReader:
 
                     v1 = self._decode_value_from_packet_bits(p1.bits) if p1.is_valid else None
                     v2 = self._decode_value_from_packet_bits(p2.bits) if p2.is_valid else None
+                    r1 = self._decode_raw_int_from_packet_bits(p1.bits) if p1.is_valid else None
+                    r2 = self._decode_raw_int_from_packet_bits(p2.bits) if p2.is_valid else None
 
                     if v1 is not None and v2 is not None:
                         if abs(v1 - v2) < self.mismatch_threshold:
                             values[s] = v1
                             quality[s] = 3
+                            raw_ints[s] = r1
                         else:
                             mismatch_v1[s] = float(v1)
                             mismatch_v2[s] = float(v2)
+                            mismatch_r1[s] = r1
+                            mismatch_r2[s] = r2
                             mismatch_pending[s] = True
                     elif v1 is not None:
                         values[s] = v1
                         quality[s] = 1
+                        raw_ints[s] = r1
                         if not p2.is_valid:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_packet_missing'] += 1
                             self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v1'][int(p2.packet_num) % 8] += 1
@@ -1345,6 +1376,7 @@ class TimeStampBasedReader:
                     elif v2 is not None:
                         values[s] = v2
                         quality[s] = 2
+                        raw_ints[s] = r2
                         if not p1.is_valid:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
                             self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
@@ -1354,6 +1386,7 @@ class TimeStampBasedReader:
                             print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} payload short, p2 pkt#{p2.packet_num} valid")
                     else:
                         quality[s] = 0
+                        # raw_ints[s] stays 0; will be overwritten by carry-forward in _append_gcs_group
                         print(f"  no_packet ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} valid={p1.is_valid}, p2 pkt#{p2.packet_num} valid={p2.is_valid}")
 
                 prev_neighbor = None
@@ -1376,6 +1409,7 @@ class TimeStampBasedReader:
                     )
                     values[s] = chosen_value
                     quality[s] = chosen_quality
+                    raw_ints[s] = mismatch_r1[s] if picked == 'v1' else mismatch_r2[s]
 
                     p1 = group[s]
                     p2 = group[s + 4]
@@ -1399,9 +1433,10 @@ class TimeStampBasedReader:
                 self.decoded_quality_by_channel[channel_idx].append(quality)
                 group_values[channel_idx] = values
                 group_quality[channel_idx] = quality
+                group_raw_values[channel_idx] = raw_ints
 
             if any(ch in self.gcs_channels for ch in synced):
-                self._append_gcs_group(group_values, group_quality, group_sample_timestamps)
+                self._append_gcs_group(group_values, group_raw_values, group_quality, group_sample_timestamps)
 
     def processing_thread(self):
         while self.running:
