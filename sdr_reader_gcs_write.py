@@ -69,7 +69,7 @@ class TimeStampBasedReader:
         bits_per_channel=40,
         channel_to_decode=3,
         mismatch_threshold=0.001,
-        decode_scale=1/256/10/2,#0.03 / 256 * 2,
+        decode_scale=1/512*.3,#0.03 / 256 * 2,
         decoded_group_maxlen=5000,
     ):
         self.sample_rate = int(sample_rate)
@@ -2058,6 +2058,7 @@ class TimeStampBasedReader:
         ax.set_ylabel('Amplitude')
         ax.grid(True, alpha=0.4)
         fig.tight_layout()
+        print(max(series), min(series))
 
         plt.show()
 
@@ -2146,7 +2147,7 @@ if __name__ == '__main__':
         accepted_frame_lengths=(248, 250),
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
-        channel_to_decode=3,
+        channel_to_decode=2,
         gcs_bucket="ueegbucket",  # Set to your GCS bucket
         gcs_blob_name="ada_eyesclosed.npy",  # Output file name (.csv for CSV, .npy for binary)
         gcs_buffer_size=400,  # Write every 400 samples (2 seconds at 200 Hz)

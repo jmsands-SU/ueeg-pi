@@ -217,6 +217,51 @@ def _raw_values_to_float(values_array, metadata):
     return values_array.astype(np.float32)
 
 
+def _correct_spike_samples(values_np, quality_packed_np, correct_receiver=True,
+                           correct_transmitter=True, spike_thresh_multiplier=10):
+    """
+    Linearly interpolate single-sample amplitude spikes.
+
+    A sample is a spike on channel c if the jump in and the jump back both exceed
+    spike_thresh_multiplier × median-absolute-diff, in opposite directions.
+
+    correct_receiver   — fix spikes where channel quality != 3 (dropped/mismatched packet)
+    correct_transmitter — fix spikes where channel quality == 3 (ADC glitch, both copies agreed)
+
+    values_np:         (N, n_channels) float array
+    quality_packed_np: (N,) uint16/uint32 array; channel ci quality = (qp >> 4*ci) & 0xF
+
+    Returns a corrected copy of values_np and the number of corrections made.
+    """
+    values = np.array(values_np, dtype=np.float64)
+    N, n_ch = values.shape
+
+    diff = np.diff(values, axis=0)                  # (N-1, n_ch)
+    mad = np.median(np.abs(diff), axis=0)
+    thresh = spike_thresh_multiplier * mad
+
+    n_corrected = 0
+    for ci in range(n_ch):
+        if thresh[ci] == 0:
+            continue
+        for i in range(1, N - 1):
+            jump_in   = diff[i - 1, ci]
+            jump_back = diff[i,     ci]
+            if not (abs(jump_in)   > thresh[ci] and
+                    abs(jump_back) > thresh[ci] and
+                    np.sign(jump_in) != np.sign(jump_back)):
+                continue
+            q = int((quality_packed_np[i] >> (4 * ci)) & 0xF)
+            is_receiver    = (q != 3)
+            is_transmitter = (q == 3)
+            if (is_receiver and correct_receiver) or (is_transmitter and correct_transmitter):
+                values[i, ci] = (values[i - 1, ci] + values[i + 1, ci]) / 2.0
+                n_corrected += 1
+
+    print(f"INFO: Spike correction: {n_corrected} sample(s) interpolated.")
+    return values.astype(np.float32), n_corrected
+
+
 def _apply_lowpass_filter(data_array, fs, corner_hz=30.0, order=4):
     """Applies a zero-phase low-pass filter to the data."""
     if data_array.ndim == 1: data_array = data_array.reshape(-1, 1)
@@ -236,6 +281,7 @@ def get_sdr_data(request):
     bucket_name = request_args.get("bucket")
     blob_name = request_args.get("blob")
     apply_lp_filter = request_args.get("apply_lp_filter") == 'true'
+    correct_spikes  = request_args.get("correct_spikes") == 'true'
     
     if not bucket_name or not blob_name:
         return (json.dumps({"error": "Missing 'bucket' or 'blob' parameters."}), 400, headers)
@@ -282,6 +328,9 @@ def get_sdr_data(request):
             data_slice = np.frombuffer(raw_bytes, dtype=dtype)
             
             segment_data_np = _raw_values_to_float(data_slice['values'], metadata) if 'values' in data_slice.dtype.names else np.array([])
+            if correct_spikes and segment_data_np.size > 0 and 'quality_packed' in data_slice.dtype.names:
+                print("INFO: Applying spike correction.")
+                segment_data_np, _ = _correct_spike_samples(segment_data_np, data_slice['quality_packed'])
             if apply_lp_filter and segment_data_np.size > 0:
                 print("INFO: Applying 30Hz low-pass filter.")
                 segment_data_np = _apply_lowpass_filter(segment_data_np, sample_rate)
@@ -347,6 +396,10 @@ def get_sdr_data(request):
             if request_args.get("start_index"):
                 start_idx, end_idx = int(request_args.get("start_index")), int(request_args.get("end_index"))
                 segment_data_np = data_only_array[start_idx:end_idx]
+                if correct_spikes and segment_data_np.size > 0 and dtype and 'quality_packed' in dtype.names:
+                    quality_slice = loaded_array['quality_packed'][start_idx:end_idx]
+                    print("INFO: Applying spike correction.")
+                    segment_data_np, _ = _correct_spike_samples(segment_data_np, quality_slice)
                 if apply_lp_filter and segment_data_np.size > 0:
                     segment_data_np = _apply_lowpass_filter(segment_data_np, sample_rate)
                 return (json.dumps({"sample_rate": sample_rate, "segment_data": segment_data_np.tolist()}), 200, headers)
