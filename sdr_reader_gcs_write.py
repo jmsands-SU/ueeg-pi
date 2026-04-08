@@ -140,8 +140,19 @@ class TimeStampBasedReader:
         self._sdr_restart_requested = threading.Event()
         self._sdr_restart_log = []  # list of {sample_idx, timestamp_utc, drop_rate, reason}
         self._rx_thread_ref = None
-        self.sdr_watchdog_window_seconds = 60
-        self.sdr_restart_drop_threshold = 0.30
+        self.sdr_watchdog_window_seconds = 20
+        self.sdr_restart_drop_threshold = 0.50
+        self.restart_cooldown_s = 120.0
+        self.post_restart_quality_window_s = 5.0
+        self.post_restart_quality_threshold = 0.50
+        self.post_restart_max_gate_s = 120.0
+
+        self._last_restart_time = None
+        self._post_restart_hold = False
+        self._post_restart_hold_buffer = []
+        self._post_restart_hold_timestamps = []
+        self._post_restart_hold_start = None
+
         self.device = None
         self.channel = None
         self.channel2 = None
@@ -239,6 +250,81 @@ class TimeStampBasedReader:
             if self.gcs_subscriber is None:
                 self.gcs_subscriber = pubsub_v1.SubscriberClient()
 
+    _RECORDING_STATE_FILE = '/tmp/sdr_recording_state.json'
+
+    def _write_recording_state_file(self):
+        """Persist current recording parameters to disk so they survive a process restart."""
+        projected_end = None
+        if self._gcs_trigger_duration is not None and self._gcs_recording_start_time is not None:
+            projected_end = self._gcs_recording_start_time + self._gcs_trigger_duration
+        state = {
+            'session_id': self.gcs_session_id,
+            'blob_name': self.gcs_blob_name,
+            'start_time_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self._gcs_recording_start_time))
+                if self._gcs_recording_start_time else None,
+            'start_time_unix': self._gcs_recording_start_time,
+            'duration_seconds': self._gcs_trigger_duration,
+            'projected_end_time_unix': projected_end,
+        }
+        try:
+            with open(self._RECORDING_STATE_FILE, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as exc:
+            print(f'Warning: could not write recording state file: {exc}')
+
+    def _delete_recording_state_file(self):
+        """Remove the on-disk recording state (called on normal stop or duration expiry)."""
+        try:
+            import os
+            os.remove(self._RECORDING_STATE_FILE)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f'Warning: could not delete recording state file: {exc}')
+
+    def _check_resume_recording(self):
+        """On startup, resume an in-progress recording if a valid state file exists."""
+        try:
+            with open(self._RECORDING_STATE_FILE) as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            print(f'Warning: could not read recording state file: {exc}')
+            return
+
+        projected_end = state.get('projected_end_time_unix')
+        now = time.time()
+
+        if projected_end is not None and now > projected_end:
+            print('Recording state file found but window already elapsed — discarding.')
+            self._delete_recording_state_file()
+            return
+
+        blob_name = state.get('blob_name')
+        session_id = state.get('session_id')
+        duration = state.get('duration_seconds')
+        start_unix = state.get('start_time_unix')
+
+        if blob_name:
+            self.gcs_blob_name = blob_name
+            self.gcs_temp_name = f'{blob_name}.temp'
+        if duration is not None and start_unix is not None:
+            self._gcs_trigger_duration = duration
+            self._gcs_recording_start_time = start_unix  # preserve original start for duration tracking
+
+        print(f'Resuming recording from state file (session={session_id}, blob={blob_name}).')
+        self._start_gcs_recording()
+        # Override session_id so we append to the same blob rather than creating a new session
+        with self._gcs_buffer_lock:
+            self.gcs_session_id = session_id
+        self._sdr_restart_log.append({
+            'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'sample_idx_at_restart': 0,
+            'drop_rate_pct': None,
+            'reason': 'process_restart_resume',
+        })
+
     def _start_gcs_recording(self):
         if self.enable_gcs and self.gcs_bucket_obj is None:
             print('WARNING: GCS start trigger received but GCS client is not initialised — recording NOT started.')
@@ -257,6 +343,7 @@ class TimeStampBasedReader:
         # Update blob/temp names from trigger message if blob was updated
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         print(f'GCS recording started (session={self.gcs_session_id}, blob={self.gcs_blob_name}).')
+        self._write_recording_state_file()
 
     def _stop_gcs_recording(self):
         with self._gcs_buffer_lock:
@@ -268,6 +355,7 @@ class TimeStampBasedReader:
                 self._flush_gcs_buffer(force=True)
             except Exception as exc:
                 print(f'GCS flush error during stop: {exc}')
+            self._delete_recording_state_file()
             print('GCS recording stopped.')
 
     def _handle_gcs_trigger_message(self, payload: str):
@@ -341,6 +429,7 @@ class TimeStampBasedReader:
                     f'(actual={elapsed:.1f}s) — stopping recording.'
                 )
                 self._stop_gcs_recording()
+                self._delete_recording_state_file()
 
     def _append_gcs_group(self, group_values: dict, group_raw_values: dict, group_quality: dict, group_sample_timestamps=None):
         """Append one decoded group (4 time slots) as 4 rows to the GCS write buffer.
@@ -366,6 +455,51 @@ class TimeStampBasedReader:
                 vals_row.append(np.int32(r))
                 packed_quality = np.uint16(packed_quality | ((q & 0xF) << (4 * ch_idx)))
             rows_to_add.append((np.asarray(vals_row, dtype=np.int32), packed_quality))
+
+        if self._post_restart_hold:
+            # Check if we've been stuck in the gate too long — force a new restart
+            if (time.time() - self._post_restart_hold_start) > self.post_restart_max_gate_s:
+                print(f'Post-restart quality gate exceeded {self.post_restart_max_gate_s:.0f}s — requesting SDR restart.')
+                self._post_restart_hold_buffer.clear()
+                self._post_restart_hold_timestamps.clear()
+                self._post_restart_hold = False
+                self._sdr_restart_requested.set()
+                return
+
+            # Buffer rows and timestamps during gate
+            self._post_restart_hold_buffer.extend(rows_to_add)
+            if group_sample_timestamps is not None:
+                self._post_restart_hold_timestamps.append(group_sample_timestamps)
+
+            # Evaluate rolling window once we have enough samples
+            window_samples = int(self.post_restart_quality_window_s * self.output_rate_hz)
+            total = len(self._post_restart_hold_buffer)
+            if total >= window_samples:
+                recent = self._post_restart_hold_buffer[-window_samples:]
+                good = sum(1 for _, pq in recent if pq != 0)
+                ratio = good / window_samples
+                if ratio >= self.post_restart_quality_threshold:
+                    self._post_restart_hold = False
+                    print(
+                        f'Post-restart quality gate cleared ({ratio*100:.0f}% good over {window_samples} samples) '
+                        f'— flushing {total} buffered samples and resuming GCS writes.'
+                    )
+                    with self._gcs_buffer_lock:
+                        if self.gcs_recording_active:
+                            if self._post_restart_hold_timestamps:
+                                first_ts = self._post_restart_hold_timestamps[0]
+                                self.gcs_timestamp_log.append({
+                                    'gcs_sample_idx': int(self.gcs_samples_written + len(self.gcs_write_buffer)),
+                                    'sample_timestamp_s': float(first_ts[0]),
+                                    'system_time_s': time.time(),
+                                    'reason': 'post_restart_quality_gate_cleared',
+                                })
+                            self.gcs_write_buffer.extend(self._post_restart_hold_buffer)
+                    self._post_restart_hold_buffer.clear()
+                    self._post_restart_hold_timestamps.clear()
+                    self._force_timestamp_after_restart = False  # already logged above
+                # If ratio failed, keep accumulating — window re-evaluates next group
+            return  # don't fall through to normal write path while gate active
 
         should_flush = False
         with self._gcs_buffer_lock:
@@ -695,6 +829,10 @@ class TimeStampBasedReader:
                 time.sleep(0.25)
             if not self.running:
                 return
+            # Skip this cycle if we are still within the post-restart cooldown window
+            if self._last_restart_time is not None:
+                if (time.time() - self._last_restart_time) < self.restart_cooldown_s:
+                    continue
             drop_rate = self._recent_drop_rate()
             if drop_rate > self.sdr_restart_drop_threshold:
                 print(
@@ -764,7 +902,12 @@ class TimeStampBasedReader:
             self._rx_thread_ref = rx_t
             rx_t.start()
             self._force_timestamp_after_restart = True
-            print(f'SDR restarted (restart #{len(self._sdr_restart_log)}).')
+            self._last_restart_time = time.time()
+            self._post_restart_hold = True
+            self._post_restart_hold_buffer = []
+            self._post_restart_hold_timestamps = []
+            self._post_restart_hold_start = time.time()
+            print(f'SDR restarted (restart #{len(self._sdr_restart_log)}). Post-restart quality gate active.')
         except Exception as exc:
             print(f'⚠️  SDR restart failed: {exc}')
 
@@ -2065,6 +2208,7 @@ class TimeStampBasedReader:
     def start_capture(self, duration_seconds=None):
         if self.enable_gcs:
             self._init_gcs_clients()
+            self._check_resume_recording()
 
         self.setup_device()
 
