@@ -2278,13 +2278,13 @@ class TimeStampBasedReader:
 if __name__ == '__main__':
     reader = TimeStampBasedReader(
         sample_rate=8e6,
-        frequency=902.7e6,
-        gain_mode='slowattack',
-        gain=30,
+        frequency=903.6e6,
+        gain_mode='manual',
+        gain=50,
         counter=False,
         raw=False,
         device=1,
-        bandwidth=3e6,
+        bandwidth=2e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
