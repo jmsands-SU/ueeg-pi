@@ -1,0 +1,4 @@
+Git Information:
+Commit Hash: cb845474
+Branch: master
+Working Directory: dirty
