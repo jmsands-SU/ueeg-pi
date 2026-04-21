@@ -26,6 +26,7 @@ class DecodedPacket:
     packet_num: int
     is_valid: bool
     bits: np.ndarray
+    error_flag: bool = False
 
 # Set Google Cloud credentials (required for GCS access)
 # Path is relative to this script's directory
@@ -73,6 +74,7 @@ class TimeStampBasedReader:
         decoded_group_maxlen=5000,
         quiet=False,
         reader_label='ant1',
+        rx_channel=0,
     ):
         self.quiet = bool(quiet)  # suppress per-buffer decode warnings (e.g. for secondary reader)
         self.reader_label = str(reader_label)
@@ -83,6 +85,7 @@ class TimeStampBasedReader:
         self.is_counter = bool(counter)
         self.is_raw = bool(raw)
         self.device_num = int(device)
+        self.rx_channel = int(rx_channel)
         self.bandwidth = int(bandwidth)
         self.buffer_size = int(buffer_size)
 
@@ -707,6 +710,11 @@ class TimeStampBasedReader:
                         '5': 'mismatch_picked_v1',
                         '6': 'mismatch_picked_v2',
                     },
+                    'error_flag_bit': {
+                        'bit': 3,
+                        'mask': '0x08',
+                        'meaning': 'interference or loss-of-signal detected mid-packet; errored copy discarded, non-errored copy used as sole source (quality bits 2:0 reflect the result as if only that copy was received)',
+                    },
                     'bit_layout': quality_nibble_map,
                 },
                 'nan_fill_policy': 'carry_forward_per_channel_per_slot; leading missing values written as 0 (int32 zero)',
@@ -998,13 +1006,12 @@ class TimeStampBasedReader:
         print('  Layout: RX_X2, Format: SC16_Q11')
         print('=============================\n')
     def _extract_output_stream(self, rx_samples_u16: np.ndarray) -> np.ndarray:
-        """Extract one antenna's data from the interleaved RX0 I/Q stream.
-        Both antennas are routed through RX0: antenna 1 on I (device_num=1, index 0),
-        antenna 2 on Q (device_num=2, index 1).
+        """Extract one antenna's stream from the interleaved RX0/RX1 I/Q buffer.
+        Stride-4 layout: [RX0_I, RX0_Q, RX1_I, RX1_Q, ...].
+        rx_channel selects RX0 (0) or RX1 (1); device_num selects I (1) or Q (2) within that channel.
         """
-        if self.device_num == 1:
-            return rx_samples_u16[0::4].copy()  # I of RX0 — antenna 1
-        return rx_samples_u16[1::4].copy()       # Q of RX0 — antenna 2
+        offset = self.rx_channel * 2 + (self.device_num - 1)
+        return rx_samples_u16[offset::4].copy()
 
     def rx_thread(self):
         self.channel.enable = True
@@ -1213,6 +1220,7 @@ class TimeStampBasedReader:
         data_bit = working_data & 1
         packet_nums_raw = (working_data & ((1 << 4) | (1 << 5) | (1 << 6))) >> 4
         valid_flag = (working_data & (1 << 8)) >> 8
+        error_flag_arr = (working_data & (1 << 7)) >> 7
 
         packet_nums_for_edges = packet_nums_raw.copy()
         valid_words = valid_flag.astype(bool)
@@ -1251,6 +1259,7 @@ class TimeStampBasedReader:
         packet_nums_for_edges = packet_nums_for_edges[:process_until]
         data_bit = data_bit[:process_until]
         valid_flag = valid_flag[:process_until]
+        error_flag_arr = error_flag_arr[:process_until]
 
         transitions = np.where(np.diff(packet_nums_for_edges) != 0)[0]
         frame_starts = np.concatenate(([prefix_len], transitions+1))
@@ -1396,7 +1405,7 @@ class TimeStampBasedReader:
             for ch in range(1, 5):
                 channel_offset = (ch - 1) * self.bits_per_channel
                 channel_end_offset = channel_offset + self.bits_per_channel
-                ch_start = start_idx + channel_offset -2
+                ch_start = start_idx + channel_offset -4
                 ch_end = start_idx + channel_end_offset
                 if ch_end > len(packet_nums_raw):
                     packets_by_channel[ch].append(
@@ -1407,9 +1416,11 @@ class TimeStampBasedReader:
 
                 bits_block = data_bit[ch_start:ch_end]
                 valid_block = valid_flag[ch_start:ch_end]
+                error_block = error_flag_arr[ch_start:ch_end]
                 selected_bits = bits_block[valid_block == 1]
+                pkt_error = bool(np.any(error_block[valid_block == 1]))
                 packets_by_channel[ch].append(
-                    DecodedPacket(packet_num=packet_num, is_valid=True, bits=selected_bits.astype(np.uint8))
+                    DecodedPacket(packet_num=packet_num, is_valid=True, bits=selected_bits.astype(np.uint8), error_flag=pkt_error)
                 )
                 packet_word_positions[ch].append(start_idx - prefix_len)
 
@@ -1534,6 +1545,7 @@ class TimeStampBasedReader:
                 raw_ints = np.zeros(4, dtype=np.int32)
                 mismatch_r1 = np.zeros(4, dtype=np.int32)
                 mismatch_r2 = np.zeros(4, dtype=np.int32)
+                error_occurred = np.zeros(4, dtype=bool)
 
                 for s in range(4):
                     p1 = group[s]
@@ -1564,6 +1576,12 @@ class TimeStampBasedReader:
                     v2 = self._decode_value_from_packet_bits(p2.bits) if p2.is_valid else None
                     r1 = self._decode_raw_int_from_packet_bits(p1.bits) if p1.is_valid else None
                     r2 = self._decode_raw_int_from_packet_bits(p2.bits) if p2.is_valid else None
+
+                    error_occurred[s] = p1.error_flag or p2.error_flag
+                    if p1.error_flag and not p2.error_flag and v2 is not None:
+                        v1, r1 = None, None
+                    elif p2.error_flag and not p1.error_flag and v1 is not None:
+                        v2, r2 = None, None
 
                     if v1 is not None and v2 is not None:
                         if abs(v1 - v2) < self.mismatch_threshold:
@@ -1640,6 +1658,8 @@ class TimeStampBasedReader:
                             'right_neighbor': None if right_neighbor is None else float(right_neighbor),
                         }
                     )
+
+                quality[error_occurred] |= np.int8(0x08)
 
                 self.decoded_groups_by_channel[channel_idx].append(values)
                 self.decoded_quality_by_channel[channel_idx].append(quality)
@@ -2420,8 +2440,8 @@ if __name__ == '__main__':
         sample_rate=8e6,
         frequency=_board['frequency_hz'],
         decode_scale=_board['decode_scale'],
-        gain_mode='slow_attack',
-        gain=40,
+        gain_mode='manual',#'slow_attack',
+        gain=45,
         counter=False,
         raw=False,
         bandwidth=1.5e6,
@@ -2449,15 +2469,23 @@ if __name__ == '__main__':
         gcs_blob_name="ada_eyesclosed_ant1.bin",
     )
 
-    # Antenna 2 — RX0 Q channel (device=2). Enabled via enable_device2 in board_config.json.
-    # gcs_blob_name will be overwritten on each trigger: primary blob with "_ant2" inserted
-    # before the extension (e.g. "session.bin" → "session_ant2.bin").
-    # quiet=True suppresses per-packet decode warnings so a noisy antenna 2 channel
-    # doesn't flood stdout and starve the primary reader's processing thread.
-    if _board_cfg.get('device2_board') is not None:
+    # Antenna 2 — secondary reader. Two modes, mutually exclusive:
+    #   dual_rx_antenna=true  → RX1 I channel of the same device (new two-channel RBF)
+    #   device2_board != null → separate BladeRF device on RX0 I/Q (legacy two-device mode)
+    # quiet=True suppresses per-packet decode warnings so a noisy antenna 2 doesn't flood stdout.
+    if _board_cfg.get('dual_rx_antenna'):
+        reader.secondary_reader = TimeStampBasedReader(
+            **{**_COMMON, 'enable_gcs_trigger': False},
+            device=1,
+            rx_channel=1,
+            gcs_blob_name="ada_eyesclosed_ant2.bin",
+            quiet=True,
+            reader_label='rx1',
+        )
+    elif _board_cfg.get('device2_board') is not None:
         _board2 = _board_cfg['boards'][_board_cfg['device2_board']]
         reader.secondary_reader = TimeStampBasedReader(
-            **{**_COMMON, 'enable_gcs_trigger': False},  # primary handles all trigger logic and forwards start/stop
+            **{**_COMMON, 'enable_gcs_trigger': False},
             device=2,
             frequency=_board2['frequency_hz'],
             decode_scale=_board2['decode_scale'],

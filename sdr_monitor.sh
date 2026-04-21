@@ -5,6 +5,8 @@ LOG_FILE="/var/log/sdr_monitor.log"
 SCRIPT_PATH="/home/ueeg/ueeg-pi/sdr_reader_gcs_write.py"
 CREDENTIALS_FILE="/home/ueeg/ueeg-pi/ueegproject-aea2731f9c3a.json"
 VENV_PATH="/home/ueeg/sdr_venv"
+BOARD_CONFIG_FILE="/home/ueeg/ueeg-pi/board_config.json"
+RBF_FILE=$("$VENV_PATH/bin/python3" -c "import json; cfg=json.load(open('$BOARD_CONFIG_FILE')); print(cfg['rbf_file'])" 2>/dev/null || echo "")
 STATUS_FILE="/tmp/sdr_monitor_status.json"
 MAX_RESTART_ATTEMPTS=3
 RESTART_DELAY=10
@@ -173,7 +175,7 @@ start_python_script() {
     # Load FPGA
     log "Loading FPGA..."
 
-    bladeRF-cli -l /home/ueeg/ueeg-pi/RMSxA4-2026-02-13_15.39.41/RMSxA4.rbf 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
+    bladeRF-cli -l "$RBF_FILE" 2>&1 | tee -a "$LOG_FILE" || log "FPGA load had non-zero exit"
 
     
     log "Successfully loaded FPGA bitstream!"
@@ -318,6 +320,13 @@ log "=========================================="
 
 update_status "initializing" "Checking for virtual environment"
 
+if [ -z "$RBF_FILE" ]; then
+    log "ERROR: Could not read rbf_file from $BOARD_CONFIG_FILE"
+    update_status "error" "board_config.json missing or rbf_file not set"
+    exit 1
+fi
+log "RBF file: $RBF_FILE"
+
 if [ ! -d "$VENV_PATH" ]; then
     log "ERROR: Virtual environment not found at $VENV_PATH"
     update_status "error" "Virtual environment not found"
@@ -395,7 +404,7 @@ while true; do
             log "BladeRF reconnected! Reloading FPGA and restarting..."
             
 
-            bladeRF-cli -l /home/ueeg/ueeg-pi/RMSxA4-2026-02-13_15.39.41/RMSxA4.rbf 2>&1 | tee -a "$LOG_FILE" || true
+            bladeRF-cli -l "$RBF_FILE" 2>&1 | tee -a "$LOG_FILE" || true
             sleep 3
             
             if restart_script; then

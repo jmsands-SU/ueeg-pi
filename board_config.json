@@ -12,5 +12,7 @@
         }
     },
     "active_board": "1",
-    "device2_board": null
+    "device2_board": null,
+    "dual_rx_antenna": true,
+    "rbf_file": "/home/ueeg/ueeg-pi/RMSxA4-2026-04-21_01.12.38/RMSxA4.rbf"
 }
