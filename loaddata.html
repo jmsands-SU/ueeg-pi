@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SDR Interactive Viewer</title>
-    
+
     <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 
     <script>
@@ -14,7 +14,7 @@
     <script>
       if (module.exports) { Object.keys(module.exports).forEach(function(key) { window[key] = module.exports[key]; }); }
     </script>
-    
+
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 95%; margin: 2em auto; background-color: #f8f9fa; color: #212529; }
         h1 { text-align: center; color: #343a40; }
@@ -24,6 +24,8 @@
         .controls .load-btn { background-color: #17a2b8; }
         .controls label { font-size: 0.9rem; color: #495057; display: flex; align-items: center; gap: 0.5em; cursor: pointer;}
         .control-group { display: flex; align-items: center; gap: 0.5em; border-left: 1px solid #ccc; padding-left: 1em; }
+        .blob-inputs { display: flex; flex-direction: column; gap: 0.4em; }
+        .blob-inputs input { width: 260px; }
         #status { text-align: center; font-weight: 500; padding: 1em; border-radius: 4px; }
         .stats-and-segments { display: flex; flex-direction: column; align-items: center; gap: 2em; margin-bottom: 2em; }
         .stats-container { background-color: white; padding: 1.5em; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); width: fit-content; }
@@ -39,11 +41,13 @@
 </head>
 <body>
 
-    <!-- HTML Body (unchanged) -->
     <h1>SDR Interactive Viewer</h1>
     <div class="controls">
         <input type="text" id="bucketName" placeholder="GCS Bucket Name" value="ueegbucket">
-        <input type="text" id="blobName" placeholder="Blob Name (e.g., my-rec.bin)">
+        <div class="blob-inputs">
+            <input type="text" id="blobName" placeholder="Blob 1 (e.g., my-rec.bin)">
+            <input type="text" id="blobName2" placeholder="Blob 2 (optional, overlay on same plot)">
+        </div>
         <div class="control-group"><button id="analyzeButton">Analyze File</button><label><input type="checkbox" id="showAllDataToggle">Show all data</label></div>
         <div class="control-group"><label>Load last</label><input type="number" id="lastTimeValue" value="5" style="width: 60px;"><select id="lastTimeUnits"><option value="1">Seconds</option><option value="60" selected>Minutes</option><option value="3600">Hours</option></select><button id="loadRecentButton" class="load-btn">Load</button></div>
         <div class="control-group"><label>Load range from</label><input type="number" id="startTimeValue" value="1" style="width: 60px;"><label>to</label><input type="number" id="endTimeValue" value="6" style="width: 60px;"><select id="rangeTimeUnits"><option value="1">Seconds</option><option value="60" selected>Minutes</option><option value="3600">Hours</option></select><button id="loadRangeButton" class="load-btn">Load Range</button></div>
@@ -102,7 +106,8 @@
         const fftFreqMaxInput = document.getElementById('fftFreqMax');
         const setFreqRangeButton = document.getElementById('setFreqRangeButton');
         const autoscaleYButton = document.getElementById('autoscaleYButton');
-        let currentSegments = [], currentSampleRate = 200.0, fullSegmentChannelData = [];
+        // fullDatasets: array of { channelData, sampleRate, label }
+        let currentSegments = [], currentSampleRate = 200.0, fullDatasets = [];
 
         analyzeBtn.addEventListener('click', analyzeFile);
         loadRecentButton.addEventListener('click', loadRecentTime);
@@ -112,34 +117,185 @@
         setFreqRangeButton.addEventListener('click', updateFftPlot);
         autoscaleYButton.addEventListener('click', autoscaleFftY);
 
+        function blobLabel(blobName) { return blobName.split('/').pop().replace(/\.bin$/, ''); }
+
+        function buildFetchUrl(bucket, blob, extraParams) {
+            return `${API_BASE_URL}?bucket=${bucket}&blob=${blob}${extraParams}`;
+        }
+
         // --- Core Application Functions ---
-        async function analyzeFile() { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const showAll = showAllDataToggle.checked; resetUI(); if (!bucket || !blob) { statusDiv.textContent = "Please enter Bucket and Blob Name."; return; } statusDiv.textContent = "Analyzing file..."; const mode = showAll ? 'all_data' : 'clean_only'; const discoveryUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&analysis_mode=${mode}`; try { const response = await fetch(discoveryUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } if (data.quality_stats) { displayQualityStats(data.quality_stats); } currentSegments = data.available_segments; currentSampleRate = data.sample_rate; if (currentSegments && currentSegments.length > 0) { const message = showAll ? "File loaded." : `Found ${currentSegments.length} clean segment(s).`; statusDiv.textContent = message + " Select below to plot."; populateDropdown(); segmentContainer.style.display = 'block'; if (showAll) { plotSelectedSegment(0); } } else { statusDiv.textContent = "No clean segments found meeting the threshold."; } } catch (error) { console.error("Error analyzing file:", error); statusDiv.textContent = `Error: ${error.message}`; } }
-        async function loadRecentTime() { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const timeValue = lastTimeValueInput.value; const unitMultiplier = lastTimeUnitsSelect.value; const unitText = lastTimeUnitsSelect.options[lastTimeUnitsSelect.selectedIndex].text; const applyFilter = applyLpFilterToggle.checked; const fixSpikes = correctSpikesToggle.checked; resetUI(); if (!bucket || !blob || !timeValue) { statusDiv.textContent = "Please enter all required fields."; return; } const totalSeconds = timeValue * unitMultiplier; statusDiv.textContent = `Fetching the last ${timeValue} ${unitText}...`; const filterParam = applyFilter ? '&apply_lp_filter=true' : ''; const spikeParam = fixSpikes ? '&correct_spikes=true' : ''; const fetchUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&last_seconds=${totalSeconds}${filterParam}${spikeParam}`; try { const response = await fetch(fetchUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } await plotData(data.segment_data, data.sample_rate, `Last ${timeValue} ${unitText} of Recording`); } catch(error) { console.error("Error loading recent time:", error); statusDiv.textContent = `Error: ${error.message}`; } }
-        async function loadTimeRange() { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const startTime = startTimeValueInput.value; const endTime = endTimeValueInput.value; const unitMultiplier = rangeTimeUnitsSelect.value; const unitText = rangeTimeUnitsSelect.options[rangeTimeUnitsSelect.selectedIndex].text.toLowerCase(); const applyFilter = applyLpFilterToggle.checked; const fixSpikes = correctSpikesToggle.checked; resetUI(); if (!bucket || !blob || !startTime || !endTime) { statusDiv.textContent = "Please enter all required fields for range."; return; } const startSeconds = startTime * unitMultiplier; const endSeconds = endTime * unitMultiplier; if (startSeconds >= endSeconds) { statusDiv.textContent = "Start time must be less than end time."; return; } statusDiv.textContent = `Fetching range from ${startTime} to ${endTime} ${unitText}...`; const filterParam = applyFilter ? '&apply_lp_filter=true' : ''; const spikeParam = fixSpikes ? '&correct_spikes=true' : ''; const fetchUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&start_time_sec=${startSeconds}&end_time_sec=${endSeconds}${filterParam}${spikeParam}`; try { const response = await fetch(fetchUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } await plotData(data.segment_data, data.sample_rate, `Time Range: ${startTime}-${endTime} ${unitText}`); } catch(error) { console.error("Error loading time range:", error); statusDiv.textContent = `Error: ${error.message}`; } }
-        async function plotSelectedSegment(index) { const bucket = document.getElementById('bucketName').value.trim(); const blob = document.getElementById('blobName').value.trim(); const segment = currentSegments[index]; const applyFilter = applyLpFilterToggle.checked; const fixSpikes = correctSpikesToggle.checked; statusDiv.textContent = `Loading data for Segment ${index + 1}...`; const filterParam = applyFilter ? '&apply_lp_filter=true' : ''; const spikeParam = fixSpikes ? '&correct_spikes=true' : ''; const dataFetchUrl = `${API_BASE_URL}?bucket=${bucket}&blob=${blob}&start_index=${segment.start}&end_index=${segment.end}${filterParam}${spikeParam}`; try { const response = await fetch(dataFetchUrl); const data = await response.json(); if (!response.ok || data.error) { throw new Error(data.error || `Server error: ${response.status}`); } await plotData(data.segment_data, data.sample_rate, `Time Domain - Segment ${index + 1}`); } catch(error) { console.error("Error plotting segment:", error); statusDiv.textContent = `Error: ${error.message}`; } }
-        
+        async function analyzeFile() {
+            const bucket = document.getElementById('bucketName').value.trim();
+            const blob = document.getElementById('blobName').value.trim();
+            const blob2 = document.getElementById('blobName2').value.trim();
+            const showAll = showAllDataToggle.checked;
+            resetUI();
+            if (!bucket || !blob) { statusDiv.textContent = "Please enter Bucket and Blob Name."; return; }
+            statusDiv.textContent = "Analyzing file(s)...";
+            const mode = showAll ? 'all_data' : 'clean_only';
+            const blobs = blob2 ? [blob, blob2] : [blob];
+            try {
+                const responses = await Promise.all(blobs.map(b => fetch(`${API_BASE_URL}?bucket=${bucket}&blob=${b}&analysis_mode=${mode}`)));
+                const jsons = await Promise.all(responses.map(r => r.json()));
+                if (!responses[0].ok || jsons[0].error) throw new Error(jsons[0].error || `Server error: ${responses[0].status}`);
+                const statsEntries = jsons
+                    .map((d, i) => d.quality_stats ? { stats: d.quality_stats, label: blobLabel(blobs[i]) } : null)
+                    .filter(Boolean);
+                if (statsEntries.length) displayQualityStats(statsEntries);
+                currentSegments = jsons[0].available_segments;
+                currentSampleRate = jsons[0].sample_rate;
+                if (currentSegments && currentSegments.length > 0) {
+                    const message = showAll ? "File(s) loaded." : `Found ${currentSegments.length} clean segment(s) in blob 1.`;
+                    statusDiv.textContent = message + " Select below to plot.";
+                    populateDropdown();
+                    segmentContainer.style.display = 'block';
+                    if (showAll) { plotSelectedSegment(0); }
+                } else {
+                    statusDiv.textContent = "No clean segments found meeting the threshold.";
+                }
+            } catch (error) { console.error("Error analyzing file:", error); statusDiv.textContent = `Error: ${error.message}`; }
+        }
+
+        async function loadRecentTime() {
+            const bucket = document.getElementById('bucketName').value.trim();
+            const blob = document.getElementById('blobName').value.trim();
+            const blob2 = document.getElementById('blobName2').value.trim();
+            const timeValue = lastTimeValueInput.value;
+            const unitMultiplier = lastTimeUnitsSelect.value;
+            const unitText = lastTimeUnitsSelect.options[lastTimeUnitsSelect.selectedIndex].text;
+            const applyFilter = applyLpFilterToggle.checked;
+            const fixSpikes = correctSpikesToggle.checked;
+            resetUI();
+            if (!bucket || !blob || !timeValue) { statusDiv.textContent = "Please enter all required fields."; return; }
+            const totalSeconds = timeValue * unitMultiplier;
+            statusDiv.textContent = `Fetching the last ${timeValue} ${unitText}...`;
+            const extraParams = `&last_seconds=${totalSeconds}` + (applyFilter ? '&apply_lp_filter=true' : '') + (fixSpikes ? '&correct_spikes=true' : '');
+            try {
+                const blobs = blob2 ? [blob, blob2] : [blob];
+                const responses = await Promise.all(blobs.map(b => fetch(buildFetchUrl(bucket, b, extraParams))));
+                const jsons = await Promise.all(responses.map(r => r.json()));
+                const datasets = [];
+                const warnings = [];
+                for (let i = 0; i < blobs.length; i++) {
+                    if (!responses[i].ok || jsons[i].error) { warnings.push(`${blobLabel(blobs[i])}: ${jsons[i].error || 'server error ' + responses[i].status}`); continue; }
+                    if (!jsons[i].segment_data || jsons[i].segment_data.length === 0) { warnings.push(`${blobLabel(blobs[i])}: no data in range`); continue; }
+                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]) });
+                }
+                if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
+                await plotData(datasets, `Last ${timeValue} ${unitText} of Recording`);
+                if (warnings.length) statusDiv.textContent += ` (warnings: ${warnings.join('; ')})`;
+            } catch(error) { console.error("Error loading recent time:", error); statusDiv.textContent = `Error: ${error.message}`; }
+        }
+
+        async function loadTimeRange() {
+            const bucket = document.getElementById('bucketName').value.trim();
+            const blob = document.getElementById('blobName').value.trim();
+            const blob2 = document.getElementById('blobName2').value.trim();
+            const startTime = startTimeValueInput.value;
+            const endTime = endTimeValueInput.value;
+            const unitMultiplier = rangeTimeUnitsSelect.value;
+            const unitText = rangeTimeUnitsSelect.options[rangeTimeUnitsSelect.selectedIndex].text.toLowerCase();
+            const applyFilter = applyLpFilterToggle.checked;
+            const fixSpikes = correctSpikesToggle.checked;
+            resetUI();
+            if (!bucket || !blob || !startTime || !endTime) { statusDiv.textContent = "Please enter all required fields for range."; return; }
+            const startSeconds = startTime * unitMultiplier;
+            const endSeconds = endTime * unitMultiplier;
+            if (startSeconds >= endSeconds) { statusDiv.textContent = "Start time must be less than end time."; return; }
+            statusDiv.textContent = `Fetching range from ${startTime} to ${endTime} ${unitText}...`;
+            const extraParams = `&start_time_sec=${startSeconds}&end_time_sec=${endSeconds}` + (applyFilter ? '&apply_lp_filter=true' : '') + (fixSpikes ? '&correct_spikes=true' : '');
+            try {
+                const blobs = blob2 ? [blob, blob2] : [blob];
+                const responses = await Promise.all(blobs.map(b => fetch(buildFetchUrl(bucket, b, extraParams))));
+                const jsons = await Promise.all(responses.map(r => r.json()));
+                const datasets = [];
+                const warnings = [];
+                for (let i = 0; i < blobs.length; i++) {
+                    if (!responses[i].ok || jsons[i].error) { warnings.push(`${blobLabel(blobs[i])}: ${jsons[i].error || 'server error ' + responses[i].status}`); continue; }
+                    if (!jsons[i].segment_data || jsons[i].segment_data.length === 0) { warnings.push(`${blobLabel(blobs[i])}: no data in range`); continue; }
+                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]) });
+                }
+                if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
+                await plotData(datasets, `Time Range: ${startTime}-${endTime} ${unitText}`);
+                if (warnings.length) statusDiv.textContent += ` (warnings: ${warnings.join('; ')})`;
+            } catch(error) { console.error("Error loading time range:", error); statusDiv.textContent = `Error: ${error.message}`; }
+        }
+
+        async function plotSelectedSegment(index) {
+            const bucket = document.getElementById('bucketName').value.trim();
+            const blob = document.getElementById('blobName').value.trim();
+            const blob2 = document.getElementById('blobName2').value.trim();
+            const segment = currentSegments[index];
+            const applyFilter = applyLpFilterToggle.checked;
+            const fixSpikes = correctSpikesToggle.checked;
+            statusDiv.textContent = `Loading data for Segment ${index + 1}...`;
+            const extraParams = `&start_index=${segment.start}&end_index=${segment.end}` + (applyFilter ? '&apply_lp_filter=true' : '') + (fixSpikes ? '&correct_spikes=true' : '');
+            try {
+                const blobs = blob2 ? [blob, blob2] : [blob];
+                const responses = await Promise.all(blobs.map(b => fetch(buildFetchUrl(bucket, b, extraParams))));
+                const jsons = await Promise.all(responses.map(r => r.json()));
+                const datasets = [];
+                const warnings = [];
+                for (let i = 0; i < blobs.length; i++) {
+                    if (!responses[i].ok || jsons[i].error) { warnings.push(`${blobLabel(blobs[i])}: ${jsons[i].error || 'server error ' + responses[i].status}`); continue; }
+                    if (!jsons[i].segment_data || jsons[i].segment_data.length === 0) { warnings.push(`${blobLabel(blobs[i])}: no data`); continue; }
+                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]) });
+                }
+                if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
+                await plotData(datasets, `Time Domain - Segment ${index + 1}`);
+                if (warnings.length) statusDiv.textContent += ` (warnings: ${warnings.join('; ')})`;
+            } catch(error) { console.error("Error plotting segment:", error); statusDiv.textContent = `Error: ${error.message}`; }
+        }
+
         // --- UI and Plotting Functions ---
-        function displayQualityStats(stats) { const total = stats.total_samples; if (!total || total === 0) return; const formatRow = (label, count) => `<tr><td>${label}</td><td>${count.toLocaleString()} (${((count / total) * 100).toFixed(2)}%)</td></tr>`; let tableHTML = ''; if(stats.missed_packet > 0) tableHTML += formatRow('Missed Packets', stats.missed_packet); if(stats.v1_only > 0) tableHTML += formatRow('Single (v1 only)', stats.v1_only); if(stats.v2_only > 0) tableHTML += formatRow('Single (v2 only)', stats.v2_only); if(stats.matched > 0) tableHTML += formatRow('Matched (v1 & v2)', stats.matched); if(stats.mismatch_v1 > 0) tableHTML += formatRow('Mismatch (picked v1)', stats.mismatch_v1); if(stats.mismatch_v2 > 0) tableHTML += formatRow('Mismatch (picked v2)', stats.mismatch_v2); tableHTML += `<tr><td><strong>Total Samples</strong></td><td><strong>${total.toLocaleString()}</strong></td></tr>`; qualityStatsBody.innerHTML = tableHTML; qualityStatsContainer.style.display = 'block'; }
+        function displayQualityStats(entries) {
+            // entries: array of { stats, label }
+            let html = '';
+            for (const { stats, label } of entries) {
+                const total = stats.total_samples;
+                if (!total || total === 0) continue;
+                const pct = (n) => `${n.toLocaleString()} (${((n / total) * 100).toFixed(2)}%)`;
+                const row = (name, n) => n > 0 ? `<tr><td>${name}</td><td>${pct(n)}</td></tr>` : '';
+                const dropRate = ((stats.missed_packet || 0) / total * 100).toFixed(2);
+                if (entries.length > 1) html += `<tr><td colspan="2" style="font-weight:700;padding-top:0.8em">${label}</td></tr>`;
+                html += `<tr><td><strong>Drop rate</strong></td><td><strong>${dropRate}%</strong></td></tr>`;
+                html += row('Missed Packets', stats.missed_packet);
+                html += row('Single (v1 only)', stats.v1_only);
+                html += row('Single (v2 only)', stats.v2_only);
+                html += row('Matched (v1 & v2)', stats.matched);
+                html += row('Mismatch (picked v1)', stats.mismatch_v1);
+                html += row('Mismatch (picked v2)', stats.mismatch_v2);
+                html += `<tr><td>Total Samples</td><td>${total.toLocaleString()}</td></tr>`;
+            }
+            qualityStatsBody.innerHTML = html;
+            qualityStatsContainer.style.display = 'block';
+        }
         function populateDropdown() { segmentDropdown.innerHTML = ''; const showAll = showAllDataToggle.checked; currentSegments.forEach((segment, index) => { const option = document.createElement('option'); option.value = index; option.textContent = (showAll && currentSegments.length === 1) ? `Full File (${segment.duration_sec.toFixed(1)}s)` : `Segment ${index + 1} (${segment.duration_sec.toFixed(1)}s)`; segmentDropdown.appendChild(option); }); }
         function resetUI() { Plotly.purge(timePlotDiv); Plotly.purge(fftPlotDiv); segmentContainer.style.display = 'none'; segmentDropdown.innerHTML = ''; qualityStatsContainer.style.display = 'none'; qualityStatsBody.innerHTML = ''; fftControlsContainer.style.display = 'none'; fftFreqMinInput.value = ''; fftFreqMaxInput.value = ''; statusDiv.textContent = "Enter a blob name and choose an action."; }
-        
-        async function plotData(channelData, sampleRate, plotTitle) {
-            if (!channelData || channelData.length === 0) { statusDiv.textContent = "No data returned to plot."; return; }
-            fullSegmentChannelData = channelData; currentSampleRate = sampleRate;
-            const time_axis = Array.from({length: fullSegmentChannelData.length}, (_, i) => i / currentSampleRate);
+
+        // datasets: array of { channelData, sampleRate, label }
+        async function plotData(datasets, plotTitle) {
+            if (!datasets || datasets.length === 0 || !datasets[0].channelData || datasets[0].channelData.length === 0) { statusDiv.textContent = "No data returned to plot."; return; }
+            fullDatasets = datasets;
+            currentSampleRate = datasets[0].sampleRate;
             const timePlotData = []; const fftPlotData = [];
             const isLinear = fftLinearToggle.checked;
             const yAxisTitle = isLinear ? 'PSD (V²/Hz)' : 'PSD (dB/Hz)';
-            const numChannels = fullSegmentChannelData[0].length;
-            for (let i = 0; i < numChannels; i++) {
-                const channelDataForFFT = fullSegmentChannelData.map(row => row[i]);
-                timePlotData.push({ x: time_axis, y: channelDataForFFT, mode: 'lines', name: `CH${i + 1}` });
-                const { freqs, psdValues } = calculateMultitaperPSD(channelDataForFFT, currentSampleRate);
-                // THE FIX: Use a much smaller epsilon value (1e-24)
-                const yValues = isLinear ? psdValues : psdValues.map(v => 10 * Math.log10(v + 1e-24));
-                const fftTrace = { x: freqs, y: yValues, mode: 'lines', name: `CH${i + 1}` };
-                fftTrace.psdValues = psdValues;
-                fftPlotData.push(fftTrace);
+            const usePrefix = datasets.length > 1;
+            for (const ds of datasets) {
+                const { channelData, sampleRate, label } = ds;
+                const time_axis = Array.from({length: channelData.length}, (_, i) => i / sampleRate);
+                const numChannels = channelData[0].length;
+                for (let i = 0; i < numChannels; i++) {
+                    const traceName = usePrefix ? `${label} CH${i + 1}` : `CH${i + 1}`;
+                    const channelDataForFFT = channelData.map(row => row[i]);
+                    timePlotData.push({ x: time_axis, y: channelDataForFFT, mode: 'lines', name: traceName });
+                    const { freqs, psdValues } = calculateMultitaperPSD(channelDataForFFT, sampleRate);
+                    const yValues = isLinear ? psdValues : psdValues.map(v => 10 * Math.log10(v + 1e-24));
+                    const fftTrace = { x: freqs, y: yValues, mode: 'lines', name: traceName };
+                    fftTrace.psdValues = psdValues;
+                    fftPlotData.push(fftTrace);
+                }
             }
             const timeLayout = { title: plotTitle, xaxis: { title: 'Time (s)' }, yaxis: { title: 'Amplitude' }};
             const fftLayout = { title: "Power Spectral Density (Multitaper)", xaxis: { title: 'Frequency (Hz)', type: 'log' }, yaxis: { title: yAxisTitle }};
@@ -148,7 +304,7 @@
             fftControlsContainer.style.display = 'flex';
             updateFftPlot();
             statusDiv.textContent = `Displaying data. Click legend to toggle channels.`;
-            timePlotDiv.removeAllListeners(); fftPlotDiv.removeAllListeners(); // Clear all listeners
+            timePlotDiv.removeAllListeners(); fftPlotDiv.removeAllListeners();
             timePlotDiv.on('plotly_relayout', debouncedRelayoutHandler);
             timePlotDiv.on('plotly_legendclick', handleLegendClick);
             fftPlotDiv.on('plotly_legendclick', handleLegendClick);
@@ -161,7 +317,6 @@
             for(let i=0; i<fftPlot.data.length; i++) {
                 const trace = fftPlot.data[i];
                 if (trace.psdValues) {
-                    // THE FIX: Use a much smaller epsilon value (1e-24)
                     new_y_data.push(isLinear ? trace.psdValues : trace.psdValues.map(v => 10 * Math.log10(v + 1e-24)));
                 }
             }
@@ -172,7 +327,7 @@
             if (range[0] !== null || range[1] !== null) { layoutUpdate['xaxis.range'] = range; }
             Plotly.update('fftPlot', { y: new_y_data }, layoutUpdate);
         }
-        
+
         function autoscaleFftY() {
             if (!fftPlot.data || fftPlot.data.length === 0) return;
             const layout = fftPlot.layout;
@@ -199,35 +354,43 @@
                 Plotly.relayout('fftPlot', {'yaxis.autorange': true});
             }
         }
-        
-        let debounceTimer; 
+
+        let debounceTimer;
         const debouncedRelayoutHandler = (eventData) => { clearTimeout(debounceTimer); debounceTimer = setTimeout(() => { handleRelayout(eventData); }, 300); };
-        
+
         function handleRelayout(eventData) {
             if (!eventData || !eventData['xaxis.range[0]']) return;
             const timeRange = [eventData['xaxis.range[0]'], eventData['xaxis.range[1]']];
-            const startIndex = Math.max(0, Math.floor(timeRange[0] * currentSampleRate));
-            const endIndex = Math.min(fullSegmentChannelData.length, Math.ceil(timeRange[1] * currentSampleRate));
-            const selectedData = fullSegmentChannelData.slice(startIndex, endIndex);
-            if (selectedData.length < 2) { Plotly.react(fftPlotDiv, [], {title: 'Not enough data for PSD'}); return; }
             const newFftTraces = [];
-            const numChannels = fullSegmentChannelData[0] ? fullSegmentChannelData[0].length : 0;
             const isLinear = fftLinearToggle.checked;
-            for (let i=0; i < numChannels; i++) {
-                const isHidden = timePlotDiv.data[i] && timePlotDiv.data[i].visible === 'legendonly';
-                const channelSelectedData = selectedData.map(row => row[i]);
-                const { freqs, psdValues } = calculateMultitaperPSD(channelSelectedData, currentSampleRate);
-                const yValues = isLinear ? psdValues : psdValues.map(v => 10 * Math.log10(v + 1e-24));
-                const newTrace = { x: freqs, y: yValues, mode: 'lines', name: `CH${i + 1}`, visible: isHidden ? 'legendonly' : true };
-                newTrace.psdValues = psdValues;
-                newFftTraces.push(newTrace);
+            const usePrefix = fullDatasets.length > 1;
+            let traceIdx = 0;
+            for (const ds of fullDatasets) {
+                const { channelData, sampleRate, label } = ds;
+                const startIndex = Math.max(0, Math.floor(timeRange[0] * sampleRate));
+                const endIndex = Math.min(channelData.length, Math.ceil(timeRange[1] * sampleRate));
+                const selectedData = channelData.slice(startIndex, endIndex);
+                const numChannels = channelData[0] ? channelData[0].length : 0;
+                if (selectedData.length < 2) { traceIdx += numChannels; continue; }
+                for (let i = 0; i < numChannels; i++) {
+                    const traceName = usePrefix ? `${label} CH${i + 1}` : `CH${i + 1}`;
+                    const isHidden = timePlotDiv.data[traceIdx] && timePlotDiv.data[traceIdx].visible === 'legendonly';
+                    const channelSelectedData = selectedData.map(row => row[i]);
+                    const { freqs, psdValues } = calculateMultitaperPSD(channelSelectedData, sampleRate);
+                    const yValues = isLinear ? psdValues : psdValues.map(v => 10 * Math.log10(v + 1e-24));
+                    const newTrace = { x: freqs, y: yValues, mode: 'lines', name: traceName, visible: isHidden ? 'legendonly' : true };
+                    newTrace.psdValues = psdValues;
+                    newFftTraces.push(newTrace);
+                    traceIdx++;
+                }
             }
+            if (newFftTraces.length === 0) { Plotly.react(fftPlotDiv, [], {title: 'Not enough data for PSD'}); return; }
             const yAxisTitle = isLinear ? 'PSD (V²/Hz)' : 'PSD (dB/Hz)';
             Plotly.react(fftPlotDiv, newFftTraces, { title: `PSD of visible region (${timeRange[0].toFixed(2)}s to ${timeRange[1].toFixed(2)}s)`, xaxis: { title: 'Frequency (Hz)', type: 'log' }, yaxis: { title: yAxisTitle } });
         }
-        
+
         function handleLegendClick(eventData) { const curveNumber = eventData.curveNumber; let newVisibility = eventData.data[curveNumber].visible === 'legendonly' ? true : 'legendonly'; Plotly.restyle(timePlotDiv, { visible: newVisibility }, [curveNumber]); Plotly.restyle(fftPlotDiv,  { visible: newVisibility }, [curveNumber]); return false; }
-        
+
         // --- DSP Functions ---
         // Multitaper PSD using sine tapers (Riedel & Sidorenko 1995 style).
         // Segments data into non-overlapping windows of segmentLength samples, applies K sine

@@ -71,7 +71,11 @@ class TimeStampBasedReader:
         mismatch_threshold=0.001,
         decode_scale=1/512*.3,#0.03 / 256 * 2,
         decoded_group_maxlen=5000,
+        quiet=False,
+        reader_label='ant1',
     ):
+        self.quiet = bool(quiet)  # suppress per-buffer decode warnings (e.g. for secondary reader)
+        self.reader_label = str(reader_label)
         self.sample_rate = int(sample_rate)
         self.frequency = int(frequency)
         self.gain = gain
@@ -212,6 +216,14 @@ class TimeStampBasedReader:
         self.capture_start_time = None
         self.samples_captured = 0
 
+        # Dual-antenna mode: attach a second TimeStampBasedReader to decode the other
+        # antenna stream (opposite I/Q of RX0) from the same BladeRF capture.
+        # Set this before calling start_capture(). The secondary reader must NOT have
+        # setup_device() or start_capture() called on it — the primary reader drives
+        # hardware and feeds data into secondary_reader.data_queue automatically.
+        self.secondary_reader = None
+        self._secondary_proc_thread = None
+
         if self.frame_length_counts:
             total_words = sum(fl * cnt for fl, cnt in self.frame_length_counts.items())
             total_gaps = sum(self.frame_length_counts.values())
@@ -250,7 +262,11 @@ class TimeStampBasedReader:
             if self.gcs_subscriber is None:
                 self.gcs_subscriber = pubsub_v1.SubscriberClient()
 
-    _RECORDING_STATE_FILE = '/tmp/sdr_recording_state.json'
+    @property
+    def _RECORDING_STATE_FILE(self):
+        # Unique per reader so primary and secondary don't overwrite each other.
+        safe = (self.gcs_blob_name or 'default').replace('/', '_').replace('.', '_')
+        return f'/tmp/sdr_recording_state_{safe}.json'
 
     def _write_recording_state_file(self):
         """Persist current recording parameters to disk so they survive a process restart."""
@@ -374,17 +390,30 @@ class TimeStampBasedReader:
         if 'blob' in msg and msg['blob']:
             self.gcs_blob_name = str(msg['blob'])
             print(f'GCS blob name updated to: {self.gcs_blob_name}')
+            if self.secondary_reader is not None:
+                base = str(msg['blob'])
+                dot = base.rfind('.')
+                sec_blob = (base[:dot] + '_ant2' + base[dot:]) if dot != -1 else (base + '_ant2')
+                self.secondary_reader.gcs_blob_name = sec_blob
+                self.secondary_reader.gcs_temp_name = f'{sec_blob}.temp'
+                print(f'GCS blob name for antenna 2 updated to: {sec_blob}')
         if 'duration_seconds' in msg:
             try:
                 self._gcs_trigger_duration = float(msg['duration_seconds'])
                 print(f'GCS trigger duration set to: {self._gcs_trigger_duration}s')
+                if self.secondary_reader is not None:
+                    self.secondary_reader._gcs_trigger_duration = self._gcs_trigger_duration
             except Exception:
                 pass
 
         if command in ('start', 'record', 'resume'):
             self._start_gcs_recording()
+            if self.secondary_reader is not None:
+                self.secondary_reader._start_gcs_recording()
         elif command in ('stop', 'pause', 'end'):
             self._stop_gcs_recording()
+            if self.secondary_reader is not None:
+                self.secondary_reader._stop_gcs_recording()
 
     def _poll_gcs_triggers(self):
         if not self.enable_gcs or not self.enable_gcs_trigger or self.gcs_subscriber is None:
@@ -429,6 +458,8 @@ class TimeStampBasedReader:
                     f'(actual={elapsed:.1f}s) — stopping recording.'
                 )
                 self._stop_gcs_recording()
+                if self.secondary_reader is not None:
+                    self.secondary_reader._stop_gcs_recording()
                 self._delete_recording_state_file()
 
     def _append_gcs_group(self, group_values: dict, group_raw_values: dict, group_quality: dict, group_sample_timestamps=None):
@@ -879,12 +910,18 @@ class TimeStampBasedReader:
             pass
         self.device = None
 
-        # Drain the queue so processing thread doesn't stall on old data
+        # Drain queues so processing threads don't stall on old data
         while not self.data_queue.empty():
             try:
                 self.data_queue.get_nowait()
             except Exception:
                 break
+        if self.secondary_reader is not None:
+            while not self.secondary_reader.data_queue.empty():
+                try:
+                    self.secondary_reader.data_queue.get_nowait()
+                except Exception:
+                    break
 
         print('SDR stopped. Waiting 10 seconds before restart...')
         for _ in range(40):
@@ -907,6 +944,12 @@ class TimeStampBasedReader:
             self._post_restart_hold_buffer = []
             self._post_restart_hold_timestamps = []
             self._post_restart_hold_start = time.time()
+            if self.secondary_reader is not None:
+                self.secondary_reader._force_timestamp_after_restart = True
+                self.secondary_reader._post_restart_hold = True
+                self.secondary_reader._post_restart_hold_buffer = []
+                self.secondary_reader._post_restart_hold_timestamps = []
+                self.secondary_reader._post_restart_hold_start = time.time()
             print(f'SDR restarted (restart #{len(self._sdr_restart_log)}). Post-restart quality gate active.')
         except Exception as exc:
             print(f'⚠️  SDR restart failed: {exc}')
@@ -923,9 +966,10 @@ class TimeStampBasedReader:
             ch.frequency = self.frequency
             ch.sample_rate = self.sample_rate
             ch.bandwidth = self.bandwidth
-            mode = self.gain_mode.lower()
+            mode = self.gain_mode.lower().replace('_', '')
             if mode == 'manual':
                 ch.gain_mode = _bladerf.GainMode.Manual
+                ch.gain = self.gain
             elif mode == 'fastattack':
                 ch.gain_mode = _bladerf.GainMode.FastAttack_AGC
             elif mode == 'slowattack':
@@ -933,8 +977,8 @@ class TimeStampBasedReader:
             elif mode == 'hybrid':
                 ch.gain_mode = _bladerf.GainMode.Hybrid_AGC
             else:
+                print(f'⚠️  Unknown gain_mode {self.gain_mode!r} — defaulting to Manual with gain={self.gain}')
                 ch.gain_mode = _bladerf.GainMode.Manual
-            if mode == 'manual':
                 ch.gain = self.gain
 
         self.device.sync_config(
@@ -954,9 +998,13 @@ class TimeStampBasedReader:
         print('  Layout: RX_X2, Format: SC16_Q11')
         print('=============================\n')
     def _extract_output_stream(self, rx_samples_u16: np.ndarray) -> np.ndarray:
+        """Extract one antenna's data from the interleaved RX0 I/Q stream.
+        Both antennas are routed through RX0: antenna 1 on I (device_num=1, index 0),
+        antenna 2 on Q (device_num=2, index 1).
+        """
         if self.device_num == 1:
-            return rx_samples_u16[0::4].copy()
-        return rx_samples_u16[1::4].copy()
+            return rx_samples_u16[0::4].copy()  # I of RX0 — antenna 1
+        return rx_samples_u16[1::4].copy()       # Q of RX0 — antenna 2
 
     def rx_thread(self):
         self.channel.enable = True
@@ -1022,13 +1070,13 @@ class TimeStampBasedReader:
                 rx_samples = np.frombuffer(rx_buffer, dtype=np.uint16, count=valid_length)
                 
                 output_data = self._extract_output_stream(rx_samples)
-                
+
                 # Calculate timestamp for FIRST word in this buffer
                 # The buffer duration represents how long it took to fill
                 # Last word arrived at buffer_received_time, first word arrived buffer_duration earlier
                 buffer_duration_s = len(output_data) / 100e3
                 first_word_timestamp = buffer_received_time - buffer_duration_s
-                
+
                 self.samples_captured += len(output_data)
 
                 try:
@@ -1036,6 +1084,20 @@ class TimeStampBasedReader:
                     self.data_queue.put((output_data, first_word_timestamp), timeout=0.2)
                 except queue.Full:
                     pass
+
+                # Dual-antenna: extract the other RX0 stream (opposite I/Q) and feed
+                # the secondary reader's queue so it decodes in parallel.
+                # Use put_nowait so a slow secondary processor never stalls rx_thread
+                # (which would delay primary data and cause the BladeRF ring to fill up).
+                if self.secondary_reader is not None:
+                    sec_idx = 1 if self.device_num == 1 else 0
+                    sec_data = rx_samples[sec_idx::4].copy()
+                    sec_first_ts = buffer_received_time - len(sec_data) / 100e3
+                    try:
+                        # print("appending to second queue",sec_data.shape,sec_data[:10])
+                        self.secondary_reader.data_queue.put_nowait((sec_data, sec_first_ts))
+                    except queue.Full:
+                        pass
 
         except Exception as exc:
             print(f'RX thread error: {exc}')
@@ -1046,6 +1108,11 @@ class TimeStampBasedReader:
                 self.data_queue.put(None, timeout=0.2)
             except Exception:
                 pass
+            if self.secondary_reader is not None:
+                try:
+                    self.secondary_reader.data_queue.put(None, timeout=0.2)
+                except Exception:
+                    pass
 
     @staticmethod
     def _bin2num_20_12(bits: np.ndarray) -> float:
@@ -1234,12 +1301,13 @@ class TimeStampBasedReader:
                         self.gap_estimate_disagree_count += 1
                 missing = max(missing_from_numbers, missing_from_distance)
                 if missing > 0:
-                    _ts = self._words_processed_total / self.sample_rate
-                    print(
-                        f"⚠️  Cross-chunk gap @ t={_ts:.3f}s: prev={prev_packet_num}, "
-                        f"first_fresh={packet_num}, missing_num={missing_from_numbers}, "
-                        f"missing_dist={missing_from_distance}, inserting={missing}"
-                    )
+                    if not self.quiet:
+                        _ts = self._words_processed_total / self.sample_rate
+                        print(
+                            f"⚠️  Cross-chunk gap @ t={_ts:.3f}s: prev={prev_packet_num}, "
+                            f"first_fresh={packet_num}, missing_num={missing_from_numbers}, "
+                            f"missing_dist={missing_from_distance}, inserting={missing}"
+                        )
                     last_num = prev_packet_num
                     for _ in range(missing):
                         last_num = (last_num + 1) % 8
@@ -1279,12 +1347,12 @@ class TimeStampBasedReader:
                             'timestamp_s': (self._words_processed_total + int(start_idx) - prefix_len) / self.sample_rate,
                         }
                     )
-                    print(
-                        f"⚠️  Packet sequence anomaly: prev={prev_packet_num}, "
-                        f"expected_next={expected_next}, observed={packet_num}, "
-                        f"expected_at_current={expected_at_current}, "
-                        f"distance={distance} words (~{expected_frames_in_gap} frame(s))"
-                    )
+                    # print(
+                    #     f"⚠️  Packet sequence anomaly: prev={prev_packet_num}, "
+                    #     f"expected_next={expected_next}, observed={packet_num}, "
+                    #     f"expected_at_current={expected_at_current}, "
+                    #     f"distance={distance} words (~{expected_frames_in_gap} frame(s))"
+                    # )
 
                     # If this frame should be the immediate next packet (1 frame apart)
                     # but packet_num disagrees, treat it as a bad header and discard it.
@@ -1292,18 +1360,19 @@ class TimeStampBasedReader:
                     # against the last known-good packet.
                     if expected_frames_in_gap == 1 and expected_next is not None and packet_num != expected_next:
                         self.packet_sequence_header_drops += 1
-                        ts_drop = (self._words_processed_total + int(start_idx) - prefix_len) / self.sample_rate
-                        print(
-                            f"⚠️  Dropping out-of-order observed packet @ t={ts_drop:.3f}s: "
-                            f"expected {expected_next}, observed {packet_num}"
-                        )
+                        if not self.quiet:
+                            ts_drop = (self._words_processed_total + int(start_idx) - prefix_len) / self.sample_rate
+                            print(
+                                f"⚠️  Dropping out-of-order observed packet @ t={ts_drop:.3f}s: "
+                                f"expected {expected_next}, observed {packet_num}"
+                            )
                         continue
 
                 # Insert placeholders using the stronger of distance-based and packet-number-based inference.
                 # This catches cases where malformed frame lengths make distance-based inference undercount losses.
                 missing = max(missing_from_distance, missing_from_numbers)
                 if missing > 0 and prev_packet_num is not None:
-                    if missing_from_numbers > missing_from_distance:
+                    if missing_from_numbers > missing_from_distance and not self.quiet:
                         print(
                             f"⚠️  Packet-gap undercount by frame distance: "
                             f"distance inferred missing={missing_from_distance}, "
@@ -1523,14 +1592,14 @@ class TimeStampBasedReader:
                         if not p1.is_valid:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
                             self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
-                            print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} missing, p2 pkt#{p2.packet_num} valid")
+                            # print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} missing, p2 pkt#{p2.packet_num} valid")
                         else:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short'] += 1
-                            print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} payload short, p2 pkt#{p2.packet_num} valid")
+                            # print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} payload short, p2 pkt#{p2.packet_num} valid")
                     else:
                         quality[s] = 0
                         # raw_ints[s] stays 0; will be overwritten by carry-forward in _append_gcs_group
-                        print(f"  no_packet ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} valid={p1.is_valid}, p2 pkt#{p2.packet_num} valid={p2.is_valid}")
+                        # print(f"  no_packet ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} valid={p1.is_valid}, p2 pkt#{p2.packet_num} valid={p2.is_valid}")
 
                 prev_neighbor = None
                 if len(self.decoded_groups_by_channel[channel_idx]) > 0:
@@ -1582,9 +1651,10 @@ class TimeStampBasedReader:
                 self._append_gcs_group(group_values, group_raw_values, group_quality, group_sample_timestamps)
 
     def processing_thread(self):
-        while self.running:
+        while True:
             try:
                 item = self.data_queue.get(timeout=0.5)
+                # print("got item from queue", "data shape" if isinstance(item, tuple) else "data", item[0].shape if isinstance(item, tuple) else item.shape,self.secondary_reader is not None)
             except queue.Empty:
                 continue
 
@@ -1911,11 +1981,25 @@ class TimeStampBasedReader:
         series = values.reshape(-1).copy()
         quality_series = quality.reshape(-1).copy()
 
-        nan_mask = np.isnan(series)
-        if np.any(nan_mask):
-            valid_idx = np.where(~nan_mask)[0]
-            if len(valid_idx) > 1:
-                series[nan_mask] = np.interp(np.where(nan_mask)[0], valid_idx, series[valid_idx])
+        # Replace non-qual-3 samples using a carry-forward anchored to qual=3 only.
+        # qual=1/2/5/6 (partial/mismatch) are kept if the jump from the last qual=3
+        # value is within 300 uV; otherwise replaced with carry-forward.
+        # qual=0 (no packet / NaN) are always replaced with carry-forward.
+        _SPIKE_THRESHOLD = 300e-6  # volts — max allowed jump from last qual=3 value
+        _PARTIAL_QUALS = (1, 2, 5, 6)
+        carry = np.nan
+        for i in range(len(series)):
+            q = int(quality_series[i])
+            if q == 3:
+                carry = series[i]
+            elif q in _PARTIAL_QUALS:
+                v = series[i]
+                if np.isnan(v) or (not np.isnan(carry) and abs(v - carry) > _SPIKE_THRESHOLD):
+                    series[i] = carry
+                # else: plausible value, leave it; carry stays at last qual=3
+            else:
+                # qual=0 — carry-forward
+                series[i] = carry
 
         # MATLAB parity: subtract mean before visualization/spectral analysis
         if len(series) > 0:
@@ -2179,7 +2263,7 @@ class TimeStampBasedReader:
         fs_output = self.output_rate_hz
         t = np.arange(len(series)) / fs_output
 
-        csv_path = f'/home/joannas/bladeRF/hdl/pythonscripts/time_domain_python_artifact_ch{idx}.csv'
+        csv_path = f'/home/joannas/bladeRF/hdl/pythonscripts/time_domain_python_artifact_{self.reader_label}_ch{idx}.csv'
         export_matrix = np.column_stack((t, series, quality_series))
         np.savetxt(
             csv_path,
@@ -2194,11 +2278,28 @@ class TimeStampBasedReader:
         )
         print(f'Exported decoded time-domain CSV: {csv_path}')
 
+        QUAL_STYLE = {
+            0: ('red',       'q=0 no_packet'),
+            1: ('orange',    'q=1 only_v1'),
+            2: ('gold',      'q=2 only_v2'),
+            3: ('steelblue', 'q=3 both_match'),
+            5: ('magenta',   'q=5 mismatch→v1'),
+            6: ('purple',    'q=6 mismatch→v2'),
+        }
+
         fig, ax = plt.subplots(figsize=(14, 4))
-        ax.plot(t, series, linewidth=0.7, color='red', alpha=0.85)
+        for q, (color, label) in QUAL_STYLE.items():
+            mask = quality_series == q
+            if not np.any(mask):
+                continue
+            ax.scatter(t[mask], series[mask], c=color, label=label,
+                       s=10, linewidths=0, alpha=0.7, zorder=2 if q == 3 else 3)
+        ax.axhline( 300e-6, color='gray', linewidth=0.8, linestyle='--', alpha=0.6, label='±300 µV')
+        ax.axhline(-300e-6, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
         ax.set_title(f'Time series – Channel {idx}')
         ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Amplitude')
+        ax.set_ylabel('Amplitude (V)')
+        ax.legend(loc='upper right', markerscale=3, fontsize=9)
         ax.grid(True, alpha=0.4)
         fig.tight_layout()
         print(max(series), min(series))
@@ -2209,6 +2310,12 @@ class TimeStampBasedReader:
         if self.enable_gcs:
             self._init_gcs_clients()
             self._check_resume_recording()
+
+        # Initialise secondary reader's GCS clients before opening the device
+        if self.secondary_reader is not None:
+            if self.secondary_reader.enable_gcs:
+                self.secondary_reader._init_gcs_clients()
+                self.secondary_reader._check_resume_recording()
 
         self.setup_device()
 
@@ -2226,13 +2333,26 @@ class TimeStampBasedReader:
         if self.enable_gcs and self.enable_gcs_trigger:
             trig_t = threading.Thread(target=self._poll_gcs_triggers, daemon=True)
 
+        # Dual-antenna: start secondary reader's processing thread.
+        # Trigger start/stop is forwarded from the primary reader's _handle_gcs_trigger_message,
+        # so no separate trigger poller is needed for the secondary.
+        sec_proc_t = None
+        if self.secondary_reader is not None:
+            self.secondary_reader.running = True
+            sec_proc_t = threading.Thread(target=self.secondary_reader.processing_thread, daemon=True)
+            self._secondary_proc_thread = sec_proc_t
+
         rx_t.start()
         proc_t.start()
         watchdog_t.start()
         if trig_t is not None:
             trig_t.start()
+        if sec_proc_t is not None:
+            sec_proc_t.start()
 
         print('Capture started (MATLAB-style timestamp/frame decoder active).')
+        if self.secondary_reader is not None:
+            print('Dual-antenna mode active: secondary reader decoding antenna 2 stream in parallel.')
 
         try:
             end_time = None if duration_seconds is None else time.time() + float(duration_seconds)
@@ -2249,21 +2369,36 @@ class TimeStampBasedReader:
             self.running = False
             self._rx_running = False
             self._stop_gcs_recording()
-            try:
-                self.data_queue.put(None, timeout=0.1)
-            except Exception:
-                pass
-            rx_t.join(timeout=3.0)
-            proc_t.join(timeout=3.0)
+            if self.secondary_reader is not None:
+                self.secondary_reader._stop_gcs_recording()
+            # Let the rx_thread finish its current buffer and send None to both
+            # processing queues via its own finally block — do NOT inject None here,
+            # which would cause the primary to stop before the rx_thread's last buffer
+            # is enqueued, giving the secondary one extra buffer.
+            rx_t.join(timeout=5.0)
             if trig_t is not None:
                 trig_t.join(timeout=1.0)
+            proc_t.join(timeout=5.0)
 
+            # Shut down secondary reader
+            if self.secondary_reader is not None:
+                self.secondary_reader.running = False
+                if sec_proc_t is not None:
+                    sec_proc_t.join(timeout=5.0)
+
+            print('\n--- Antenna 1 ---')
             self.print_stats()
             self.save_raw_frame_log(
                 os.path.join(os.path.dirname(__file__), 'raw_frame_log.csv')
             )
+            if self.secondary_reader is not None:
+                print('\n--- Antenna 2 ---')
+                self.secondary_reader.print_stats()
+
             if self.enable_plotting:
                 self.plot_channel(self.channel_to_decode)
+                if self.secondary_reader is not None and self.secondary_reader.enable_plotting:
+                    self.secondary_reader.plot_channel(self.secondary_reader.channel_to_decode)
             elif self.enable_gcs:
                 series, quality_series = self.get_channel_series(self.channel_to_decode)
                 self._upload_series_to_gcs_binary(series, quality_series)
@@ -2276,33 +2411,60 @@ class TimeStampBasedReader:
 
 
 if __name__ == '__main__':
-    reader = TimeStampBasedReader(
+    with open(os.path.join(os.path.dirname(__file__), 'board_config.json')) as _f:
+        _board_cfg = json.load(_f)
+    _board = _board_cfg['boards'][_board_cfg['active_board']]
+
+    # Shared configuration for both antennas
+    _COMMON = dict(
         sample_rate=8e6,
-        frequency=903.6e6,
-        gain_mode='manual',
-        gain=50,
+        frequency=_board['frequency_hz'],
+        decode_scale=_board['decode_scale'],
+        gain_mode='slow_attack',
+        gain=40,
         counter=False,
         raw=False,
-        device=1,
-        bandwidth=2e6,
+        bandwidth=1.5e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
         accepted_frame_lengths=(248, 250),
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
-        channel_to_decode=2,
-        gcs_bucket="ueegbucket",  # Set to your GCS bucket
-        gcs_blob_name="ada_eyesclosed.npy",  # Output file name (.csv for CSV, .npy for binary)
-        gcs_buffer_size=400,  # Write every 400 samples (2 seconds at 200 Hz)
-        gcs_channels=[2, 3],  # List of channels to save (1-4)
-        gcs_format='binary',  # 'csv' or 'binary' - binary is much faster and more compact
-        # Pub/Sub trigger configuration (for trigger-controlled recording)
-        enable_gcs_trigger=True,  # Set to True to enable trigger-controlled recording
+        channel_to_decode=3,
+        gcs_bucket="ueegbucket",
+        gcs_buffer_size=400,
+        gcs_channels=[2, 3],
+        gcs_format='binary',
+        enable_gcs_trigger=True,
         enable_gcs=True,
-        gcs_trigger_topic_id="sdr-commands",  # Pub/Sub topic id in same project as storage
-        gcs_trigger_subscription_id="sdr-commands-pi-sub",  # Optional existing subscription id; None = auto-create 
+        gcs_trigger_topic_id="sdr-commands",
+        gcs_trigger_subscription_id="sdr-commands-pi-sub",
     )
+
+    # Antenna 1 — RX0 I channel (device=1). This reader owns the BladeRF device.
+    reader = TimeStampBasedReader(
+        **_COMMON,
+        device=1,
+        gcs_blob_name="ada_eyesclosed_ant1.bin",
+    )
+
+    # Antenna 2 — RX0 Q channel (device=2). Enabled via enable_device2 in board_config.json.
+    # gcs_blob_name will be overwritten on each trigger: primary blob with "_ant2" inserted
+    # before the extension (e.g. "session.bin" → "session_ant2.bin").
+    # quiet=True suppresses per-packet decode warnings so a noisy antenna 2 channel
+    # doesn't flood stdout and starve the primary reader's processing thread.
+    if _board_cfg.get('device2_board') is not None:
+        _board2 = _board_cfg['boards'][_board_cfg['device2_board']]
+        reader.secondary_reader = TimeStampBasedReader(
+            **{**_COMMON, 'enable_gcs_trigger': False},  # primary handles all trigger logic and forwards start/stop
+            device=2,
+            frequency=_board2['frequency_hz'],
+            decode_scale=_board2['decode_scale'],
+            gcs_blob_name="ada_eyesclosed_ant2.bin",
+            quiet=True,
+            reader_label='device2',
+        )
 
     reader.start_capture(duration_seconds=None)
     # reader.decode_from_file(

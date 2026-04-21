@@ -1,0 +1,16 @@
+{
+    "boards": {
+        "1": {
+            "label": "board1(blue-red case)",
+            "frequency_hz": 907600000,
+            "decode_scale": 0.00032
+        },
+        "2": {
+            "label": "board2 (black case)",
+            "frequency_hz": 903600000,
+            "decode_scale": 0.000587890625
+        }
+    },
+    "active_board": "1",
+    "device2_board": null
+}
