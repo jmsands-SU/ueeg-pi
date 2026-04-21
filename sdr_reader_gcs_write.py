@@ -874,6 +874,16 @@ class TimeStampBasedReader:
                     continue
             drop_rate = self._recent_drop_rate()
             if drop_rate > self.sdr_restart_drop_threshold:
+                if self.secondary_reader is not None:
+                    sec_has_data = any(len(q) > 0 for q in self.secondary_reader.decoded_quality_by_channel.values())
+                    if sec_has_data:
+                        sec_drop_rate = self.secondary_reader._recent_drop_rate()
+                        if sec_drop_rate <= self.sdr_restart_drop_threshold:
+                            print(
+                                f'⚠️  Watchdog: primary drop rate {drop_rate*100:.1f}% is high but '
+                                f'secondary is healthy ({sec_drop_rate*100:.1f}%) — not restarting.'
+                            )
+                            continue
                 print(
                     f'⚠️  Watchdog: drop rate {drop_rate*100:.1f}% > '
                     f'{self.sdr_restart_drop_threshold*100:.0f}% threshold — requesting SDR restart.'
@@ -2440,11 +2450,11 @@ if __name__ == '__main__':
         sample_rate=8e6,
         frequency=_board['frequency_hz'],
         decode_scale=_board['decode_scale'],
-        gain_mode='manual',#'slow_attack',
+        gain_mode='slow_attack',
         gain=45,
         counter=False,
         raw=False,
-        bandwidth=1.5e6,
+        bandwidth=1e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
