@@ -36,6 +36,7 @@
         .segment-selector { text-align: center; }
         .plot-container { display: flex; flex-direction: column; gap: 3em; margin-top: 2em; }
         .plot { width: 100%; height: 450px; margin: auto; }
+        .quality-plot { width: 100%; height: 130px; margin: auto; }
         .fft-controls { border-top: 1px solid #e9ecef; margin-top: 1em; padding-top: 1em; display: flex; justify-content: center; gap: 1em; align-items: center;}
     </style>
 </head>
@@ -61,6 +62,7 @@
     </div>
     <div class="plot-container">
         <div id="timePlot" class="plot"></div>
+        <div id="qualityPlot" class="quality-plot"></div>
         <div id="fftPlot" class="plot"></div>
         <div class="fft-controls" id="fftControlsContainer" style="display: none;">
              <label><input type="checkbox" id="fftLinearToggle">Linear Y-Axis</label>
@@ -99,6 +101,7 @@
         const qualityStatsContainer = document.getElementById('qualityStatsContainer');
         const qualityStatsBody = document.getElementById('qualityStatsBody');
         const timePlotDiv = document.getElementById('timePlot');
+        const qualityPlotDiv = document.getElementById('qualityPlot');
         const fftPlotDiv = document.getElementById('fftPlot');
         const fftControlsContainer = document.getElementById('fftControlsContainer');
         const fftLinearToggle = document.getElementById('fftLinearToggle');
@@ -179,7 +182,7 @@
                 for (let i = 0; i < blobs.length; i++) {
                     if (!responses[i].ok || jsons[i].error) { warnings.push(`${blobLabel(blobs[i])}: ${jsons[i].error || 'server error ' + responses[i].status}`); continue; }
                     if (!jsons[i].segment_data || jsons[i].segment_data.length === 0) { warnings.push(`${blobLabel(blobs[i])}: no data in range`); continue; }
-                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]) });
+                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]), segmentQuality: jsons[i].segment_quality || null });
                 }
                 if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
                 await plotData(datasets, `Last ${timeValue} ${unitText} of Recording`);
@@ -213,7 +216,7 @@
                 for (let i = 0; i < blobs.length; i++) {
                     if (!responses[i].ok || jsons[i].error) { warnings.push(`${blobLabel(blobs[i])}: ${jsons[i].error || 'server error ' + responses[i].status}`); continue; }
                     if (!jsons[i].segment_data || jsons[i].segment_data.length === 0) { warnings.push(`${blobLabel(blobs[i])}: no data in range`); continue; }
-                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]) });
+                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]), segmentQuality: jsons[i].segment_quality || null });
                 }
                 if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
                 await plotData(datasets, `Time Range: ${startTime}-${endTime} ${unitText}`);
@@ -239,7 +242,7 @@
                 for (let i = 0; i < blobs.length; i++) {
                     if (!responses[i].ok || jsons[i].error) { warnings.push(`${blobLabel(blobs[i])}: ${jsons[i].error || 'server error ' + responses[i].status}`); continue; }
                     if (!jsons[i].segment_data || jsons[i].segment_data.length === 0) { warnings.push(`${blobLabel(blobs[i])}: no data`); continue; }
-                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]) });
+                    datasets.push({ channelData: jsons[i].segment_data, sampleRate: jsons[i].sample_rate, label: blobLabel(blobs[i]), segmentQuality: jsons[i].segment_quality || null });
                 }
                 if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
                 await plotData(datasets, `Time Domain - Segment ${index + 1}`);
@@ -256,7 +259,10 @@
                 if (!total || total === 0) continue;
                 const pct = (n) => `${n.toLocaleString()} (${((n / total) * 100).toFixed(2)}%)`;
                 const row = (name, n) => n > 0 ? `<tr><td>${name}</td><td>${pct(n)}</td></tr>` : '';
+                const errorStyle = 'color:#c0392b';
+                const erow = (name, n) => n > 0 ? `<tr><td style="${errorStyle}">${name}</td><td style="${errorStyle}">${pct(n)}</td></tr>` : '';
                 const dropRate = ((stats.missed_packet || 0) / total * 100).toFixed(2);
+                const errTotal = stats.error_flagged_total || 0;
                 if (entries.length > 1) html += `<tr><td colspan="2" style="font-weight:700;padding-top:0.8em">${label}</td></tr>`;
                 html += `<tr><td><strong>Drop rate</strong></td><td><strong>${dropRate}%</strong></td></tr>`;
                 html += row('Missed Packets', stats.missed_packet);
@@ -265,25 +271,77 @@
                 html += row('Matched (v1 & v2)', stats.matched);
                 html += row('Mismatch (picked v1)', stats.mismatch_v1);
                 html += row('Mismatch (picked v2)', stats.mismatch_v2);
+                if (errTotal > 0) {
+                    html += `<tr><td colspan="2" style="font-size:0.85em;padding-top:0.6em;color:#888">— error flagged (bit 3) —</td></tr>`;
+                    html += erow('Error total', errTotal);
+                    html += erow('Error: no packet', stats.error_missed);
+                    html += erow('Error: v1 used (v2 errored)', stats.error_v1_only);
+                    html += erow('Error: v2 used (v1 errored)', stats.error_v2_only);
+                    html += erow('Error: matched', stats.error_matched);
+                    html += erow('Error: mismatch picked v1', stats.error_mismatch_v1);
+                    html += erow('Error: mismatch picked v2', stats.error_mismatch_v2);
+                }
                 html += `<tr><td>Total Samples</td><td>${total.toLocaleString()}</td></tr>`;
             }
             qualityStatsBody.innerHTML = html;
             qualityStatsContainer.style.display = 'block';
         }
         function populateDropdown() { segmentDropdown.innerHTML = ''; const showAll = showAllDataToggle.checked; currentSegments.forEach((segment, index) => { const option = document.createElement('option'); option.value = index; option.textContent = (showAll && currentSegments.length === 1) ? `Full File (${segment.duration_sec.toFixed(1)}s)` : `Segment ${index + 1} (${segment.duration_sec.toFixed(1)}s)`; segmentDropdown.appendChild(option); }); }
-        function resetUI() { Plotly.purge(timePlotDiv); Plotly.purge(fftPlotDiv); segmentContainer.style.display = 'none'; segmentDropdown.innerHTML = ''; qualityStatsContainer.style.display = 'none'; qualityStatsBody.innerHTML = ''; fftControlsContainer.style.display = 'none'; fftFreqMinInput.value = ''; fftFreqMaxInput.value = ''; statusDiv.textContent = "Enter a blob name and choose an action."; }
+        function resetUI() { Plotly.purge(timePlotDiv); Plotly.purge(qualityPlotDiv); Plotly.purge(fftPlotDiv); segmentContainer.style.display = 'none'; segmentDropdown.innerHTML = ''; qualityStatsContainer.style.display = 'none'; qualityStatsBody.innerHTML = ''; fftControlsContainer.style.display = 'none'; fftFreqMinInput.value = ''; fftFreqMaxInput.value = ''; statusDiv.textContent = "Enter a blob name and choose an action."; }
 
-        // datasets: array of { channelData, sampleRate, label }
+        // Quality code definitions (bits 2:0 = base code, bit 3 = error flag)
+        const QUALITY_CATS = [
+            { code: 0,  label: 'Missed',           color: '#e74c3c', symbol: 'x' },
+            { code: 1,  label: 'v1 only',           color: '#e67e22', symbol: 'circle' },
+            { code: 2,  label: 'v2 only',           color: '#f1c40f', symbol: 'circle' },
+            { code: 3,  label: 'Matched',           color: '#2ecc71', symbol: 'circle' },
+            { code: 5,  label: 'Mismatch→v1',       color: '#3498db', symbol: 'diamond' },
+            { code: 6,  label: 'Mismatch→v2',       color: '#9b59b6', symbol: 'diamond' },
+            { code: 8,  label: 'Err: missed',       color: '#c0392b', symbol: 'x' },
+            { code: 9,  label: 'Err: v1 (v2 bad)',  color: '#d35400', symbol: 'triangle-up' },
+            { code: 10, label: 'Err: v2 (v1 bad)',  color: '#b7950b', symbol: 'triangle-up' },
+            { code: 11, label: 'Err: matched',      color: '#1a6b3c', symbol: 'triangle-up' },
+            { code: 13, label: 'Err: mismatch→v1',  color: '#1a5276', symbol: 'triangle-up' },
+            { code: 14, label: 'Err: mismatch→v2',  color: '#6c3483', symbol: 'triangle-up' },
+        ];
+
+        function buildQualityScatterTraces(time_axis, qualityArr) {
+            const byCode = {};
+            for (let i = 0; i < qualityArr.length; i++) {
+                const q = qualityArr[i];
+                if (!byCode[q]) byCode[q] = { t: [], q: [] };
+                byCode[q].t.push(time_axis[i]);
+                byCode[q].q.push(q);
+            }
+            const traces = [];
+            for (const cat of QUALITY_CATS) {
+                const pts = byCode[cat.code];
+                if (!pts || pts.t.length === 0) continue;
+                const isError = (cat.code & 0x08) !== 0;
+                traces.push({
+                    x: pts.t,
+                    y: Array(pts.t.length).fill(cat.code),
+                    mode: 'markers',
+                    name: cat.label,
+                    marker: { color: cat.color, symbol: cat.symbol, size: isError ? 8 : 6,
+                               line: isError ? { color: '#c0392b', width: 1 } : {} },
+                    hovertemplate: `%{x:.3f}s — ${cat.label}<extra></extra>`,
+                });
+            }
+            return traces;
+        }
+
+        // datasets: array of { channelData, sampleRate, label, segmentQuality }
         async function plotData(datasets, plotTitle) {
             if (!datasets || datasets.length === 0 || !datasets[0].channelData || datasets[0].channelData.length === 0) { statusDiv.textContent = "No data returned to plot."; return; }
             fullDatasets = datasets;
             currentSampleRate = datasets[0].sampleRate;
-            const timePlotData = []; const fftPlotData = [];
+            const timePlotData = []; const fftPlotData = []; const qualityPlotData = [];
             const isLinear = fftLinearToggle.checked;
             const yAxisTitle = isLinear ? 'PSD (V²/Hz)' : 'PSD (dB/Hz)';
             const usePrefix = datasets.length > 1;
             for (const ds of datasets) {
-                const { channelData, sampleRate, label } = ds;
+                const { channelData, sampleRate, label, segmentQuality } = ds;
                 const time_axis = Array.from({length: channelData.length}, (_, i) => i / sampleRate);
                 const numChannels = channelData[0].length;
                 for (let i = 0; i < numChannels; i++) {
@@ -296,16 +354,46 @@
                     fftTrace.psdValues = psdValues;
                     fftPlotData.push(fftTrace);
                 }
+                if (segmentQuality && segmentQuality.length === channelData.length) {
+                    const prefix = usePrefix ? `${label} ` : '';
+                    for (const tr of buildQualityScatterTraces(time_axis, segmentQuality)) {
+                        tr.name = prefix + tr.name;
+                        qualityPlotData.push(tr);
+                    }
+                }
             }
             const timeLayout = { title: plotTitle, xaxis: { title: 'Time (s)' }, yaxis: { title: 'Amplitude' }};
             const fftLayout = { title: "Power Spectral Density (Multitaper)", xaxis: { title: 'Frequency (Hz)', type: 'log' }, yaxis: { title: yAxisTitle }};
             await Plotly.newPlot(timePlotDiv, timePlotData, timeLayout);
+            if (qualityPlotData.length > 0) {
+                const qCodes = QUALITY_CATS.map(c => c.code);
+                const qLabels = QUALITY_CATS.map(c => `${c.code}: ${c.label}`);
+                await Plotly.newPlot(qualityPlotDiv, qualityPlotData, {
+                    margin: { t: 24, b: 36, l: 60, r: 10 },
+                    title: { text: 'Sample Quality', font: { size: 12 } },
+                    xaxis: { title: 'Time (s)', matches: 'x' },
+                    yaxis: { tickvals: qCodes, ticktext: qLabels, fixedrange: true, tickfont: { size: 10 } },
+                    legend: { orientation: 'h', y: -0.4 },
+                    height: 130,
+                });
+                qualityPlotDiv.style.display = 'block';
+            } else {
+                qualityPlotDiv.style.display = 'none';
+            }
             await Plotly.newPlot(fftPlotDiv, fftPlotData, fftLayout);
             fftControlsContainer.style.display = 'flex';
             updateFftPlot();
             statusDiv.textContent = `Displaying data. Click legend to toggle channels.`;
             timePlotDiv.removeAllListeners(); fftPlotDiv.removeAllListeners();
             timePlotDiv.on('plotly_relayout', debouncedRelayoutHandler);
+            timePlotDiv.on('plotly_relayout', (ev) => {
+                if (qualityPlotData.length === 0) return;
+                if (ev['xaxis.range[0]'] !== undefined) {
+                    Plotly.relayout(qualityPlotDiv, { 'xaxis.range': [ev['xaxis.range[0]'], ev['xaxis.range[1]']] });
+                } else if (ev['xaxis.autorange']) {
+                    Plotly.relayout(qualityPlotDiv, { 'xaxis.autorange': true });
+                }
+            });
             timePlotDiv.on('plotly_legendclick', handleLegendClick);
             fftPlotDiv.on('plotly_legendclick', handleLegendClick);
         }
