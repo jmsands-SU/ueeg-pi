@@ -2078,15 +2078,27 @@ class TimeStampBasedReader:
             print(f'No samples decoded for channel {idx}.')
             return
 
+        base_q = quality & np.int8(0x07)
+        err_flag = (quality & np.int8(0x08)) != 0
+
         print('\n=== Decoded Sample Statistics ===')
         print(f'Channel: {idx}')
         print(f'Total samples: {total}')
-        print(f'  No packet (0):               {np.sum(quality == 0):6d} ({100*np.sum(quality == 0)/total:5.1f}%)')
-        print(f'  Only v1 (1):                 {np.sum(quality == 1):6d} ({100*np.sum(quality == 1)/total:5.1f}%)')
-        print(f'  Only v2 (2):                 {np.sum(quality == 2):6d} ({100*np.sum(quality == 2)/total:5.1f}%)')
-        print(f'  Match both (3):              {np.sum(quality == 3):6d} ({100*np.sum(quality == 3)/total:5.1f}%)')
-        print(f'  Mismatch picked v1 (5):      {np.sum(quality == 5):6d} ({100*np.sum(quality == 5)/total:5.1f}%)')
-        print(f'  Mismatch picked v2 (6):      {np.sum(quality == 6):6d} ({100*np.sum(quality == 6)/total:5.1f}%)')
+        print(f'  No packet (0):               {np.sum(base_q == 0):6d} ({100*np.sum(base_q == 0)/total:5.1f}%)')
+        print(f'  Only v1 (1):                 {np.sum(base_q == 1):6d} ({100*np.sum(base_q == 1)/total:5.1f}%)')
+        print(f'  Only v2 (2):                 {np.sum(base_q == 2):6d} ({100*np.sum(base_q == 2)/total:5.1f}%)')
+        print(f'  Match both (3):              {np.sum(base_q == 3):6d} ({100*np.sum(base_q == 3)/total:5.1f}%)')
+        print(f'  Mismatch picked v1 (5):      {np.sum(base_q == 5):6d} ({100*np.sum(base_q == 5)/total:5.1f}%)')
+        print(f'  Mismatch picked v2 (6):      {np.sum(base_q == 6):6d} ({100*np.sum(base_q == 6)/total:5.1f}%)')
+        err_total = int(np.sum(err_flag))
+        err_v2_errored = int(np.sum(quality == np.int8(9)))   # base=1 (only_v1) + error → v2 had error
+        err_v1_errored = int(np.sum(quality == np.int8(10)))  # base=2 (only_v2) + error → v1 had error
+        err_other      = err_total - err_v2_errored - err_v1_errored
+        print(f'  Error flag set (bit 3):      {err_total:6d} ({100*err_total/total:5.1f}%)')
+        if err_total > 0:
+            print(f'    v2 errored → used v1 only:  {err_v2_errored:6d}')
+            print(f'    v1 errored → used v2 only:  {err_v1_errored:6d}')
+            print(f'    both/no-fallback errored:   {err_other:6d}')
         print(f'  Packet drops (resync off):   {self.resync_drops_by_channel[idx]:6d}')
         print(f'  Sequence anomalies:          {self.packet_sequence_anomaly_count:6d}')
         print(f'  Header anomaly drops:        {self.packet_sequence_header_drops:6d}')
@@ -2099,7 +2111,7 @@ class TimeStampBasedReader:
         )
         print(f"  Accepted frame lengths:      {','.join(str(v) for v in self.accepted_frame_lengths)}")
 
-        match_count = int(np.sum(quality == 3))
+        match_count = int(np.sum(base_q == 3))
         if (
             match_count == int(total)
             and (
@@ -2110,8 +2122,8 @@ class TimeStampBasedReader:
         ):
             print('  Note: quality percentages are computed after resync/sequence handling; dropped packets are not included in these percentages.')
 
-        only_v1_count = int(np.sum(quality == 1))
-        only_v2_count = int(np.sum(quality == 2))
+        only_v1_count = int(np.sum(base_q == 1))
+        only_v2_count = int(np.sum(base_q == 2))
         one_sided_total = only_v1_count + only_v2_count
         if one_sided_total > 0:
             causes = self.only_side_cause_counts_by_channel[idx]
@@ -2136,7 +2148,7 @@ class TimeStampBasedReader:
                 if fmt_v2:
                     print(f'    missing pkt num seen by only_v2 (v1 side): {fmt_v2}')
 
-        known = np.array([0, 1, 2, 3, 5, 6], dtype=np.int8)
+        known = np.array([0, 1, 2, 3, 5, 6, 8, 9, 10, 11, 13, 14], dtype=np.int8)
         unknown_count = np.sum(~np.isin(quality, known))
         if unknown_count > 0:
             print(f'  Unknown quality codes:       {unknown_count:6d} ({100*unknown_count/total:5.1f}%)')
@@ -2301,8 +2313,9 @@ class TimeStampBasedReader:
             delimiter=',',
             header=(
                 'time_s,amplitude,quality_code | '
-                'quality mapping: 0=no_packet, 1=only_v1, 2=only_v2, '
-                '3=both_match, 5=mismatch_picked_v1, 6=mismatch_picked_v2'
+                'quality mapping: bits[2:0]: 0=no_packet, 1=only_v1(v2_errored), 2=only_v2(v1_errored), '
+                '3=both_match, 5=mismatch_picked_v1, 6=mismatch_picked_v2; '
+                'bit3(0x08)=error_flag (OR\'d into base code)'
             ),
             comments='',
         )
@@ -2317,13 +2330,19 @@ class TimeStampBasedReader:
             6: ('purple',    'q=6 mismatch→v2'),
         }
 
+        base_quality_series = quality_series & np.int8(0x07)
+        err_mask = (quality_series & np.int8(0x08)) != 0
+
         fig, ax = plt.subplots(figsize=(14, 4))
         for q, (color, label) in QUAL_STYLE.items():
-            mask = quality_series == q
+            mask = base_quality_series == q
             if not np.any(mask):
                 continue
             ax.scatter(t[mask], series[mask], c=color, label=label,
                        s=10, linewidths=0, alpha=0.7, zorder=2 if q == 3 else 3)
+        if np.any(err_mask):
+            ax.scatter(t[err_mask], series[err_mask], marker='x', c='black',
+                       s=20, linewidths=0.8, alpha=0.8, zorder=4, label='error_flag')
         ax.axhline( 300e-6, color='gray', linewidth=0.8, linestyle='--', alpha=0.6, label='±300 µV')
         ax.axhline(-300e-6, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
         ax.set_title(f'Time series – Channel {idx}')
