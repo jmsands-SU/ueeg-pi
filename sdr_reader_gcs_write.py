@@ -179,6 +179,15 @@ class TimeStampBasedReader:
         self.bit_mismatch_events_by_channel = {
             ch: deque(maxlen=2000) for ch in range(1, 5)
         }
+        self.payload_short_log_by_channel = {
+            ch: deque(maxlen=500) for ch in range(1, 5)
+        }
+        # Histogram of how many valid_flag==1 bits were extracted per packet per channel.
+        # Key = bit count, value = number of packets with that count.
+        # Expected peak at bits_per_channel/2 (=20 for the default 40-bit, 50% duty-cycle config).
+        self.valid_flag_bitcount_hist_by_channel = {
+            ch: Counter() for ch in range(1, 5)
+        }
         self.only_side_cause_counts_by_channel = {
             ch: Counter() for ch in range(1, 5)
         }
@@ -211,6 +220,9 @@ class TimeStampBasedReader:
         self._words_processed_total = 0       # absolute word offset for timestamps
         self._raw_frame_log = []              # list of (abs_word_idx, packet_num, frame_length, passed_valid)
         self._word_timestamps = []  # Stores timestamp for each word in decode buffer
+        # Set to (start_s, end_s) to print raw packet bits and decoded ints for every
+        # sample whose time (sample_idx / output_rate_hz) falls in the window.
+        self.debug_packet_window = None
         self.gcs_timestamp_log = []  # List of {gcs_sample_idx, timestamp_utc, system_time_s}
         self.gcs_timestamp_log_interval = 12000  # Log timestamp every 12000 samples (60 seconds at 200 Hz)
         self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}  # Track word positions for packets
@@ -1231,7 +1243,7 @@ class TimeStampBasedReader:
         packet_nums_raw = (working_data & ((1 << 4) | (1 << 5) | (1 << 6))) >> 4
         valid_flag = (working_data & (1 << 8)) >> 8
         error_flag_arr = (working_data & (1 << 7)) >> 7
-
+        # print("error count:", sum(error_flag_arr),np.where(error_flag_arr==1))
         packet_nums_for_edges = packet_nums_raw.copy()
         valid_words = valid_flag.astype(bool)
         if np.any(valid_words):
@@ -1270,13 +1282,12 @@ class TimeStampBasedReader:
         data_bit = data_bit[:process_until]
         valid_flag = valid_flag[:process_until]
         error_flag_arr = error_flag_arr[:process_until]
-
         transitions = np.where(np.diff(packet_nums_for_edges) != 0)[0]
         frame_starts = np.concatenate(([prefix_len], transitions+1))
         frame_ends = np.concatenate((transitions, [len(packet_nums_for_edges) - 1]))
         frame_lengths = frame_ends - frame_starts + 1
 
-        starts_in_fresh_data = frame_starts >= prefix_len
+        starts_in_fresh_data = frame_starts >= prefix_len 
         self.prefix_overlap_frames_skipped += int(np.sum(~starts_in_fresh_data))
         valid_mask = np.isin(frame_lengths, self.accepted_frame_lengths) & starts_in_fresh_data
         valid_frame_starts = frame_starts[valid_mask]
@@ -1412,12 +1423,21 @@ class TimeStampBasedReader:
                     else:
                         self.gap_estimate_disagree_count += 1
 
+            # Packet-level error flag: any valid word across all 4 channels has error set.
+            # valid+error window per ch cancels the -4 offset, giving [start_idx : start_idx + 4*bpc].
+            _pkt_err_end = start_idx + 4 * self.bits_per_channel
+            if start_idx >= 0 and _pkt_err_end <= len(error_flag_arr):
+                _all_valid = valid_flag[start_idx:_pkt_err_end]
+                _all_error = error_flag_arr[start_idx:_pkt_err_end]
+                pkt_error = bool(np.any(_all_error[_all_valid == 1]))
+            else:
+                pkt_error = False
+
             for ch in range(1, 5):
                 channel_offset = (ch - 1) * self.bits_per_channel
-                channel_end_offset = channel_offset + self.bits_per_channel
                 ch_start = start_idx + channel_offset -4
-                ch_end = start_idx + channel_end_offset
-                if ch_end > len(packet_nums_raw):
+                ch_end = ch_start + self.bits_per_channel
+                if ch_start < 0 or ch_end+5 > len(packet_nums_raw):
                     packets_by_channel[ch].append(
                         DecodedPacket(packet_num=packet_num, is_valid=False, bits=np.array([], dtype=np.uint8))
                     )
@@ -1425,10 +1445,12 @@ class TimeStampBasedReader:
                     continue
 
                 bits_block = data_bit[ch_start:ch_end]
-                valid_block = valid_flag[ch_start:ch_end]
-                error_block = error_flag_arr[ch_start:ch_end]
+                valid_block = valid_flag[ch_start+4:ch_end+4]
+                if sum(valid_block) != 20:
+                    print(ch,valid_block, len(valid_block), sum(valid_block))
+                    print(bits_block)
                 selected_bits = bits_block[valid_block == 1]
-                pkt_error = bool(np.any(error_block[valid_block == 1]))
+                self.valid_flag_bitcount_hist_by_channel[ch][len(selected_bits)] += 1
                 packets_by_channel[ch].append(
                     DecodedPacket(packet_num=packet_num, is_valid=True, bits=selected_bits.astype(np.uint8), error_flag=pkt_error)
                 )
@@ -1587,6 +1609,20 @@ class TimeStampBasedReader:
                     r1 = self._decode_raw_int_from_packet_bits(p1.bits) if p1.is_valid else None
                     r2 = self._decode_raw_int_from_packet_bits(p2.bits) if p2.is_valid else None
 
+                    if self.debug_packet_window is not None:
+                        _dbg_t = sample_idx / self.output_rate_hz
+                        _dbg_lo, _dbg_hi = self.debug_packet_window
+                        if _dbg_lo <= _dbg_t <= _dbg_hi and channel_idx == 3:
+                            _b1 = ''.join(str(int(x)) for x in p1.bits) if p1.bits is not None else ''
+                            _b2 = ''.join(str(int(x)) for x in p2.bits) if p2.bits is not None else ''
+                            print(
+                                f'[dbg] ch{channel_idx} s={s} idx={sample_idx} t={_dbg_t:.4f}s '
+                                f'| v1 pkt#{p1.packet_num} valid={p1.is_valid} err={p1.error_flag} '
+                                f'bits={len(p1.bits) if p1.bits is not None else 0} raw={r1} [{_b1}] '
+                                f'| v2 pkt#{p2.packet_num} valid={p2.is_valid} err={p2.error_flag} '
+                                f'bits={len(p2.bits) if p2.bits is not None else 0} raw={r2} [{_b2}]'
+                            )
+
                     error_occurred[s] = p1.error_flag or p2.error_flag
                     if p1.error_flag and not p2.error_flag and v2 is not None:
                         v1, r1 = None, None
@@ -1594,7 +1630,7 @@ class TimeStampBasedReader:
                         v2, r2 = None, None
 
                     if v1 is not None and v2 is not None:
-                        if abs(v1 - v2) < self.mismatch_threshold:
+                        if r1 == r2:
                             values[s] = v1
                             quality[s] = 3
                             raw_ints[s] = r1
@@ -1611,8 +1647,32 @@ class TimeStampBasedReader:
                         if not p2.is_valid:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_packet_missing'] += 1
                             self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v1'][int(p2.packet_num) % 8] += 1
+                        elif p2.error_flag:
+                            self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_error_suppressed'] += 1
                         else:
+                            # Genuinely short: p2 is valid, no error flag, but bits < 20
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_payload_short'] += 1
+                            ev = {
+                                'sample_idx': int(sample_idx),
+                                'ch': channel_idx,
+                                'short_side': 'v2',
+                                'short_pkt': int(p2.packet_num),
+                                'short_bits_len': len(p2.bits) if p2.bits is not None else 0,
+                                'short_bits': ''.join(str(int(x)) for x in p2.bits) if p2.bits is not None else '',
+                                'short_error_flag': p2.error_flag,
+                                'good_pkt': int(p1.packet_num),
+                                'good_bits_len': len(p1.bits) if p1.bits is not None else 0,
+                                'good_error_flag': p1.error_flag,
+                            }
+                            self.payload_short_log_by_channel[channel_idx].append(ev)
+                            total_short = self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_payload_short']
+                            if total_short <= 20:
+                                t = sample_idx / self.output_rate_hz
+                                print(
+                                    f'⚠️  payload_short ch{channel_idx} sample={sample_idx} t={t:.3f}s '
+                                    f'v2(short) pkt#{ev["short_pkt"]} bits={ev["short_bits_len"]} [{ev["short_bits"]}] | '
+                                    f'v1(good) pkt#{ev["good_pkt"]} bits={ev["good_bits_len"]}'
+                                )
                     elif v2 is not None:
                         values[s] = v2
                         quality[s] = 2
@@ -1621,9 +1681,32 @@ class TimeStampBasedReader:
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
                             self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
                             # print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} missing, p2 pkt#{p2.packet_num} valid")
+                        elif p1.error_flag:
+                            self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_error_suppressed'] += 1
                         else:
+                            # Genuinely short: p1 is valid, no error flag, but bits < 20
                             self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short'] += 1
-                            # print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} payload short, p2 pkt#{p2.packet_num} valid")
+                            ev = {
+                                'sample_idx': int(sample_idx),
+                                'ch': channel_idx,
+                                'short_side': 'v1',
+                                'short_pkt': int(p1.packet_num),
+                                'short_bits_len': len(p1.bits) if p1.bits is not None else 0,
+                                'short_bits': ''.join(str(int(x)) for x in p1.bits) if p1.bits is not None else '',
+                                'short_error_flag': p1.error_flag,
+                                'good_pkt': int(p2.packet_num),
+                                'good_bits_len': len(p2.bits) if p2.bits is not None else 0,
+                                'good_error_flag': p2.error_flag,
+                            }
+                            self.payload_short_log_by_channel[channel_idx].append(ev)
+                            total_short = self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short']
+                            if total_short <= 20:
+                                t = sample_idx / self.output_rate_hz
+                                print(
+                                    f'⚠️  payload_short ch{channel_idx} sample={sample_idx} t={t:.3f}s '
+                                    f'v1(short) pkt#{ev["short_pkt"]} bits={ev["short_bits_len"]} [{ev["short_bits"]}] | '
+                                    f'v2(good) pkt#{ev["good_pkt"]} bits={ev["good_bits_len"]}'
+                                )
                     else:
                         quality[s] = 0
                         # raw_ints[s] stays 0; will be overwritten by carry-forward in _append_gcs_group
@@ -1767,6 +1850,12 @@ class TimeStampBasedReader:
         self.bit_mismatch_events_by_channel = {
             ch: deque(maxlen=2000) for ch in range(1, 5)
         }
+        self.payload_short_log_by_channel = {
+            ch: deque(maxlen=500) for ch in range(1, 5)
+        }
+        self.valid_flag_bitcount_hist_by_channel = {
+            ch: Counter() for ch in range(1, 5)
+        }
         self.only_side_cause_counts_by_channel = {
             ch: Counter() for ch in range(1, 5)
         }
@@ -1895,6 +1984,7 @@ class TimeStampBasedReader:
         byteorder='little',
         matlab_scale=2048.0,
         matlab_select='first_row',
+        iq_plot_file=None,
     ):
         raw = np.fromfile(bin_path, dtype=dtype)
         print(len(raw), 'raw samples read from binary file.')
@@ -1905,8 +1995,47 @@ class TimeStampBasedReader:
             raw = raw.byteswap().newbyteorder()
 
         fmt = file_format.lower()
-        if fmt not in ('auto', 'word_stream', 'rx_x2_interleaved', 'matlab_float32_2xn'):
-            raise ValueError("file_format must be 'auto', 'word_stream', 'rx_x2_interleaved', or 'matlab_float32_2xn'")
+        if fmt not in ('auto', 'word_stream', 'rx_x2_interleaved', 'matlab_float32_2xn', 'gnuradio_cf32'):
+            raise ValueError("file_format must be 'auto', 'word_stream', 'rx_x2_interleaved', 'matlab_float32_2xn', or 'gnuradio_cf32'")
+
+        if fmt == 'gnuradio_cf32':
+            # Dual-channel BladeRF layout (float32): [RX0_I, RX0_Q, RX1_I, RX1_Q, ...]  stride-4.
+            # The decode word stream uses stride-2 (same behaviour as before IQ plotting was added).
+            # The IQ plot uses stride-4 per _extract_output_stream to correctly isolate each
+            # rx_channel's I and Q components.
+            float_raw = np.fromfile(bin_path, dtype=np.float32)
+            if float_raw.size < 2:
+                return self.decode_from_word_stream(np.array([], dtype=np.uint16), reset=reset)
+            usable = (float_raw.size // 4) * 4
+            float_raw = float_raw[:usable]
+            # ── Decode word stream (stride-2, unchanged) ───────────────────────────
+            i_float  = float_raw[0::2]
+            i_int16  = np.round(i_float * float(matlab_scale)).astype(np.int16)
+            words    = i_int16.view(np.uint16)
+            print(f'[file decode] gnuradio_cf32: {float_raw.size} float32 → '
+                  f'{len(i_float)} stride-2 samples → {len(words)} words (scale={matlab_scale})')
+            print(f'[file decode] I float range: '
+                  f'min={float(i_float.min()):.4f} max={float(i_float.max()):.4f} '
+                  f'mean={float(i_float.mean()):.4f}')
+            print(f'[file decode] word (int16) range: '
+                  f'min={int(i_int16.min())} max={int(i_int16.max())} '
+                  f'first8={i_int16[:8].tolist()}')
+            # ── IQ window data — stored for plot_channel to combine into one figure ──
+            if iq_plot_file is not None and self.debug_packet_window is not None:
+                iq_raw = np.fromfile(iq_plot_file, dtype=np.float32)
+                iq_usable = (iq_raw.size // 2) * 2
+                i_ch_float = iq_raw[:iq_usable][0::2]
+                q_ch_float = iq_raw[:iq_usable][1::2]
+                t_s = np.arange(len(i_ch_float)) / self.sample_rate
+                win_lo, win_hi = self.debug_packet_window
+                mask = (t_s >= win_lo) & (t_s <= win_hi)
+                self._iq_plot_data = (
+                    t_s[mask], i_ch_float[mask], q_ch_float[mask],
+                    win_lo, win_hi, os.path.basename(iq_plot_file),
+                )
+            else:
+                self._iq_plot_data = None
+            return self.decode_from_word_stream(words[0::80], reset=reset)
 
         if fmt == 'matlab_float32_2xn':
             float_raw = np.fromfile(bin_path, dtype=np.float32)
@@ -1943,6 +2072,11 @@ class TimeStampBasedReader:
             usable = (raw.size // 4) * 4
             interleaved = raw[:usable].astype(np.uint16, copy=False)
             words = self._extract_output_stream(interleaved)
+            print(f'[file decode] rx_x2_interleaved: {raw.size} raw uint16 → {len(words)} words '
+                  f'(offset={self.rx_channel * 2 + (self.device_num - 1)}, stride=4)')
+            print(f'[file decode] word range: min={int(words.min())} max={int(words.max())} '
+                  f'mean={float(words.astype(np.int16).mean()):.1f} '
+                  f'first8={words[:8].astype(np.int16).tolist()}')
             return self.decode_from_word_stream(words, reset=reset)
 
         # auto: if divisible by 4, assume raw BladeRF RX_X2 dump; otherwise direct word stream
@@ -1962,6 +2096,7 @@ class TimeStampBasedReader:
         bin_file_format='auto',
         matlab_scale=2048.0,
         matlab_select='first_row',
+        iq_plot_file=None,
     ):
         lower = input_path.lower()
         if lower.endswith('.mat'):
@@ -1973,6 +2108,7 @@ class TimeStampBasedReader:
                 file_format=bin_file_format,
                 matlab_scale=matlab_scale,
                 matlab_select=matlab_select,
+                iq_plot_file=iq_plot_file,
             )
         if lower.endswith('.npy'):
             words = np.load(input_path)
@@ -2015,7 +2151,7 @@ class TimeStampBasedReader:
         # qual=1/2/5/6 (partial/mismatch) are kept if the jump from the last qual=3
         # value is within 300 uV; otherwise replaced with carry-forward.
         # qual=0 (no packet / NaN) are always replaced with carry-forward.
-        _SPIKE_THRESHOLD = 300e-6  # volts — max allowed jump from last qual=3 value
+        _SPIKE_THRESHOLD = 2e-3  # volts — max allowed jump from last qual=3 value
         _PARTIAL_QUALS = (1, 2, 5, 6)
         carry = np.nan
         for i in range(len(series)):
@@ -2130,12 +2266,42 @@ class TimeStampBasedReader:
             print('  One-sided decode causes:')
             c1 = int(causes.get('only_v1_v2_packet_missing', 0))
             c2 = int(causes.get('only_v1_v2_payload_short', 0))
+            c2e = int(causes.get('only_v1_v2_error_suppressed', 0))
             c3 = int(causes.get('only_v2_v1_packet_missing', 0))
             c4 = int(causes.get('only_v2_v1_payload_short', 0))
-            print(f'    only_v1 <- v2 packet missing: {c1:6d} ({100*c1/max(one_sided_total,1):5.1f}% of one-sided)')
-            print(f'    only_v1 <- v2 payload short : {c2:6d} ({100*c2/max(one_sided_total,1):5.1f}% of one-sided)')
-            print(f'    only_v2 <- v1 packet missing: {c3:6d} ({100*c3/max(one_sided_total,1):5.1f}% of one-sided)')
-            print(f'    only_v2 <- v1 payload short : {c4:6d} ({100*c4/max(one_sided_total,1):5.1f}% of one-sided)')
+            c4e = int(causes.get('only_v2_v1_error_suppressed', 0))
+            print(f'    only_v1 <- v2 packet missing  : {c1:6d} ({100*c1/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v1 <- v2 error suppressed: {c2e:6d} ({100*c2e/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v1 <- v2 payload short   : {c2:6d} ({100*c2/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v2 <- v1 packet missing  : {c3:6d} ({100*c3/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v2 <- v1 error suppressed: {c4e:6d} ({100*c4e/max(one_sided_total,1):5.1f}% of one-sided)')
+            print(f'    only_v2 <- v1 payload short   : {c4:6d} ({100*c4/max(one_sided_total,1):5.1f}% of one-sided)')
+            short_events = list(self.payload_short_log_by_channel[idx])
+            if short_events:
+                print(f'\n  Payload-short events (up to 20 of {len(short_events)} logged):')
+                print(f'    {"#":>4}  {"ch":>2}  {"side":>4}  {"pkt":>3}  {"bits":>4}  {"err":>5}  {"t(s)":>8}  bit_pattern')
+                for i, ev in enumerate(short_events[:20], 1):
+                    t = ev['sample_idx'] / self.output_rate_hz
+                    good_side = 'v2' if ev['short_side'] == 'v1' else 'v1'
+                    print(
+                        f'    {i:>4}  ch{ev["ch"]}  {ev["short_side"]:>4}  '
+                        f'#{ev["short_pkt"]:>1}  {ev["short_bits_len"]:>4}  {str(ev["short_error_flag"]):>5}  {t:>8.3f}  '
+                        f'[{ev["short_bits"]}]  ({good_side} pkt#{ev["good_pkt"]} bits={ev["good_bits_len"]} err={ev["good_error_flag"]})'
+                    )
+
+            hist = self.valid_flag_bitcount_hist_by_channel[idx]
+            if hist:
+                total_pkts = sum(hist.values())
+                expected = self.bits_per_channel // 2
+                off_count = sum(cnt for bits, cnt in hist.items() if bits != expected)
+                print(f'\n  Valid-flag bit-count histogram (ch{idx}, expected={expected}, total packets={total_pkts}):')
+                for bits in sorted(hist):
+                    cnt = hist[bits]
+                    bar = '█' * min(40, int(40 * cnt / total_pkts))
+                    marker = ' ← expected' if bits == expected else (' ← SHORT (<20, payload lost)' if bits < 20 else ' ← EXCESS')
+                    print(f'    bits={bits:3d}: {cnt:7d} ({100*cnt/total_pkts:5.1f}%) {bar}{marker}')
+                if off_count:
+                    print(f'    {off_count} packets ({100*off_count/total_pkts:.1f}%) had bit count != {expected}')
 
             miss_hist = self.only_side_missing_packetnum_by_channel[idx]
             miss_for_only_v1 = miss_hist['for_only_v1']
@@ -2333,23 +2499,45 @@ class TimeStampBasedReader:
         base_quality_series = quality_series & np.int8(0x07)
         err_mask = (quality_series & np.int8(0x08)) != 0
 
-        fig, ax = plt.subplots(figsize=(14, 4))
+        iq_data = getattr(self, '_iq_plot_data', None)
+        if iq_data is not None:
+            iq_t, iq_i, iq_q, win_lo, win_hi, iq_name = iq_data
+            fig, (ax, ax_i, ax_q) = plt.subplots(3, 1, sharex=True,
+                                                  figsize=(14, 8),
+                                                  gridspec_kw={'height_ratios': [2, 1, 1]})
+            ax.set_xlim(win_lo, win_hi)
+        else:
+            fig, ax = plt.subplots(figsize=(14, 4))
+            ax_i = ax_q = None
+
         for q, (color, label) in QUAL_STYLE.items():
             mask = base_quality_series == q
             if not np.any(mask):
                 continue
             ax.scatter(t[mask], series[mask], c=color, label=label,
-                       s=10, linewidths=0, alpha=0.7, zorder=2 if q == 3 else 3)
+                       s=30, linewidths=0, alpha=0.7, zorder=2 if q == 3 else 3)
         if np.any(err_mask):
             ax.scatter(t[err_mask], series[err_mask], marker='x', c='black',
-                       s=20, linewidths=0.8, alpha=0.8, zorder=4, label='error_flag')
+                       s=30, linewidths=0.8, alpha=0.8, zorder=4, label='error_flag')
         ax.axhline( 300e-6, color='gray', linewidth=0.8, linestyle='--', alpha=0.6, label='±300 µV')
         ax.axhline(-300e-6, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
         ax.set_title(f'Time series – Channel {idx}')
-        ax.set_xlabel('Time (s)')
         ax.set_ylabel('Amplitude (V)')
         ax.legend(loc='upper right', markerscale=3, fontsize=9)
         ax.grid(True, alpha=0.4)
+
+        if ax_i is not None:
+            ax_i.plot(iq_t, iq_i, linewidth=0.4, color='steelblue')
+            ax_i.set_ylabel('I')
+            ax_i.set_title(f'Raw I/Q — {iq_name}')
+            ax_i.grid(True, linewidth=0.3)
+            ax_q.plot(iq_t, iq_q, linewidth=0.4, color='darkorange')
+            ax_q.set_ylabel('Q')
+            ax_q.set_xlabel('Time (s)')
+            ax_q.grid(True, linewidth=0.3)
+        else:
+            ax.set_xlabel('Time (s)')
+
         fig.tight_layout()
         print(max(series), min(series))
 
@@ -2530,5 +2718,13 @@ if __name__ == '__main__':
     #     matlab_scale=2048.0,
     #     matlab_select='first_row',
     # )
+    # reader.debug_packet_window = (9.5,10)
+    # reader.decode_from_file(
+    #     '/home/joannas/8MHz_datareadout.bin',
+    #     bin_file_format='gnuradio_cf32',
+    #     matlab_scale=2048.0,
+    #     iq_plot_file="/home/joannas/8MHz_antennaraw.bin",
+    # )
+    # reader.debug_packet_window = None
     # reader.print_stats()
     # reader.plot_channel(3)
