@@ -14,5 +14,5 @@
     "active_board": "1",
     "device2_board": null,
     "dual_rx_antenna": false,
-    "rbf_file": "/home/ueeg/ueeg-pi/SingleDeviceSingleAntennaNoOverflow-04-21_18.15.59/RMSxA4.rbf"
+    "rbf_file": "/home/ueeg/ueeg-pi/SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf"
 }

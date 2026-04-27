@@ -1,0 +1,20 @@
+Fitter Status : Successful - Mon Apr 27 02:05:09 2026
+Quartus Prime Version : 20.1.1 Build 720 11/11/2020 SJ Lite Edition
+Revision Name : RMS
+Top-level Entity Name : bladerf
+Family : Cyclone V
+Device : 5CEBA4F23C8
+Timing Models : Final
+Logic utilization (in ALMs) : 9,647 / 18,480 ( 52 % )
+Total registers : 17852
+Total pins : 173 / 224 ( 77 % )
+Total virtual pins : 0
+Total block memory bits : 2,261,407 / 3,153,920 ( 72 % )
+Total RAM Blocks : 308 / 308 ( 100 % )
+Total DSP Blocks : 23 / 66 ( 35 % )
+Total HSSI RX PCSs : 0
+Total HSSI PMA RX Deserializers : 0
+Total HSSI TX PCSs : 0
+Total HSSI PMA TX Serializers : 0
+Total PLLs : 3 / 4 ( 75 % )
+Total DLLs : 0 / 4 ( 0 % )
