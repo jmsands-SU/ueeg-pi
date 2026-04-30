@@ -126,6 +126,22 @@
             return `${API_BASE_URL}?bucket=${bucket}&blob=${blob}${extraParams}`;
         }
 
+        function computeQualityStatsFromArray(qualityArr) {
+            if (!qualityArr || qualityArr.length === 0) return null;
+            const counts = new Array(16).fill(0);
+            for (const q of qualityArr) if (q >= 0 && q < 16) counts[q]++;
+            const c = code => counts[code];
+            const errTotal = c(8)+c(9)+c(10)+c(11)+c(13)+c(14);
+            return {
+                total_samples: qualityArr.length,
+                missed_packet: c(0), v1_only: c(1), v2_only: c(2), matched: c(3),
+                mismatch_v1: c(5), mismatch_v2: c(6),
+                error_missed: c(8), error_v1_only: c(9), error_v2_only: c(10),
+                error_matched: c(11), error_mismatch_v1: c(13), error_mismatch_v2: c(14),
+                error_flagged_total: errTotal,
+            };
+        }
+
         // --- Core Application Functions ---
         async function analyzeFile() {
             const bucket = document.getElementById('bucketName').value.trim();
@@ -186,6 +202,8 @@
                 }
                 if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
                 await plotData(datasets, `Last ${timeValue} ${unitText} of Recording`);
+                const recentStatsEntries = datasets.filter(d => d.segmentQuality).map(d => ({ stats: computeQualityStatsFromArray(d.segmentQuality), label: d.label })).filter(e => e.stats);
+                if (recentStatsEntries.length) displayQualityStats(recentStatsEntries);
                 if (warnings.length) statusDiv.textContent += ` (warnings: ${warnings.join('; ')})`;
             } catch(error) { console.error("Error loading recent time:", error); statusDiv.textContent = `Error: ${error.message}`; }
         }
@@ -220,6 +238,8 @@
                 }
                 if (datasets.length === 0) throw new Error(warnings.join('; ') || 'No data loaded');
                 await plotData(datasets, `Time Range: ${startTime}-${endTime} ${unitText}`);
+                const rangeStatsEntries = datasets.filter(d => d.segmentQuality).map(d => ({ stats: computeQualityStatsFromArray(d.segmentQuality), label: d.label })).filter(e => e.stats);
+                if (rangeStatsEntries.length) displayQualityStats(rangeStatsEntries);
                 if (warnings.length) statusDiv.textContent += ` (warnings: ${warnings.join('; ')})`;
             } catch(error) { console.error("Error loading time range:", error); statusDiv.textContent = `Error: ${error.message}`; }
         }
@@ -290,19 +310,21 @@
         function resetUI() { Plotly.purge(timePlotDiv); Plotly.purge(qualityPlotDiv); Plotly.purge(fftPlotDiv); segmentContainer.style.display = 'none'; segmentDropdown.innerHTML = ''; qualityStatsContainer.style.display = 'none'; qualityStatsBody.innerHTML = ''; fftControlsContainer.style.display = 'none'; fftFreqMinInput.value = ''; fftFreqMaxInput.value = ''; statusDiv.textContent = "Enter a blob name and choose an action."; }
 
         // Quality code definitions (bits 2:0 = base code, bit 3 = error flag)
+        // q=3 always means both copies matched (error flags never appear on matched samples).
+        // Error flag (bit 3) only appears on mismatched or single-sided samples where
+        // error flags guided which copy was used.
         const QUALITY_CATS = [
-            { code: 0,  label: 'Missed',           color: '#e74c3c', symbol: 'x' },
-            { code: 1,  label: 'v1 only',           color: '#e67e22', symbol: 'circle' },
-            { code: 2,  label: 'v2 only',           color: '#f1c40f', symbol: 'circle' },
-            { code: 3,  label: 'Matched',           color: '#2ecc71', symbol: 'circle' },
-            { code: 5,  label: 'Mismatch→v1',       color: '#3498db', symbol: 'diamond' },
-            { code: 6,  label: 'Mismatch→v2',       color: '#9b59b6', symbol: 'diamond' },
-            { code: 8,  label: 'Err: missed',       color: '#c0392b', symbol: 'x' },
-            { code: 9,  label: 'Err: v1 (v2 bad)',  color: '#d35400', symbol: 'triangle-up' },
-            { code: 10, label: 'Err: v2 (v1 bad)',  color: '#b7950b', symbol: 'triangle-up' },
-            { code: 11, label: 'Err: matched',      color: '#1a6b3c', symbol: 'triangle-up' },
-            { code: 13, label: 'Err: mismatch→v1',  color: '#1a5276', symbol: 'triangle-up' },
-            { code: 14, label: 'Err: mismatch→v2',  color: '#6c3483', symbol: 'triangle-up' },
+            { code: 0,  label: 'Missed',                      color: '#e74c3c', symbol: 'x' },
+            { code: 1,  label: 'v1 only',                     color: '#e67e22', symbol: 'circle' },
+            { code: 2,  label: 'v2 only',                     color: '#f1c40f', symbol: 'circle' },
+            { code: 3,  label: 'Matched',                     color: '#2ecc71', symbol: 'circle' },
+            { code: 5,  label: 'Mismatch→v1',                 color: '#3498db', symbol: 'diamond' },
+            { code: 6,  label: 'Mismatch→v2',                 color: '#9b59b6', symbol: 'diamond' },
+            { code: 8,  label: 'Err: missed',                 color: '#c0392b', symbol: 'x' },
+            { code: 9,  label: 'Err: mismatch, v2 bad→v1',   color: '#d35400', symbol: 'triangle-up' },
+            { code: 10, label: 'Err: mismatch, v1 bad→v2',   color: '#b7950b', symbol: 'triangle-up' },
+            { code: 13, label: 'Err: mismatch→v1 (both err)', color: '#1a5276', symbol: 'triangle-up' },
+            { code: 14, label: 'Err: mismatch→v2 (both err)', color: '#6c3483', symbol: 'triangle-up' },
         ];
 
         function buildQualityScatterTraces(time_axis, qualityArr) {

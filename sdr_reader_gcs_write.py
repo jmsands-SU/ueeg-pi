@@ -121,6 +121,8 @@ class TimeStampBasedReader:
         self.gcs_samples_written = 0
         # Per-channel last-good value for NaN carry-forward (shape (4,) per channel)
         self._gcs_last_good_values = {ch: np.zeros(4, dtype=np.int32) for ch in range(1, 5)}
+        self._carry_forward_log_count = 0
+        self._carry_forward_log_max = 50
 
         self.frame_length = int(frame_length)
         if accepted_frame_lengths is None:
@@ -371,6 +373,7 @@ class TimeStampBasedReader:
             self.gcs_timestamp_log = []
             self._gcs_recording_start_time = time.time()
             self._gcs_last_good_values = {ch: np.zeros(4, dtype=np.int32) for ch in range(1, 5)}
+            self._carry_forward_log_count = 0
         # Update blob/temp names from trigger message if blob was updated
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         print(f'GCS recording started (session={self.gcs_session_id}, blob={self.gcs_blob_name}).')
@@ -498,6 +501,12 @@ class TimeStampBasedReader:
                     last[s] = np.int32(r)
                 else:
                     r = int(last[s])  # carry-forward (0 at very start)
+                    if self._carry_forward_log_count < self._carry_forward_log_max:
+                        self._carry_forward_log_count += 1
+                        _cf_float = r / (1 << 12) * self.decode_scale
+                        print(f'[carry-fwd #{self._carry_forward_log_count}] GCS write ch{ch} slot{s} q={q:#04x}: repeating raw={r} ({_cf_float:.6f})')
+                        if self._carry_forward_log_count == self._carry_forward_log_max:
+                            print(f'[carry-fwd] log limit ({self._carry_forward_log_max}) reached, suppressing further carry-forward logs')
                 vals_row.append(np.int32(r))
                 packed_quality = np.uint16(packed_quality | ((q & 0xF) << (4 * ch_idx)))
             rows_to_add.append((np.asarray(vals_row, dtype=np.int32), packed_quality))
@@ -1424,7 +1433,7 @@ class TimeStampBasedReader:
                         self.gap_estimate_disagree_count += 1
 
             # Packet-level error flag: any valid word across all 4 channels has error set.
-            # valid+error window per ch cancels the -4 offset, giving [start_idx : start_idx + 4*bpc].
+            # valid+error window per ch cancels the -2 offset, giving [start_idx : start_idx + 4*bpc].
             _pkt_err_end = start_idx + 4 * self.bits_per_channel
             if start_idx >= 0 and _pkt_err_end <= len(error_flag_arr):
                 _all_valid = valid_flag[start_idx:_pkt_err_end]
@@ -1435,7 +1444,7 @@ class TimeStampBasedReader:
 
             for ch in range(1, 5):
                 channel_offset = (ch - 1) * self.bits_per_channel
-                ch_start = start_idx + channel_offset -4
+                ch_start = start_idx + channel_offset -2
                 ch_end = ch_start + self.bits_per_channel
                 if ch_start < 0 or ch_end+5 > len(packet_nums_raw):
                     packets_by_channel[ch].append(
@@ -1445,7 +1454,7 @@ class TimeStampBasedReader:
                     continue
 
                 bits_block = data_bit[ch_start:ch_end]
-                valid_block = valid_flag[ch_start+4:ch_end+4]
+                valid_block = valid_flag[ch_start+2:ch_end+2]
                 if sum(valid_block) != 20:
                     print(ch,valid_block, len(valid_block), sum(valid_block))
                     print(bits_block)
@@ -1623,94 +1632,116 @@ class TimeStampBasedReader:
                                 f'bits={len(p2.bits) if p2.bits is not None else 0} raw={r2} [{_b2}]'
                             )
 
-                    error_occurred[s] = p1.error_flag or p2.error_flag
-                    if p1.error_flag and not p2.error_flag and v2 is not None:
-                        v1, r1 = None, None
-                    elif p2.error_flag and not p1.error_flag and v1 is not None:
-                        v2, r2 = None, None
+                    # Match check first — error flags don't matter if both copies agree.
+                    # q=3 always means the received data matched, regardless of error flags.
+                    if v1 is not None and v2 is not None and r1 == r2:
+                        values[s] = v1
+                        quality[s] = 3
+                        raw_ints[s] = r1
+                        # error_occurred stays False — no error bit for matched samples
+                        if p1.error_flag and p2.error_flag:
+                            self.only_side_cause_counts_by_channel[channel_idx]['both_error_matched'] += 1
+                        elif p1.error_flag != p2.error_flag:
+                            self.only_side_cause_counts_by_channel[channel_idx]['error_flag_mismatch_data_matched'] += 1
+                    else:
+                        # Not a match (mismatch or one/both sides missing).
+                        # Use error flags to prefer the clean copy when there is one.
+                        error_occurred[s] = p1.error_flag or p2.error_flag
+                        if p1.error_flag and not p2.error_flag and v2 is not None:
+                            v1, r1 = None, None
+                        elif p2.error_flag and not p1.error_flag and v1 is not None:
+                            v2, r2 = None, None
 
-                    if v1 is not None and v2 is not None:
-                        if r1 == r2:
-                            values[s] = v1
-                            quality[s] = 3
-                            raw_ints[s] = r1
-                        else:
+                        if v1 is not None and v2 is not None:
+                            # Mismatch with no clear error-flag preference (both or neither errored)
                             mismatch_v1[s] = float(v1)
                             mismatch_v2[s] = float(v2)
                             mismatch_r1[s] = r1
                             mismatch_r2[s] = r2
                             mismatch_pending[s] = True
-                    elif v1 is not None:
-                        values[s] = v1
-                        quality[s] = 1
-                        raw_ints[s] = r1
-                        if not p2.is_valid:
-                            self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_packet_missing'] += 1
-                            self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v1'][int(p2.packet_num) % 8] += 1
-                        elif p2.error_flag:
-                            self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_error_suppressed'] += 1
+                        elif v1 is not None:
+                            values[s] = v1
+                            quality[s] = 1
+                            raw_ints[s] = r1
+                            if not p2.is_valid:
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_packet_missing'] += 1
+                                self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v1'][int(p2.packet_num) % 8] += 1
+                            elif p2.error_flag:
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_error_suppressed'] += 1
+                            else:
+                                # Genuinely short: p2 is valid, no error flag, but bits < 20
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_payload_short'] += 1
+                                ev = {
+                                    'sample_idx': int(sample_idx),
+                                    'ch': channel_idx,
+                                    'short_side': 'v2',
+                                    'short_pkt': int(p2.packet_num),
+                                    'short_bits_len': len(p2.bits) if p2.bits is not None else 0,
+                                    'short_bits': ''.join(str(int(x)) for x in p2.bits) if p2.bits is not None else '',
+                                    'short_error_flag': p2.error_flag,
+                                    'good_pkt': int(p1.packet_num),
+                                    'good_bits_len': len(p1.bits) if p1.bits is not None else 0,
+                                    'good_error_flag': p1.error_flag,
+                                }
+                                self.payload_short_log_by_channel[channel_idx].append(ev)
+                                total_short = self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_payload_short']
+                                if total_short <= 20:
+                                    t = sample_idx / self.output_rate_hz
+                                    print(
+                                        f'⚠️  payload_short ch{channel_idx} sample={sample_idx} t={t:.3f}s '
+                                        f'v2(short) pkt#{ev["short_pkt"]} bits={ev["short_bits_len"]} [{ev["short_bits"]}] | '
+                                        f'v1(good) pkt#{ev["good_pkt"]} bits={ev["good_bits_len"]}'
+                                    )
+                        elif v2 is not None:
+                            values[s] = v2
+                            quality[s] = 2
+                            raw_ints[s] = r2
+                            if not p1.is_valid:
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
+                                self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
+                            elif p1.error_flag:
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_error_suppressed'] += 1
+                            else:
+                                # Genuinely short: p1 is valid, no error flag, but bits < 20
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short'] += 1
+                                ev = {
+                                    'sample_idx': int(sample_idx),
+                                    'ch': channel_idx,
+                                    'short_side': 'v1',
+                                    'short_pkt': int(p1.packet_num),
+                                    'short_bits_len': len(p1.bits) if p1.bits is not None else 0,
+                                    'short_bits': ''.join(str(int(x)) for x in p1.bits) if p1.bits is not None else '',
+                                    'short_error_flag': p1.error_flag,
+                                    'good_pkt': int(p2.packet_num),
+                                    'good_bits_len': len(p2.bits) if p2.bits is not None else 0,
+                                    'good_error_flag': p2.error_flag,
+                                }
+                                self.payload_short_log_by_channel[channel_idx].append(ev)
+                                total_short = self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short']
+                                if total_short <= 20:
+                                    t = sample_idx / self.output_rate_hz
+                                    print(
+                                        f'⚠️  payload_short ch{channel_idx} sample={sample_idx} t={t:.3f}s '
+                                        f'v1(short) pkt#{ev["short_pkt"]} bits={ev["short_bits_len"]} [{ev["short_bits"]}] | '
+                                        f'v2(good) pkt#{ev["good_pkt"]} bits={ev["good_bits_len"]}'
+                                    )
                         else:
-                            # Genuinely short: p2 is valid, no error flag, but bits < 20
-                            self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_payload_short'] += 1
-                            ev = {
-                                'sample_idx': int(sample_idx),
-                                'ch': channel_idx,
-                                'short_side': 'v2',
-                                'short_pkt': int(p2.packet_num),
-                                'short_bits_len': len(p2.bits) if p2.bits is not None else 0,
-                                'short_bits': ''.join(str(int(x)) for x in p2.bits) if p2.bits is not None else '',
-                                'short_error_flag': p2.error_flag,
-                                'good_pkt': int(p1.packet_num),
-                                'good_bits_len': len(p1.bits) if p1.bits is not None else 0,
-                                'good_error_flag': p1.error_flag,
-                            }
-                            self.payload_short_log_by_channel[channel_idx].append(ev)
-                            total_short = self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_payload_short']
-                            if total_short <= 20:
-                                t = sample_idx / self.output_rate_hz
-                                print(
-                                    f'⚠️  payload_short ch{channel_idx} sample={sample_idx} t={t:.3f}s '
-                                    f'v2(short) pkt#{ev["short_pkt"]} bits={ev["short_bits_len"]} [{ev["short_bits"]}] | '
-                                    f'v1(good) pkt#{ev["good_pkt"]} bits={ev["good_bits_len"]}'
-                                )
-                    elif v2 is not None:
-                        values[s] = v2
-                        quality[s] = 2
-                        raw_ints[s] = r2
-                        if not p1.is_valid:
-                            self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
-                            self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
-                            # print(f"  only_v2 ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} missing, p2 pkt#{p2.packet_num} valid")
-                        elif p1.error_flag:
-                            self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_error_suppressed'] += 1
-                        else:
-                            # Genuinely short: p1 is valid, no error flag, but bits < 20
-                            self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short'] += 1
-                            ev = {
-                                'sample_idx': int(sample_idx),
-                                'ch': channel_idx,
-                                'short_side': 'v1',
-                                'short_pkt': int(p1.packet_num),
-                                'short_bits_len': len(p1.bits) if p1.bits is not None else 0,
-                                'short_bits': ''.join(str(int(x)) for x in p1.bits) if p1.bits is not None else '',
-                                'short_error_flag': p1.error_flag,
-                                'good_pkt': int(p2.packet_num),
-                                'good_bits_len': len(p2.bits) if p2.bits is not None else 0,
-                                'good_error_flag': p2.error_flag,
-                            }
-                            self.payload_short_log_by_channel[channel_idx].append(ev)
-                            total_short = self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short']
-                            if total_short <= 20:
-                                t = sample_idx / self.output_rate_hz
-                                print(
-                                    f'⚠️  payload_short ch{channel_idx} sample={sample_idx} t={t:.3f}s '
-                                    f'v1(short) pkt#{ev["short_pkt"]} bits={ev["short_bits_len"]} [{ev["short_bits"]}] | '
-                                    f'v2(good) pkt#{ev["good_pkt"]} bits={ev["good_bits_len"]}'
-                                )
-                    else:
-                        quality[s] = 0
-                        # raw_ints[s] stays 0; will be overwritten by carry-forward in _append_gcs_group
-                        # print(f"  no_packet ch{channel_idx} sample_idx={sample_idx} @ t={sample_idx/self.output_rate_hz:.3f}s: p1 pkt#{p1.packet_num} valid={p1.is_valid}, p2 pkt#{p2.packet_num} valid={p2.is_valid}")
+                            quality[s] = 0
+                            # raw_ints[s] stays 0; will be overwritten by carry-forward in _append_gcs_group
+                        if self._carry_forward_log_count < self._carry_forward_log_max:
+                            self._carry_forward_log_count += 1
+                            _r1_attempt = self._decode_raw_int_from_packet_bits(p1.bits) if p1.bits is not None and len(p1.bits) >= 20 else None
+                            _r2_attempt = self._decode_raw_int_from_packet_bits(p2.bits) if p2.bits is not None and len(p2.bits) >= 20 else None
+                            print(
+                                f'[carry-fwd #{self._carry_forward_log_count}] ch{channel_idx} slot{s} '
+                                f'idx={sample_idx} t={sample_idx/self.output_rate_hz:.3f}s → both copies invalid, carry-forward will be used. '
+                                f'v1: pkt#{p1.packet_num} valid={p1.is_valid} err={p1.error_flag} '
+                                f'bits={len(p1.bits) if p1.bits is not None else 0} raw_attempt={_r1_attempt} | '
+                                f'v2: pkt#{p2.packet_num} valid={p2.is_valid} err={p2.error_flag} '
+                                f'bits={len(p2.bits) if p2.bits is not None else 0} raw_attempt={_r2_attempt}'
+                            )
+                            if self._carry_forward_log_count == self._carry_forward_log_max:
+                                print(f'[carry-fwd] log limit ({self._carry_forward_log_max}) reached, suppressing further carry-forward logs')
 
                 prev_neighbor = None
                 if len(self.decoded_groups_by_channel[channel_idx]) > 0:
@@ -2151,20 +2182,22 @@ class TimeStampBasedReader:
         # qual=1/2/5/6 (partial/mismatch) are kept if the jump from the last qual=3
         # value is within 300 uV; otherwise replaced with carry-forward.
         # qual=0 (no packet / NaN) are always replaced with carry-forward.
-        _SPIKE_THRESHOLD = 2e-3  # volts — max allowed jump from last qual=3 value
+        # The error flag (bit 3) is stripped before the decision so that 9/10/11/13/14
+        # are treated the same as their non-error counterparts (1/2/3/5/6).
+        _SPIKE_THRESHOLD = 10e-3  # volts — max allowed jump from last qual=3 value
         _PARTIAL_QUALS = (1, 2, 5, 6)
         carry = np.nan
         for i in range(len(series)):
-            q = int(quality_series[i])
-            if q == 3:
+            base_q = int(quality_series[i]) & 0x07  # strip error flag
+            if base_q == 3:
                 carry = series[i]
-            elif q in _PARTIAL_QUALS:
+            elif base_q in _PARTIAL_QUALS:
                 v = series[i]
                 if np.isnan(v) or (not np.isnan(carry) and abs(v - carry) > _SPIKE_THRESHOLD):
                     series[i] = carry
                 # else: plausible value, leave it; carry stays at last qual=3
             else:
-                # qual=0 — carry-forward
+                # base_q == 0: no packet — carry-forward
                 series[i] = carry
 
         # MATLAB parity: subtract mean before visualization/spectral analysis
@@ -2235,6 +2268,10 @@ class TimeStampBasedReader:
             print(f'    v2 errored → used v1 only:  {err_v2_errored:6d}')
             print(f'    v1 errored → used v2 only:  {err_v1_errored:6d}')
             print(f'    both/no-fallback errored:   {err_other:6d}')
+            both_err_matched = int(self.only_side_cause_counts_by_channel[idx].get('both_error_matched', 0))
+            print(f'    both errored but matched:   {both_err_matched:6d}')
+            flag_mismatch_data_matched = int(self.only_side_cause_counts_by_channel[idx].get('error_flag_mismatch_data_matched', 0))
+            print(f'    flag mismatch but data matched: {flag_mismatch_data_matched:6d}')
         print(f'  Packet drops (resync off):   {self.resync_drops_by_channel[idx]:6d}')
         print(f'  Sequence anomalies:          {self.packet_sequence_anomaly_count:6d}')
         print(f'  Header anomaly drops:        {self.packet_sequence_header_drops:6d}')
@@ -2668,10 +2705,10 @@ if __name__ == '__main__':
         accepted_frame_lengths=(248, 250),
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
-        channel_to_decode=3,
+        channel_to_decode=1,
         gcs_bucket="ueegbucket",
         gcs_buffer_size=400,
-        gcs_channels=[2, 3],
+        gcs_channels=[1,2, 3],
         gcs_format='binary',
         enable_gcs_trigger=True,
         enable_gcs=True,
