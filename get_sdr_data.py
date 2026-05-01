@@ -40,20 +40,36 @@ def _parse_dtype_from_meta(metadata):
         return None
 
 def calculate_quality_stats(flags_array):
-    """Counts occurrences of each quality flag value and returns a summary."""
+    """Counts occurrences of each quality flag value and returns a summary.
+    Bit 3 (0x08) is the error flag; bits 2:0 are the base quality code.
+    """
     if flags_array is None or len(flags_array) == 0:
         return None
-    counts = np.bincount(flags_array.astype(int))
-    total_samples = len(flags_array)
+    arr = flags_array.astype(int)
+    counts = np.bincount(arr, minlength=16)
+    def c(code): return int(counts[code]) if code < len(counts) else 0
+    total_samples = len(arr)
     stats = {
         "total_samples": total_samples,
-        "missed_packet": int(counts[0]) if len(counts) > 0 else 0,
-        "v1_only": int(counts[1]) if len(counts) > 1 else 0,
-        "v2_only": int(counts[2]) if len(counts) > 2 else 0,
-        "matched": int(counts[3]) if len(counts) > 3 else 0,
-        "mismatch_v1": int(counts[5]) if len(counts) > 5 else 0,
-        "mismatch_v2": int(counts[6]) if len(counts) > 6 else 0
+        # base quality codes (no error flag)
+        "missed_packet": c(0),
+        "v1_only":       c(1),
+        "v2_only":       c(2),
+        "matched":       c(3),
+        "mismatch_v1":   c(5),
+        "mismatch_v2":   c(6),
+        # error-flagged variants (bit 3 set: base code | 0x08)
+        "error_missed":     c(8),
+        "error_v1_only":    c(9),   # v2 had error, v1 used
+        "error_v2_only":    c(10),  # v1 had error, v2 used
+        "error_matched":    c(11),
+        "error_mismatch_v1": c(13),
+        "error_mismatch_v2": c(14),
     }
+    stats["error_flagged_total"] = sum(stats[k] for k in (
+        "error_missed", "error_v1_only", "error_v2_only",
+        "error_matched", "error_mismatch_v1", "error_mismatch_v2"
+    ))
     return stats
 
 def find_all_clean_runs(mask):
@@ -262,13 +278,24 @@ def _correct_spike_samples(values_np, quality_packed_np, correct_receiver=True,
     return values.astype(np.float32), n_corrected
 
 
-def _apply_lowpass_filter(data_array, fs, corner_hz=30.0, order=4):
-    """Applies a zero-phase low-pass filter to the data."""
-    if data_array.ndim == 1: data_array = data_array.reshape(-1, 1)
+def _apply_bandpass_filter(data_array, fs, low_hz=None, high_hz=None, order=4):
+    """Applies a zero-phase Butterworth filter: bandpass, lowpass, or highpass depending on which corners are given."""
+    if data_array.ndim == 1:
+        data_array = data_array.reshape(-1, 1)
     if len(data_array) <= order * 3:
         print(f"WARNING: Data length ({len(data_array)}) is too short for filter. Returning original data.")
         return data_array
-    b, a = signal.butter(order, corner_hz / (0.5 * fs), btype='low', analog=False)
+    nyq = 0.5 * fs
+    has_low = low_hz is not None and low_hz > 0
+    has_high = high_hz is not None and 0 < high_hz < nyq
+    if has_low and has_high:
+        b, a = signal.butter(order, [low_hz / nyq, high_hz / nyq], btype='bandpass', analog=False)
+    elif has_high:
+        b, a = signal.butter(order, high_hz / nyq, btype='low', analog=False)
+    elif has_low:
+        b, a = signal.butter(order, low_hz / nyq, btype='high', analog=False)
+    else:
+        return data_array
     return signal.filtfilt(b, a, data_array, axis=0)
 
 def get_sdr_data(request):
@@ -280,8 +307,15 @@ def get_sdr_data(request):
     request_args = request.args
     bucket_name = request_args.get("bucket")
     blob_name = request_args.get("blob")
-    apply_lp_filter = request_args.get("apply_lp_filter") == 'true'
     correct_spikes  = request_args.get("correct_spikes") == 'true'
+    bp_low_hz_str  = request_args.get("bp_low_hz")
+    bp_high_hz_str = request_args.get("bp_high_hz")
+    bp_low_hz  = float(bp_low_hz_str)  if bp_low_hz_str  else None
+    bp_high_hz = float(bp_high_hz_str) if bp_high_hz_str else None
+    # legacy: apply_lp_filter=true → 30 Hz lowpass
+    if request_args.get("apply_lp_filter") == 'true' and bp_high_hz is None:
+        bp_high_hz = 30.0
+    apply_filter = bp_low_hz is not None or bp_high_hz is not None
     
     if not bucket_name or not blob_name:
         return (json.dumps({"error": "Missing 'bucket' or 'blob' parameters."}), 400, headers)
@@ -328,26 +362,52 @@ def get_sdr_data(request):
             data_slice = np.frombuffer(raw_bytes, dtype=dtype)
             
             segment_data_np = _raw_values_to_float(data_slice['values'], metadata) if 'values' in data_slice.dtype.names else np.array([])
-            if correct_spikes and segment_data_np.size > 0 and 'quality_packed' in data_slice.dtype.names:
+            quality_packed_slice = data_slice['quality_packed'] if 'quality_packed' in data_slice.dtype.names else None
+            if correct_spikes and segment_data_np.size > 0 and quality_packed_slice is not None:
                 print("INFO: Applying spike correction.")
-                segment_data_np, _ = _correct_spike_samples(segment_data_np, data_slice['quality_packed'])
-            if apply_lp_filter and segment_data_np.size > 0:
-                print("INFO: Applying 30Hz low-pass filter.")
-                segment_data_np = _apply_lowpass_filter(segment_data_np, sample_rate)
+                segment_data_np, _ = _correct_spike_samples(segment_data_np, quality_packed_slice)
+            if apply_filter and segment_data_np.size > 0:
+                print(f"INFO: Applying filter (hp={bp_low_hz} Hz, lp={bp_high_hz} Hz).")
+                segment_data_np = _apply_bandpass_filter(segment_data_np, sample_rate, low_hz=bp_low_hz, high_hz=bp_high_hz)
 
-            return (json.dumps({"sample_rate": sample_rate, "segment_data": segment_data_np.tolist()}), 200, headers)
+            segment_quality = (quality_packed_slice & 0x0F).tolist() if quality_packed_slice is not None else None
+            return (json.dumps({"sample_rate": sample_rate, "segment_data": segment_data_np.tolist(), "segment_quality": segment_quality}), 200, headers)
 
         else:
             print("INFO: Entering full download mode.")
-            data_blob = bucket.blob(blob_name)
-            if not data_blob.exists(): raise FileNotFoundError(f"Data blob not found: {blob_name}")
-            
-            binary_content = data_blob.download_as_bytes()
+            data_blob = bucket.get_blob(blob_name)
+            if data_blob is None: raise FileNotFoundError(f"Data blob not found: {blob_name}")
+
             meta_blob = bucket.blob(f"{blob_name}.meta")
             metadata = json.loads(meta_blob.download_as_text()) if meta_blob.exists() else {}
-            
+
             sample_rate = metadata.get("sample_rate_hz", 200.0)
             dtype = _parse_dtype_from_meta(metadata)
+
+            # Reject downloads that would be too large to render in the browser.
+            # Compute duration from dtype + file size; fall back to a raw byte cap.
+            MAX_FULL_LOAD_SECONDS = 600  # 10 minutes
+            MAX_FULL_LOAD_BYTES   = 20_000_000  # 20 MB fallback when dtype unknown
+            file_size = data_blob.size or 0
+            if file_size > 0:
+                if dtype:
+                    approx_duration_sec = (file_size // dtype.itemsize) / sample_rate
+                    too_large = approx_duration_sec > MAX_FULL_LOAD_SECONDS
+                    size_desc = f"{approx_duration_sec/60:.1f} min, {file_size/1e6:.1f} MB"
+                else:
+                    too_large = file_size > MAX_FULL_LOAD_BYTES
+                    size_desc = f"{file_size/1e6:.1f} MB"
+                if too_large:
+                    print(f"INFO: Full-load rejected — file too large ({size_desc}).")
+                    return (json.dumps({
+                        "error": (
+                            f"File is too large to load in full ({size_desc}). "
+                            f"Use 'Load last N minutes' or the time-range loader to fetch a smaller portion."
+                        ),
+                        "file_size_mb": round(file_size / 1e6, 2),
+                    }), 413, headers)
+
+            binary_content = data_blob.download_as_bytes()
 
             bytes_per_sample_prbs, bytes_per_copy_prbs = _parse_prbs_metadata(metadata)
             if bytes_per_sample_prbs is not None:
@@ -377,7 +437,7 @@ def get_sdr_data(request):
                 loaded_array = np.frombuffer(binary_content, dtype=dtype)
                 data_only_array = _raw_values_to_float(loaded_array['values'], metadata)
                 first_channel_flags = loaded_array['quality_packed'] & 0x0F
-                clean_mask = (first_channel_flags > 0)
+                clean_mask = ((first_channel_flags > 0) & (first_channel_flags < 8)) | (first_channel_flags == 11)
                 quality_flags_for_stats = first_channel_flags
             else:
                 print("INFO: Could not parse modern dtype. Assuming legacy .npy format.")
@@ -396,13 +456,17 @@ def get_sdr_data(request):
             if request_args.get("start_index"):
                 start_idx, end_idx = int(request_args.get("start_index")), int(request_args.get("end_index"))
                 segment_data_np = data_only_array[start_idx:end_idx]
-                if correct_spikes and segment_data_np.size > 0 and dtype and 'quality_packed' in dtype.names:
+                quality_slice = None
+                if dtype and 'quality_packed' in dtype.names:
                     quality_slice = loaded_array['quality_packed'][start_idx:end_idx]
-                    print("INFO: Applying spike correction.")
-                    segment_data_np, _ = _correct_spike_samples(segment_data_np, quality_slice)
-                if apply_lp_filter and segment_data_np.size > 0:
-                    segment_data_np = _apply_lowpass_filter(segment_data_np, sample_rate)
-                return (json.dumps({"sample_rate": sample_rate, "segment_data": segment_data_np.tolist()}), 200, headers)
+                    if correct_spikes and segment_data_np.size > 0:
+                        print("INFO: Applying spike correction.")
+                        segment_data_np, _ = _correct_spike_samples(segment_data_np, quality_slice)
+                if apply_filter and segment_data_np.size > 0:
+                    print(f"INFO: Applying filter (hp={bp_low_hz} Hz, lp={bp_high_hz} Hz).")
+                    segment_data_np = _apply_bandpass_filter(segment_data_np, sample_rate, low_hz=bp_low_hz, high_hz=bp_high_hz)
+                segment_quality = (quality_slice & 0x0F).tolist() if quality_slice is not None else None
+                return (json.dumps({"sample_rate": sample_rate, "segment_data": segment_data_np.tolist(), "segment_quality": segment_quality}), 200, headers)
             else:
                 analysis_mode = request_args.get("analysis_mode", "clean_only")
                 valid_runs_sorted = []

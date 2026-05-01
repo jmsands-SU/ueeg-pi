@@ -2708,7 +2708,7 @@ if __name__ == '__main__':
         channel_to_decode=1,
         gcs_bucket="ueegbucket",
         gcs_buffer_size=400,
-        gcs_channels=[1,2, 3],
+        gcs_channels=[2, 3],
         gcs_format='binary',
         enable_gcs_trigger=True,
         enable_gcs=True,

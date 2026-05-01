@@ -52,7 +52,11 @@
         <div class="control-group"><button id="analyzeButton">Analyze File</button><label><input type="checkbox" id="showAllDataToggle">Show all data</label></div>
         <div class="control-group"><label>Load last</label><input type="number" id="lastTimeValue" value="5" style="width: 60px;"><select id="lastTimeUnits"><option value="1">Seconds</option><option value="60" selected>Minutes</option><option value="3600">Hours</option></select><button id="loadRecentButton" class="load-btn">Load</button></div>
         <div class="control-group"><label>Load range from</label><input type="number" id="startTimeValue" value="1" style="width: 60px;"><label>to</label><input type="number" id="endTimeValue" value="6" style="width: 60px;"><select id="rangeTimeUnits"><option value="1">Seconds</option><option value="60" selected>Minutes</option><option value="3600">Hours</option></select><button id="loadRangeButton" class="load-btn">Load Range</button></div>
-        <div class="control-group"><label title="Applies a 30Hz low-pass filter on the server."><input type="checkbox" id="applyLpFilterToggle">Apply 30Hz LP Filter</label></div>
+        <div class="control-group">
+            <label><input type="checkbox" id="applyFilterToggle">Filter:</label>
+            <label title="High-pass corner (Hz). Leave blank for lowpass only.">HP</label><input type="number" id="bpLowHz" placeholder="Hz" min="0" step="0.5" style="width:60px;">
+            <label title="Low-pass corner (Hz). Leave blank for highpass only.">LP</label><input type="number" id="bpHighHz" value="30" placeholder="Hz" min="0" step="1" style="width:60px;">
+        </div>
         <div class="control-group"><label title="Linearly interpolates single-sample spikes (same algorithm as plot_ueeg_only.py)."><input type="checkbox" id="correctSpikesToggle" checked>Correct Spikes</label></div>
     </div>
     <div id="status">Enter a blob name and choose an action.</div>
@@ -93,7 +97,9 @@
         const startTimeValueInput = document.getElementById('startTimeValue');
         const endTimeValueInput = document.getElementById('endTimeValue');
         const rangeTimeUnitsSelect = document.getElementById('rangeTimeUnits');
-        const applyLpFilterToggle = document.getElementById('applyLpFilterToggle');
+        const applyFilterToggle = document.getElementById('applyFilterToggle');
+        const bpLowHzInput = document.getElementById('bpLowHz');
+        const bpHighHzInput = document.getElementById('bpHighHz');
         const correctSpikesToggle = document.getElementById('correctSpikesToggle');
         const segmentContainer = document.getElementById('segmentSelectorContainer');
         const segmentDropdown = document.getElementById('segmentDropdown');
@@ -156,6 +162,11 @@
             try {
                 const responses = await Promise.all(blobs.map(b => fetch(`${API_BASE_URL}?bucket=${bucket}&blob=${b}&analysis_mode=${mode}`)));
                 const jsons = await Promise.all(responses.map(r => r.json()));
+                if (responses[0].status === 413 || (jsons[0].error && jsons[0].file_size_mb !== undefined)) {
+                    statusDiv.innerHTML = `<span style="color:#c0392b"><b>File too large to load in full</b> (${jsons[0].file_size_mb} MB).<br>` +
+                        `Use <b>Load last N minutes</b> or the <b>Load time range</b> controls to fetch a smaller portion.</span>`;
+                    return;
+                }
                 if (!responses[0].ok || jsons[0].error) throw new Error(jsons[0].error || `Server error: ${responses[0].status}`);
                 const statsEntries = jsons
                     .map((d, i) => d.quality_stats ? { stats: d.quality_stats, label: blobLabel(blobs[i]) } : null)
@@ -182,13 +193,18 @@
             const timeValue = lastTimeValueInput.value;
             const unitMultiplier = lastTimeUnitsSelect.value;
             const unitText = lastTimeUnitsSelect.options[lastTimeUnitsSelect.selectedIndex].text;
-            const applyFilter = applyLpFilterToggle.checked;
+            const applyFilter = applyFilterToggle.checked;
+            const bpLow = parseFloat(bpLowHzInput.value);
+            const bpHigh = parseFloat(bpHighHzInput.value);
             const fixSpikes = correctSpikesToggle.checked;
             resetUI();
             if (!bucket || !blob || !timeValue) { statusDiv.textContent = "Please enter all required fields."; return; }
             const totalSeconds = timeValue * unitMultiplier;
             statusDiv.textContent = `Fetching the last ${timeValue} ${unitText}...`;
-            const extraParams = `&last_seconds=${totalSeconds}` + (applyFilter ? '&apply_lp_filter=true' : '') + (fixSpikes ? '&correct_spikes=true' : '');
+            const extraParams = `&last_seconds=${totalSeconds}`
+                + (applyFilter && !isNaN(bpLow) && bpLow > 0 ? `&bp_low_hz=${bpLow}` : '')
+                + (applyFilter && !isNaN(bpHigh) && bpHigh > 0 ? `&bp_high_hz=${bpHigh}` : '')
+                + (fixSpikes ? '&correct_spikes=true' : '');
             try {
                 const blobs = blob2 ? [blob, blob2] : [blob];
                 const responses = await Promise.all(blobs.map(b => fetch(buildFetchUrl(bucket, b, extraParams))));
@@ -216,7 +232,9 @@
             const endTime = endTimeValueInput.value;
             const unitMultiplier = rangeTimeUnitsSelect.value;
             const unitText = rangeTimeUnitsSelect.options[rangeTimeUnitsSelect.selectedIndex].text.toLowerCase();
-            const applyFilter = applyLpFilterToggle.checked;
+            const applyFilter = applyFilterToggle.checked;
+            const bpLow = parseFloat(bpLowHzInput.value);
+            const bpHigh = parseFloat(bpHighHzInput.value);
             const fixSpikes = correctSpikesToggle.checked;
             resetUI();
             if (!bucket || !blob || !startTime || !endTime) { statusDiv.textContent = "Please enter all required fields for range."; return; }
@@ -224,7 +242,10 @@
             const endSeconds = endTime * unitMultiplier;
             if (startSeconds >= endSeconds) { statusDiv.textContent = "Start time must be less than end time."; return; }
             statusDiv.textContent = `Fetching range from ${startTime} to ${endTime} ${unitText}...`;
-            const extraParams = `&start_time_sec=${startSeconds}&end_time_sec=${endSeconds}` + (applyFilter ? '&apply_lp_filter=true' : '') + (fixSpikes ? '&correct_spikes=true' : '');
+            const extraParams = `&start_time_sec=${startSeconds}&end_time_sec=${endSeconds}`
+                + (applyFilter && !isNaN(bpLow) && bpLow > 0 ? `&bp_low_hz=${bpLow}` : '')
+                + (applyFilter && !isNaN(bpHigh) && bpHigh > 0 ? `&bp_high_hz=${bpHigh}` : '')
+                + (fixSpikes ? '&correct_spikes=true' : '');
             try {
                 const blobs = blob2 ? [blob, blob2] : [blob];
                 const responses = await Promise.all(blobs.map(b => fetch(buildFetchUrl(bucket, b, extraParams))));
@@ -249,10 +270,15 @@
             const blob = document.getElementById('blobName').value.trim();
             const blob2 = document.getElementById('blobName2').value.trim();
             const segment = currentSegments[index];
-            const applyFilter = applyLpFilterToggle.checked;
+            const applyFilter = applyFilterToggle.checked;
+            const bpLow = parseFloat(bpLowHzInput.value);
+            const bpHigh = parseFloat(bpHighHzInput.value);
             const fixSpikes = correctSpikesToggle.checked;
             statusDiv.textContent = `Loading data for Segment ${index + 1}...`;
-            const extraParams = `&start_index=${segment.start}&end_index=${segment.end}` + (applyFilter ? '&apply_lp_filter=true' : '') + (fixSpikes ? '&correct_spikes=true' : '');
+            const extraParams = `&start_index=${segment.start}&end_index=${segment.end}`
+                + (applyFilter && !isNaN(bpLow) && bpLow > 0 ? `&bp_low_hz=${bpLow}` : '')
+                + (applyFilter && !isNaN(bpHigh) && bpHigh > 0 ? `&bp_high_hz=${bpHigh}` : '')
+                + (fixSpikes ? '&correct_spikes=true' : '');
             try {
                 const blobs = blob2 ? [blob, blob2] : [blob];
                 const responses = await Promise.all(blobs.map(b => fetch(buildFetchUrl(bucket, b, extraParams))));
