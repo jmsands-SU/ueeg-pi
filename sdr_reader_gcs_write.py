@@ -75,6 +75,7 @@ class TimeStampBasedReader:
         quiet=False,
         reader_label='ant1',
         rx_channel=0,
+        bladerf_identifier=None,
     ):
         self.quiet = bool(quiet)  # suppress per-buffer decode warnings (e.g. for secondary reader)
         self.reader_label = str(reader_label)
@@ -86,6 +87,7 @@ class TimeStampBasedReader:
         self.is_raw = bool(raw)
         self.device_num = int(device)
         self.rx_channel = int(rx_channel)
+        self.bladerf_identifier = bladerf_identifier  # e.g. "*:serial=abc123" or "*:instance=1"
         self.bandwidth = int(bandwidth)
         self.buffer_size = int(buffer_size)
 
@@ -996,7 +998,7 @@ class TimeStampBasedReader:
     def setup_device(self):
         if _bladerf is None:
             raise ImportError('bladerf Python module is not available.')
-        self.device = bladerf.BladeRF()
+        self.device = bladerf.BladeRF(self.bladerf_identifier) if self.bladerf_identifier else bladerf.BladeRF()
 
         self.channel = self.device.Channel(_bladerf.CHANNEL_RX(0))
         self.channel2 = self.device.Channel(_bladerf.CHANNEL_RX(1))
@@ -1358,6 +1360,7 @@ class TimeStampBasedReader:
                     self.packet_sequence_anomaly_count += missing
                     self.placeholder_inserts_cross_chunk += int(missing)
 
+            seq_anomaly = False
             if prev_start is not None:
                 distance = start_idx - prev_start
                 expected_frames_in_gap = self._estimate_frames_in_gap_linear(distance)
@@ -1372,7 +1375,9 @@ class TimeStampBasedReader:
                     missing_from_distance = max(0, expected_frames_in_gap - 1)
                     if observed_step is not None and observed_step > 0:
                         missing_from_numbers = max(0, observed_step - 1)
+                seq_anomaly = False
                 if expected_at_current is not None and packet_num != expected_at_current:
+                    seq_anomaly = True
                     self.packet_sequence_anomaly_count += 1
                     self.packet_sequence_events.append(
                         {
@@ -1432,8 +1437,7 @@ class TimeStampBasedReader:
                     else:
                         self.gap_estimate_disagree_count += 1
 
-            # Packet-level error flag: any valid word across all 4 channels has error set.
-            # valid+error window per ch cancels the -2 offset, giving [start_idx : start_idx + 4*bpc].
+            # Packet-level error flag: hardware interference flag OR packet sequence anomaly.
             _pkt_err_end = start_idx + 4 * self.bits_per_channel
             if start_idx >= 0 and _pkt_err_end <= len(error_flag_arr):
                 _all_valid = valid_flag[start_idx:_pkt_err_end]
@@ -1441,10 +1445,12 @@ class TimeStampBasedReader:
                 pkt_error = bool(np.any(_all_error[_all_valid == 1]))
             else:
                 pkt_error = False
+            if seq_anomaly:
+                pkt_error = True
 
             for ch in range(1, 5):
                 channel_offset = (ch - 1) * self.bits_per_channel
-                ch_start = start_idx + channel_offset -2
+                ch_start = start_idx + channel_offset-2
                 ch_end = ch_start + self.bits_per_channel
                 if ch_start < 0 or ch_end+5 > len(packet_nums_raw):
                     packets_by_channel[ch].append(
@@ -1786,6 +1792,8 @@ class TimeStampBasedReader:
                 quality[error_occurred] |= np.int8(0x08)
 
                 self.decoded_groups_by_channel[channel_idx].append(values)
+                # if channel_idx == 2:
+                    # print(f"Decoded group for channel {channel_idx}, sample_idx={sample_indices[0]}-{sample_indices[-1]}: values={values} quality={quality} raw_ints={raw_ints}")
                 self.decoded_quality_by_channel[channel_idx].append(quality)
                 group_values[channel_idx] = values
                 group_quality[channel_idx] = quality
@@ -2184,7 +2192,7 @@ class TimeStampBasedReader:
         # qual=0 (no packet / NaN) are always replaced with carry-forward.
         # The error flag (bit 3) is stripped before the decision so that 9/10/11/13/14
         # are treated the same as their non-error counterparts (1/2/3/5/6).
-        _SPIKE_THRESHOLD = 10e-3  # volts — max allowed jump from last qual=3 value
+        _SPIKE_THRESHOLD = 20e-3  # volts — max allowed jump from last qual=3 value
         _PARTIAL_QUALS = (1, 2, 5, 6)
         carry = np.nan
         for i in range(len(series)):
@@ -2202,7 +2210,7 @@ class TimeStampBasedReader:
 
         # MATLAB parity: subtract mean before visualization/spectral analysis
         if len(series) > 0:
-            series = series - np.mean(series)
+            series = series - np.nanmean(series)
 
         if self.enable_bandpass_filter and len(series) > 16:
             series, self.filter_zi[idx - 1] = signal.lfilter(
@@ -2689,23 +2697,32 @@ if __name__ == '__main__':
         _board_cfg = json.load(_f)
     _board = _board_cfg['boards'][_board_cfg['active_board']]
 
+    # In dual_rx_antenna mode: active_board → secondary (RX1); dual_rx_primary_board → primary (RX0).
+    # If dual_rx_primary_board is null, the primary also uses active_board settings.
+    _dual_primary_key = _board_cfg.get('dual_rx_primary_board')
+    _primary_board = (
+        _board_cfg['boards'][str(_dual_primary_key)]
+        if _board_cfg.get('dual_rx_antenna') and _dual_primary_key is not None
+        else _board
+    )
+
     # Shared configuration for both antennas
     _COMMON = dict(
-        sample_rate=8e6,
+        sample_rate=32e6,
         frequency=_board['frequency_hz'],
-        decode_scale=_board['decode_scale'],
-        gain_mode='slow_attack',
-        gain=45,
+        decode_scale=_primary_board['decode_scale'],
+        gain_mode='manual',
+        gain=40,
         counter=False,
         raw=False,
-        bandwidth=1e6,
+        bandwidth=6e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
         accepted_frame_lengths=(248, 250),
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
-        channel_to_decode=1,
+        channel_to_decode=3,
         gcs_bucket="ueegbucket",
         gcs_buffer_size=400,
         gcs_channels=[2, 3],
@@ -2717,19 +2734,28 @@ if __name__ == '__main__':
     )
 
     # Antenna 1 — RX0 I channel (device=1). This reader owns the BladeRF device.
+    # Set device1_identifier in board_config.json to a serial/instance string when
+    # multiple BladeRF devices are connected, e.g. "*:serial=abc123" or "*:instance=0".
     reader = TimeStampBasedReader(
         **_COMMON,
         device=1,
         gcs_blob_name="ada_eyesclosed_ant1.bin",
+        bladerf_identifier=_board_cfg.get('device1_identifier'),
     )
 
-    # Antenna 2 — secondary reader. Two modes, mutually exclusive:
-    #   dual_rx_antenna=true  → RX1 I channel of the same device (new two-channel RBF)
-    #   device2_board != null → separate BladeRF device on RX0 I/Q (legacy two-device mode)
-    # quiet=True suppresses per-packet decode warnings so a noisy antenna 2 doesn't flood stdout.
+    # Antenna 2 — two modes, mutually exclusive:
+    #   dual_rx_antenna=true  → RX1 I channel of the same device (shares BladeRF with reader 1)
+    #   device2_board != null → independent BladeRF; set device2_settings.bladerf_identifier
+    #                           in board_config.json to select which physical device to open.
+    _reader2 = None
     if _board_cfg.get('dual_rx_antenna'):
+        # Secondary reader uses active_board decode_scale regardless of dual_rx_primary_board.
         reader.secondary_reader = TimeStampBasedReader(
-            **{**_COMMON, 'enable_gcs_trigger': False},
+            **{
+                **_COMMON,
+                'enable_gcs_trigger': False,
+                'decode_scale': _board['decode_scale'],
+            },
             device=1,
             rx_channel=1,
             gcs_blob_name="ada_eyesclosed_ant2.bin",
@@ -2738,17 +2764,30 @@ if __name__ == '__main__':
         )
     elif _board_cfg.get('device2_board') is not None:
         _board2 = _board_cfg['boards'][_board_cfg['device2_board']]
-        reader.secondary_reader = TimeStampBasedReader(
-            **{**_COMMON, 'enable_gcs_trigger': False},
-            device=2,
-            frequency=_board2['frequency_hz'],
-            decode_scale=_board2['decode_scale'],
-            gcs_blob_name="ada_eyesclosed_ant2.bin",
-            quiet=True,
-            reader_label='device2',
+        # device2_settings can override any kwarg, including bladerf_identifier
+        _dev2_overrides = _board_cfg.get('device2_settings', {})
+        _reader2 = TimeStampBasedReader(
+            **{
+                **_COMMON,
+                'enable_gcs_trigger': False,
+                'device': 1,
+                'frequency': _board2['frequency_hz'],
+                'decode_scale': _board2['decode_scale'],
+                'gcs_blob_name': 'ada_eyesclosed_ant2.bin',
+                'quiet': True,
+                'reader_label': 'device2',
+                **_dev2_overrides,  # wins over all defaults above, including bladerf_identifier
+            }
         )
 
+    if _reader2 is not None:
+        _t2 = threading.Thread(target=_reader2.start_capture, kwargs={'duration_seconds': None}, daemon=True)
+        _t2.start()
+
     reader.start_capture(duration_seconds=None)
+
+    if _reader2 is not None:
+        _t2.join()
     # reader.decode_from_file(
     #     '/home/joannas/joannacheckalpha.bin',
     #     bin_file_format='matlab_float32_2xn',
