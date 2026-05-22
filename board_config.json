@@ -6,13 +6,28 @@
             "decode_scale": 0.00032
         },
         "2": {
-            "label": "board2 (black case)",
+            "label": "board2 (chip ?}(black case)",
             "frequency_hz": 903600000,
             "decode_scale": 0.000587890625
+        },
+        "3": {
+            "label": "board3 chip 27(____ case)",
+            "frequency_hz": 911700000,
+            "decode_scale": 0.0005
+        },
+        "4": {
+            "label": "board4 (____ case)",
+            "frequency_hz": 911700000,
+            "decode_scale": 0.0005
         }
     },
     "active_board": "1",
+    "device1_identifier": "*:serial=1e165c5f0bc94c0c85c5092c27a93427",
     "device2_board": null,
-    "dual_rx_antenna": false,
+    "device2_settings": {
+        "bladerf_identifier": null
+    },
+    "dual_rx_antenna": true,
+    "dual_rx_primary_board": null,
     "rbf_file": "/home/ueeg/ueeg-pi/SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf"
 }
