@@ -18,15 +18,15 @@ fi
 CURRENT_USER="${USER:-$(whoami)}"
 USER_HOME="/home/${CURRENT_USER}"
 
-echo "Installing for user: ${CURRENT_USER}"
+# echo "Installing for user: ${CURRENT_USER}"
 
-echo ""
-echo "Step 1: Installing System Dependencies..."
-sudo apt update
-sudo apt install -y \
-    python3-dev python3-venv git cmake libusb-1.0-0-dev pkg-config \  
-    python3-scipy python3-matplotlib \
-    bladerf libbladerf-dev python3-bladerf
+# echo ""
+# echo "Step 1: Installing System Dependencies..."
+# sudo apt update
+# sudo apt install -y \
+#     python3-dev python3-venv git cmake libusb-1.0-0-dev pkg-config \  
+#     python3-scipy python3-matplotlib \
+#     bladerf libbladerf-dev python3-bladerf
 
 echo "✓ System dependencies installed"
 
