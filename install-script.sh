@@ -24,8 +24,8 @@ echo ""
 echo "Step 1: Installing System Dependencies..."
 sudo apt update
 sudo apt install -y \
-    python3-dev python3-venv git cmake libusb-1.0-0-dev pkg-config \ 
-    python3-numpy python3-scipy python3-matplotlib \
+    python3-dev python3-venv git cmake libusb-1.0-0-dev pkg-config \  
+    python3-scipy python3-matplotlib \
     bladerf libbladerf-dev python3-bladerf
 
 echo "✓ System dependencies installed"
