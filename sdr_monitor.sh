@@ -7,7 +7,7 @@ SCRIPT_PATH="$PI_HOME/ueeg-pi/sdr_reader_gcs_write.py"
 CREDENTIALS_FILE="$PI_HOME/ueeg-pi/ueegproject-aea2731f9c3a.json"
 VENV_PATH="$PI_HOME/sdr_venv"
 BOARD_CONFIG_FILE="$PI_HOME/ueeg-pi/board_config.json"
-RBF_FILE=$("$VENV_PATH/bin/python3" -c "import json; cfg=json.load(open('$BOARD_CONFIG_FILE')); print(cfg['rbf_file'])" 2>/dev/null || echo "")
+RBF_FILE="$PI_HOME/ueeg-pi/$("$VENV_PATH/bin/python3" -c "import json; cfg=json.load(open('$BOARD_CONFIG_FILE')); print(cfg['rbf_file'])" 2>/dev/null || echo "")"
 STATUS_FILE="/tmp/sdr_monitor_status.json"
 MAX_RESTART_ATTEMPTS=3
 RESTART_DELAY=10
