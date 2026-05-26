@@ -34,5 +34,5 @@
     },
     "dual_rx_antenna": false,
     "dual_rx_primary_board": null,
-    "rbf_file": "ueeg-pi/SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf"
+    "rbf_file": "SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf"
 }
