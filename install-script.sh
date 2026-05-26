@@ -54,6 +54,9 @@ hdmi_force_hotplug=1
 hdmi_ignore_edid=0xa5000080
 EOF'
 fi
+if ! grep -q "usb_max_current_enable=1" /boot/firmware/config.txt 2>/dev/null; then
+    echo "usb_max_current_enable=1" | sudo tee -a /boot/firmware/config.txt
+fi
 echo "✓ Headless boot configured"
 
 echo ""
