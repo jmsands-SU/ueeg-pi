@@ -2,10 +2,11 @@
 # /usr/local/bin/sdr_monitor.sh
 
 LOG_FILE="/var/log/sdr_monitor.log"
-SCRIPT_PATH="/home/ueeg/ueeg-pi/sdr_reader_gcs_write.py"
-CREDENTIALS_FILE="/home/ueeg/ueeg-pi/ueegproject-aea2731f9c3a.json"
-VENV_PATH="/home/ueeg/sdr_venv"
-BOARD_CONFIG_FILE="/home/ueeg/ueeg-pi/board_config.json"
+PI_HOME=$(getent passwd 1000 | cut -d: -f6)
+SCRIPT_PATH="$PI_HOME/ueeg-pi/sdr_reader_gcs_write.py"
+CREDENTIALS_FILE="$PI_HOME/ueeg-pi/ueegproject-aea2731f9c3a.json"
+VENV_PATH="$PI_HOME/sdr_venv"
+BOARD_CONFIG_FILE="$PI_HOME/ueeg-pi/board_config.json"
 RBF_FILE=$("$VENV_PATH/bin/python3" -c "import json; cfg=json.load(open('$BOARD_CONFIG_FILE')); print(cfg['rbf_file'])" 2>/dev/null || echo "")
 STATUS_FILE="/tmp/sdr_monitor_status.json"
 MAX_RESTART_ATTEMPTS=3
@@ -184,8 +185,8 @@ start_python_script() {
     export GOOGLE_APPLICATION_CREDENTIALS="$CREDENTIALS_FILE"
     export PYTHONUNBUFFERED=1
     
-    cd /home/ueeg || {
-        log "ERROR: Cannot cd to /home/ueeg"
+    cd "$PI_HOME" || {
+        log "ERROR: Cannot cd to $PI_HOME"
         return 1
     }
     
