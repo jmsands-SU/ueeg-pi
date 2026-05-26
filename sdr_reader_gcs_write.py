@@ -2708,7 +2708,7 @@ if __name__ == '__main__':
 
     # Shared configuration for both antennas
     _COMMON = dict(
-        sample_rate=32e6,
+        sample_rate=8e6,
         frequency=_board['frequency_hz'],
         decode_scale=_primary_board['decode_scale'],
         gain_mode='manual',
@@ -2732,7 +2732,8 @@ if __name__ == '__main__':
         gcs_trigger_topic_id="sdr-commands",
         gcs_trigger_subscription_id="sdr-commands-pi-sub",
     )
-
+    if _board_cfg.get('dual_rx_antenna'):
+        _COMMON['sample_rate'] = 32e6  # for dual-antenna, use 32 MHz sample rate
     # Antenna 1 — RX0 I channel (device=1). This reader owns the BladeRF device.
     # Set device1_identifier in board_config.json to a serial/instance string when
     # multiple BladeRF devices are connected, e.g. "*:serial=abc123" or "*:instance=0".

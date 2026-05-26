@@ -58,6 +58,7 @@
             <label title="Low-pass corner (Hz). Leave blank for highpass only.">LP</label><input type="number" id="bpHighHz" value="30" placeholder="Hz" min="0" step="1" style="width:60px;">
         </div>
         <div class="control-group"><label title="Linearly interpolates single-sample spikes (same algorithm as plot_ueeg_only.py)."><input type="checkbox" id="correctSpikesToggle" checked>Correct Spikes</label></div>
+        <div class="control-group"><label title="Show per-sample quality codes below the time plot."><input type="checkbox" id="showQualityToggle">Show Quality</label></div>
     </div>
     <div id="status">Enter a blob name and choose an action.</div>
     <div class="stats-and-segments">
@@ -80,6 +81,7 @@
              </span>
              <span class="control-group">
                 <button id="autoscaleYButton">Autoscale Y</button>
+                <label title="Automatically rescale the FFT Y-axis when the time range changes."><input type="checkbox" id="fftAutoYToggle" checked>Auto on zoom</label>
              </span>
         </div>
     </div>
@@ -101,6 +103,7 @@
         const bpLowHzInput = document.getElementById('bpLowHz');
         const bpHighHzInput = document.getElementById('bpHighHz');
         const correctSpikesToggle = document.getElementById('correctSpikesToggle');
+        const showQualityToggle = document.getElementById('showQualityToggle');
         const segmentContainer = document.getElementById('segmentSelectorContainer');
         const segmentDropdown = document.getElementById('segmentDropdown');
         const statusDiv = document.getElementById('status');
@@ -115,6 +118,7 @@
         const fftFreqMaxInput = document.getElementById('fftFreqMax');
         const setFreqRangeButton = document.getElementById('setFreqRangeButton');
         const autoscaleYButton = document.getElementById('autoscaleYButton');
+        const fftAutoYToggle = document.getElementById('fftAutoYToggle');
         // fullDatasets: array of { channelData, sampleRate, label }
         let currentSegments = [], currentSampleRate = 200.0, fullDatasets = [];
 
@@ -354,15 +358,20 @@
         ];
 
         function buildQualityScatterTraces(time_axis, qualityArr) {
+            // Downsample quality for display: max 1 event per 100 ms to keep Plotly fast.
+            // "Matched" (code 3) is the normal baseline — skip it to avoid tens of thousands
+            // of redundant green markers that dominate memory and render time.
+            const stride = Math.max(1, Math.ceil(qualityArr.length / 6000)); // at most ~6000 non-trivial events shown
             const byCode = {};
-            for (let i = 0; i < qualityArr.length; i++) {
+            for (let i = 0; i < qualityArr.length; i += stride) {
                 const q = qualityArr[i];
-                if (!byCode[q]) byCode[q] = { t: [], q: [] };
+                if (q === 3) continue; // skip Matched — it's the baseline, not an event
+                if (!byCode[q]) byCode[q] = { t: [] };
                 byCode[q].t.push(time_axis[i]);
-                byCode[q].q.push(q);
             }
             const traces = [];
             for (const cat of QUALITY_CATS) {
+                if (cat.code === 3) continue; // Matched shown implicitly (absence of markers)
                 const pts = byCode[cat.code];
                 if (!pts || pts.t.length === 0) continue;
                 const isError = (cat.code & 0x08) !== 0;
@@ -402,7 +411,7 @@
                     fftTrace.psdValues = psdValues;
                     fftPlotData.push(fftTrace);
                 }
-                if (segmentQuality && segmentQuality.length === channelData.length) {
+                if (showQualityToggle.checked && segmentQuality && segmentQuality.length === channelData.length) {
                     const prefix = usePrefix ? `${label} ` : '';
                     for (const tr of buildQualityScatterTraces(time_axis, segmentQuality)) {
                         tr.name = prefix + tr.name;
@@ -430,6 +439,12 @@
             }
             await Plotly.newPlot(fftPlotDiv, fftPlotData, fftLayout);
             fftControlsContainer.style.display = 'flex';
+            if (applyFilterToggle.checked) {
+                const bpLow = parseFloat(bpLowHzInput.value);
+                const bpHigh = parseFloat(bpHighHzInput.value);
+                if (!isNaN(bpLow) && bpLow > 0) fftFreqMinInput.value = bpLow;
+                if (!isNaN(bpHigh) && bpHigh > 0) fftFreqMaxInput.value = bpHigh;
+            }
             updateFftPlot();
             statusDiv.textContent = `Displaying data. Click legend to toggle channels.`;
             timePlotDiv.removeAllListeners(); fftPlotDiv.removeAllListeners();
@@ -464,28 +479,39 @@
             Plotly.update('fftPlot', { y: new_y_data }, layoutUpdate);
         }
 
-        function autoscaleFftY() {
-            if (!fftPlot.data || fftPlot.data.length === 0) return;
-            const layout = fftPlot.layout;
-            const xRange = layout.xaxis.range;
-            if (!xRange) { Plotly.relayout('fftPlot', {'yaxis.autorange': true}); return; }
-            const minFreq = Math.pow(10, xRange[0]);
-            const maxFreq = Math.pow(10, xRange[1]);
-            let overallMinY = Infinity, overallMaxY = -Infinity;
-            for (const trace of fftPlot.data) {
-                if (trace.visible === 'legendonly') continue;
-                for (let i = 0; i < trace.x.length; i++) {
-                    if (trace.x[i] >= minFreq && trace.x[i] <= maxFreq) {
-                        const val = trace.y[i];
-                        if (val < overallMinY) overallMinY = val;
-                        if (val > overallMaxY) overallMaxY = val;
-                    }
+        function getFftFreqBoundsHz() {
+            const lo = parseFloat(fftFreqMinInput.value);
+            const hi = parseFloat(fftFreqMaxInput.value);
+            return {
+                minF: (!isNaN(lo) && lo > 0) ? lo : 0,
+                maxF: (!isNaN(hi) && hi > 0) ? hi : Infinity,
+            };
+        }
+
+        function computeYRangeForTraces(traces, minF, maxF) {
+            const vals = [];
+            for (const tr of traces) {
+                if (tr.visible === 'legendonly') continue;
+                for (let i = 0; i < tr.x.length; i++) {
+                    if (tr.x[i] >= minF && tr.x[i] <= maxF) vals.push(tr.y[i]);
                 }
             }
-            if (isFinite(overallMinY) && isFinite(overallMaxY)) {
-                const range = overallMaxY - overallMinY;
-                const padding = range * 0.05 || 0.1;
-                Plotly.relayout('fftPlot', {'yaxis.range': [overallMinY - padding, overallMaxY + padding]});
+            if (vals.length === 0) return null;
+            vals.sort((a, b) => a - b);
+            // Use 2nd percentile as floor — near-zero FFT bins hit the log floor (~-240 dB)
+            // and would otherwise collapse the useful signal range to a sliver at the top.
+            const yMin = vals[Math.floor(vals.length * 0.02)];
+            const yMax = vals[vals.length - 1];
+            const padTop = (yMax - yMin) * 0.05 || 0.1;
+            return [yMin, yMax + padTop];
+        }
+
+        function autoscaleFftY() {
+            if (!fftPlot.data || fftPlot.data.length === 0) return;
+            const { minF, maxF } = getFftFreqBoundsHz();
+            const yRange = computeYRangeForTraces(fftPlot.data, minF, maxF);
+            if (yRange) {
+                Plotly.relayout('fftPlot', {'yaxis.range': yRange});
             } else {
                 Plotly.relayout('fftPlot', {'yaxis.autorange': true});
             }
@@ -522,7 +548,20 @@
             }
             if (newFftTraces.length === 0) { Plotly.react(fftPlotDiv, [], {title: 'Not enough data for PSD'}); return; }
             const yAxisTitle = isLinear ? 'PSD (V²/Hz)' : 'PSD (dB/Hz)';
-            Plotly.react(fftPlotDiv, newFftTraces, { title: `PSD of visible region (${timeRange[0].toFixed(2)}s to ${timeRange[1].toFixed(2)}s)`, xaxis: { title: 'Frequency (Hz)', type: 'log' }, yaxis: { title: yAxisTitle } });
+            const minFreq = parseFloat(fftFreqMinInput.value);
+            const maxFreq = parseFloat(fftFreqMaxInput.value);
+            const freqRange = (!isNaN(minFreq) && minFreq > 0) || (!isNaN(maxFreq) && maxFreq > 0)
+                ? [(!isNaN(minFreq) && minFreq > 0) ? Math.log10(minFreq) : null,
+                   (!isNaN(maxFreq) && maxFreq > 0) ? Math.log10(maxFreq) : null]
+                : undefined;
+            const fftXAxis = { title: 'Frequency (Hz)', type: 'log' };
+            if (freqRange) fftXAxis.range = freqRange;
+            Plotly.react(fftPlotDiv, newFftTraces, { title: `PSD of visible region (${timeRange[0].toFixed(2)}s to ${timeRange[1].toFixed(2)}s)`, xaxis: fftXAxis, yaxis: { title: yAxisTitle } });
+            if (fftAutoYToggle.checked) {
+                const { minF, maxF } = getFftFreqBoundsHz();
+                const yRange = computeYRangeForTraces(fftPlot.data, minF, maxF);
+                if (yRange) Plotly.relayout(fftPlotDiv, { 'yaxis.range': yRange });
+            }
         }
 
         function handleLegendClick(eventData) { const curveNumber = eventData.curveNumber; let newVisibility = eventData.data[curveNumber].visible === 'legendonly' ? true : 'legendonly'; Plotly.restyle(timePlotDiv, { visible: newVisibility }, [curveNumber]); Plotly.restyle(fftPlotDiv,  { visible: newVisibility }, [curveNumber]); return false; }
