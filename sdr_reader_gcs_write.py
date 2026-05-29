@@ -151,6 +151,7 @@ class TimeStampBasedReader:
         self._sdr_restart_requested = threading.Event()
         self._sdr_restart_log = []  # list of {sample_idx, timestamp_utc, drop_rate, reason}
         self._rx_thread_ref = None
+        self._proc_thread_ref = None
         self.sdr_watchdog_window_seconds = 20
         self.sdr_restart_drop_threshold = 0.50
         self.restart_cooldown_s = 120.0
@@ -283,8 +284,9 @@ class TimeStampBasedReader:
 
     @property
     def _RECORDING_STATE_FILE(self):
-        # Unique per reader so primary and secondary don't overwrite each other.
-        safe = (self.gcs_blob_name or 'default').replace('/', '_').replace('.', '_')
+        # Keyed on reader_label (fixed at construction) so the path is stable even if
+        # gcs_blob_name is updated at runtime by a Pub/Sub trigger message.
+        safe = self.reader_label.replace('/', '_').replace('.', '_')
         return f'/tmp/sdr_recording_state_{safe}.json'
 
     def _write_recording_state_file(self):
@@ -344,15 +346,16 @@ class TimeStampBasedReader:
         if blob_name:
             self.gcs_blob_name = blob_name
             self.gcs_temp_name = f'{blob_name}.temp'
-        if duration is not None and start_unix is not None:
-            self._gcs_trigger_duration = duration
-            self._gcs_recording_start_time = start_unix  # preserve original start for duration tracking
 
         print(f'Resuming recording from state file (session={session_id}, blob={blob_name}).')
         self._start_gcs_recording()
-        # Override session_id so we append to the same blob rather than creating a new session
+        # Override session_id and start/duration fields after _start_gcs_recording() so that
+        # _start_gcs_recording()'s resets don't clobber the values we care about.
         with self._gcs_buffer_lock:
             self.gcs_session_id = session_id
+            if duration is not None and start_unix is not None:
+                self._gcs_trigger_duration = duration
+                self._gcs_recording_start_time = start_unix
         self._sdr_restart_log.append({
             'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'sample_idx_at_restart': 0,
@@ -951,7 +954,17 @@ class TimeStampBasedReader:
             pass
         self.device = None
 
-        # Drain queues so processing threads don't stall on old data
+        # The rx thread's finally block puts None into data_queue to signal the
+        # processing thread to stop. Wait for the processing thread to consume it
+        # and exit so we can restart it cleanly below.
+        proc_t = self._proc_thread_ref
+        if proc_t is not None:
+            proc_t.join(timeout=3.0)
+        sec_proc_t = self._secondary_proc_thread
+        if sec_proc_t is not None:
+            sec_proc_t.join(timeout=3.0)
+
+        # Drain any remaining stale items (including any un-consumed None sentinels)
         while not self.data_queue.empty():
             try:
                 self.data_queue.get_nowait()
@@ -979,6 +992,16 @@ class TimeStampBasedReader:
             rx_t = threading.Thread(target=self.rx_thread, daemon=True)
             self._rx_thread_ref = rx_t
             rx_t.start()
+            # Restart the processing thread — it exited when the rx thread put None
+            # in data_queue to signal shutdown. Without a fresh processing thread
+            # no data is decoded and GCS writes stop permanently.
+            new_proc_t = threading.Thread(target=self.processing_thread, daemon=True)
+            self._proc_thread_ref = new_proc_t
+            new_proc_t.start()
+            if self.secondary_reader is not None:
+                new_sec_proc_t = threading.Thread(target=self.secondary_reader.processing_thread, daemon=True)
+                self._secondary_proc_thread = new_sec_proc_t
+                new_sec_proc_t.start()
             self._force_timestamp_after_restart = True
             self._last_restart_time = time.time()
             self._post_restart_hold = True
@@ -2609,6 +2632,7 @@ class TimeStampBasedReader:
         rx_t = threading.Thread(target=self.rx_thread, daemon=True)
         self._rx_thread_ref = rx_t
         proc_t = threading.Thread(target=self.processing_thread, daemon=True)
+        self._proc_thread_ref = proc_t
         watchdog_t = threading.Thread(target=self._watchdog_thread_func, daemon=True)
         trig_t = None
 
@@ -2715,7 +2739,7 @@ if __name__ == '__main__':
         gain=40,
         counter=False,
         raw=False,
-        bandwidth=6e6,
+        bandwidth=2e6,
         enable_plotting=True,
         enable_bandpass_filter=False,
         frame_length=250,
@@ -2734,6 +2758,7 @@ if __name__ == '__main__':
     )
     if _board_cfg.get('dual_rx_antenna'):
         _COMMON['sample_rate'] = 32e6  # for dual-antenna, use 32 MHz sample rate
+        _COMMON['bandwidth'] = 8e6
     # Antenna 1 — RX0 I channel (device=1). This reader owns the BladeRF device.
     # Set device1_identifier in board_config.json to a serial/instance string when
     # multiple BladeRF devices are connected, e.g. "*:serial=abc123" or "*:instance=0".

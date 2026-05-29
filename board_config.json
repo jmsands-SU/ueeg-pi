@@ -6,7 +6,7 @@
             "decode_scale": 0.00032
         },
         "2": {
-            "label": "board2 (chip ?}(black case)",
+            "label": "board2 (chip 23}(black case channel 3 broken)",
             "frequency_hz": 903600000,
             "decode_scale": 0.000587890625
         },
@@ -26,13 +26,13 @@
             "decode_scale": 0.00038
         }
     },
-    "active_board": "4",
+    "active_board": "1",
     "device1_identifier": "*:serial=1e165c5f0bc94c0c85c5092c27a93427",
     "device2_board": null,
     "device2_settings": {
         "bladerf_identifier": null
     },
     "dual_rx_antenna": false,
-    "dual_rx_primary_board": null,
+    "dual_rx_primary_board": "4",
     "rbf_file": "SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf"
 }
