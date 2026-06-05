@@ -154,12 +154,14 @@ class TimeStampBasedReader:
         self._proc_thread_ref = None
         self.sdr_watchdog_window_seconds = 20
         self.sdr_restart_drop_threshold = 0.50
+        self.sdr_restart_rate_upper_factor = 1.10  # restart if rate > expected * this
         self.restart_cooldown_s = 120.0
         self.post_restart_quality_window_s = 5.0
         self.post_restart_quality_threshold = 0.50
         self.post_restart_max_gate_s = 120.0
 
         self._last_restart_time = None
+        self._last_decoded_sample_time = None  # wall-clock time of most recent quality append
         self._post_restart_hold = False
         self._post_restart_hold_buffer = []
         self._post_restart_hold_timestamps = []
@@ -874,9 +876,21 @@ class TimeStampBasedReader:
         self.filter_zi = [zi.copy(), zi.copy(), zi.copy(), zi.copy()]
 
     def _recent_drop_rate(self):
-        """Fraction of samples in the last watchdog window that have quality 0 (no packet)."""
+        """Fraction of samples in the last watchdog window that have quality 0 (no packet).
+
+        Returns 1.0 if no new samples have arrived within the watchdog window,
+        which catches total signal loss that would otherwise leave the deque stale.
+        """
         window = int(self.sdr_watchdog_window_seconds * self.output_rate_hz)
         quality_deque = self.decoded_quality_by_channel[self.channel_to_decode]
+
+        # Total silence: deque never had data or no new samples within the window.
+        if self._last_decoded_sample_time is None:
+            return 0.0  # haven't started yet, don't trigger early
+        silence_s = time.time() - self._last_decoded_sample_time
+        if silence_s >= self.sdr_watchdog_window_seconds:
+            return 1.0
+
         if len(quality_deque) == 0:
             return 0.0
         recent = list(quality_deque)[-window:]
@@ -887,6 +901,10 @@ class TimeStampBasedReader:
 
     def _watchdog_thread_func(self):
         """Checks drop rate every watchdog_window_seconds; requests SDR restart if too high."""
+        cycle = 0
+        count_before = self.decoded_sample_count_by_channel[self.channel_to_decode]
+        t_before = time.time()
+
         while self.running:
             for _ in range(int(self.sdr_watchdog_window_seconds * 4)):
                 if not self.running:
@@ -894,11 +912,54 @@ class TimeStampBasedReader:
                 time.sleep(0.25)
             if not self.running:
                 return
+
+            count_after = self.decoded_sample_count_by_channel[self.channel_to_decode]
+            t_after = time.time()
+            elapsed = t_after - t_before
+            samples_this_window = count_after - count_before
+            measured_rate_hz = samples_this_window / elapsed if elapsed > 0 else 0.0
+            count_before = count_after
+            t_before = t_after
+
+            cycle += 1
+            ts = time.strftime('%H:%M:%S', time.gmtime())
+
             # Skip this cycle if we are still within the post-restart cooldown window
             if self._last_restart_time is not None:
-                if (time.time() - self._last_restart_time) < self.restart_cooldown_s:
+                elapsed_since_restart = time.time() - self._last_restart_time
+                if elapsed_since_restart < self.restart_cooldown_s:
+                    remaining = self.restart_cooldown_s - elapsed_since_restart
+                    print(
+                        f'[{ts}] Watchdog cycle {cycle}: in post-restart cooldown, '
+                        f'{remaining:.0f}s remaining (cooldown={self.restart_cooldown_s:.0f}s)  '
+                        f'measured_rate={measured_rate_hz:.1f}Hz (expected={self.output_rate_hz:.1f}Hz)'
+                    )
                     continue
+
             drop_rate = self._recent_drop_rate()
+            window = int(self.sdr_watchdog_window_seconds * self.output_rate_hz)
+            quality_deque = self.decoded_quality_by_channel[self.channel_to_decode]
+            actual_samples = min(len(list(quality_deque)), window)
+
+            silence_s = (time.time() - self._last_decoded_sample_time) if self._last_decoded_sample_time else None
+            silence_info = f'  silence={silence_s:.1f}s' if silence_s is not None and silence_s >= 1.0 else ''
+
+            rate_pct = 100.0 * measured_rate_hz / self.output_rate_hz if self.output_rate_hz > 0 else 0.0
+
+            sec_info = ''
+            if self.secondary_reader is not None:
+                sec_has_data = any(len(q) > 0 for q in self.secondary_reader.decoded_quality_by_channel.values())
+                if sec_has_data:
+                    sec_drop_rate = self.secondary_reader._recent_drop_rate()
+                    sec_info = f'  secondary_drop={sec_drop_rate*100:.1f}%'
+
+            print(
+                f'[{ts}] Watchdog cycle {cycle}: drop={drop_rate*100:.1f}%'
+                f'  threshold={self.sdr_restart_drop_threshold*100:.0f}%'
+                f'  rate={measured_rate_hz:.1f}Hz ({rate_pct:.0f}% of {self.output_rate_hz:.1f}Hz)'
+                f'  window={actual_samples}/{window} samples{silence_info}{sec_info}'
+            )
+
             if drop_rate > self.sdr_restart_drop_threshold:
                 if self.secondary_reader is not None:
                     sec_has_data = any(len(q) > 0 for q in self.secondary_reader.decoded_quality_by_channel.values())
@@ -913,6 +974,16 @@ class TimeStampBasedReader:
                 print(
                     f'⚠️  Watchdog: drop rate {drop_rate*100:.1f}% > '
                     f'{self.sdr_restart_drop_threshold*100:.0f}% threshold — requesting SDR restart.'
+                )
+                self._sdr_restart_requested.set()
+                continue
+
+            upper_rate_limit = self.output_rate_hz * self.sdr_restart_rate_upper_factor
+            if measured_rate_hz > upper_rate_limit and self._last_decoded_sample_time is not None:
+                print(
+                    f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz exceeds '
+                    f'{upper_rate_limit:.1f}Hz ({self.sdr_restart_rate_upper_factor:.0%} of expected) '
+                    f'— requesting SDR restart.'
                 )
                 self._sdr_restart_requested.set()
 
@@ -1366,7 +1437,7 @@ class TimeStampBasedReader:
                 missing = max(missing_from_numbers, missing_from_distance)
                 if missing > 0:
                     if not self.quiet:
-                        _ts = self._words_processed_total / self.sample_rate
+                        _ts = self._words_processed_total / self.bit_clock_hz
                         print(
                             f"⚠️  Cross-chunk gap @ t={_ts:.3f}s: prev={prev_packet_num}, "
                             f"first_fresh={packet_num}, missing_num={missing_from_numbers}, "
@@ -1411,7 +1482,7 @@ class TimeStampBasedReader:
                             'distance_words': int(distance),
                             'expected_frames_in_gap': int(expected_frames_in_gap),
                             'start_idx': int(start_idx),
-                            'timestamp_s': (self._words_processed_total + int(start_idx) - prefix_len) / self.sample_rate,
+                            'timestamp_s': (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz,
                         }
                     )
                     # print(
@@ -1428,11 +1499,18 @@ class TimeStampBasedReader:
                     if expected_frames_in_gap == 1 and expected_next is not None and packet_num != expected_next:
                         self.packet_sequence_header_drops += 1
                         if not self.quiet:
-                            ts_drop = (self._words_processed_total + int(start_idx) - prefix_len) / self.sample_rate
+                            ts_drop = (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz
                             print(
                                 f"⚠️  Dropping out-of-order observed packet @ t={ts_drop:.3f}s: "
                                 f"expected {expected_next}, observed {packet_num}"
                             )
+                        # Insert a quality=0 placeholder so the watchdog counts this loss.
+                        for ch in range(1, 5):
+                            packets_by_channel[ch].append(
+                                DecodedPacket(packet_num=expected_next, is_valid=False, bits=np.array([], dtype=np.uint8))
+                            )
+                            packet_word_positions[ch].append(None)
+                        self.packet_sequence_anomaly_count += 1
                         continue
 
                 # Insert placeholders using the stronger of distance-based and packet-number-based inference.
@@ -1818,6 +1896,8 @@ class TimeStampBasedReader:
                 # if channel_idx == 2:
                     # print(f"Decoded group for channel {channel_idx}, sample_idx={sample_indices[0]}-{sample_indices[-1]}: values={values} quality={quality} raw_ints={raw_ints}")
                 self.decoded_quality_by_channel[channel_idx].append(quality)
+                if channel_idx == self.channel_to_decode:
+                    self._last_decoded_sample_time = time.time()
                 group_values[channel_idx] = values
                 group_quality[channel_idx] = quality
                 group_raw_values[channel_idx] = raw_ints
