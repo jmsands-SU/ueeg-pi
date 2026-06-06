@@ -10,9 +10,8 @@ ExecStart=/usr/local/bin/sdr_monitor.sh
 Restart=always
 RestartSec=30
 User=1000
-WorkingDirectory=%h
+WorkingDirectory=/tmp
 Environment="PYTHONUNBUFFERED=1"
-Environment="GOOGLE_APPLICATION_CREDENTIALS=%h/ueegproject-aea2731f9c3a.json"
 StandardOutput=file:/var/log/sdr_service.log
 StandardError=file:/var/log/sdr_service.log
 
