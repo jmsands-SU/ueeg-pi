@@ -159,7 +159,7 @@ class TimeStampBasedReader:
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         self.gcs_samples_written = 0
         # Per-channel last-good value for NaN carry-forward (shape (4,) per channel)
-        self._gcs_last_good_values = {ch: np.zeros(4, dtype=np.int32) for ch in range(1, 5)}
+        self._gcs_last_good_values = {ch: np.int32(0) for ch in range(1, 5)}
         self._carry_forward_log_count = 0
         self._carry_forward_log_max = 50
 
@@ -191,6 +191,7 @@ class TimeStampBasedReader:
         self.sdr_watchdog_window_seconds = 20
         self.sdr_restart_drop_threshold = 0.50
         self.sdr_restart_rate_upper_factor = 1.10  # restart if rate > expected * this
+        self.sdr_restart_rate_lower_factor = 0.50  # restart if rate < expected * this
 
         self._last_decoded_sample_time = None      # wall-clock time of most recent quality append
         self._last_chunk_end_word_timestamp = None  # wall-clock end of last consumed chunk
@@ -433,7 +434,7 @@ class TimeStampBasedReader:
             self.gcs_samples_written = 0
             self.gcs_timestamp_log = []
             self._gcs_recording_start_time = time.time()
-            self._gcs_last_good_values = {ch: np.zeros(4, dtype=np.int32) for ch in range(1, 5)}
+            self._gcs_last_good_values = {ch: np.int32(0) for ch in range(1, 5)}
             self._carry_forward_log_count = 0
         # Update blob/temp names from trigger message if blob was updated
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
@@ -612,12 +613,11 @@ class TimeStampBasedReader:
             packed_quality = np.uint16(0)
             for ch_idx, ch in enumerate(self.gcs_channels):
                 q = int(group_quality[ch][s]) if ch in group_quality else 0
-                last = self._gcs_last_good_values[ch]
                 if ch in group_raw_values and q != 0:
                     r = int(group_raw_values[ch][s])
-                    last[s] = np.int32(r)
+                    self._gcs_last_good_values[ch] = np.int32(r)
                 else:
-                    r = int(last[s])  # carry-forward (0 at very start)
+                    r = int(self._gcs_last_good_values[ch])  # carry-forward
                     if self._carry_forward_log_count < self._carry_forward_log_max:
                         self._carry_forward_log_count += 1
                         _cf_float = r / (1 << 12) * self.decode_scale
@@ -696,6 +696,8 @@ class TimeStampBasedReader:
             # Take everything — if there's a backlog we flush it all in one Compose.
             buffer_snapshot = list(self.gcs_write_buffer)
             self.gcs_write_buffer = []
+            # Stamp here (commit point) so upload latency doesn't inflate the interval.
+            self._last_gcs_flush_time = time.time()
 
         # --- START OF NEW, EFFICIENT LOGIC ---
         
@@ -764,7 +766,6 @@ class TimeStampBasedReader:
         n_samples = len(new_data_chunk)
         self.gcs_samples_written += n_samples
         self.gcs_chunk_counter += 1
-        self._last_gcs_flush_time = time.time()
         self._write_gcs_metadata() # This MUST be called after updating samples_written
         
         print(
@@ -1051,6 +1052,16 @@ class TimeStampBasedReader:
                 print(
                     f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz exceeds '
                     f'{upper_rate_limit:.1f}Hz ({self.sdr_restart_rate_upper_factor:.0%} of expected) '
+                    f'— exiting for monitor-driven restart.'
+                )
+                self.running = False
+                continue
+
+            lower_rate_limit = self.output_rate_hz * self.sdr_restart_rate_lower_factor
+            if measured_rate_hz < lower_rate_limit and self._last_decoded_sample_time is not None:
+                print(
+                    f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz below '
+                    f'{lower_rate_limit:.1f}Hz ({self.sdr_restart_rate_lower_factor:.0%} of expected) '
                     f'— exiting for monitor-driven restart.'
                 )
                 self.running = False
