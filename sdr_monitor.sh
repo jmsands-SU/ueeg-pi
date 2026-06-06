@@ -379,7 +379,19 @@ fi
 LOOP_COUNT=0
 
 while true; do
-    sleep $HEALTH_CHECK_INTERVAL
+    # Fast-poll for process death every 5 s rather than waiting the full interval.
+    # This reduces detection latency from up to 60 s to ≤5 s without adding
+    # heavyweight BladeRF/GCS checks on every tick.
+    fast_poll=0
+    while [ $fast_poll -lt $((HEALTH_CHECK_INTERVAL / 5)) ]; do
+        sleep 5
+        fast_poll=$((fast_poll + 1))
+        if [ "$SCRIPT_RUNNING" = true ] && \
+           ! pgrep -f "$VENV_PATH/bin/python3.*sdr_reader_gcs_write" > /dev/null; then
+            log "Python process exited — triggering immediate restart"
+            break
+        fi
+    done
     LOOP_COUNT=$((LOOP_COUNT + 1))
     
     # Wrap everything in error handling

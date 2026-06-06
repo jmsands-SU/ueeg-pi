@@ -5,7 +5,43 @@ import json
 from collections import deque, Counter
 from dataclasses import dataclass
 import os
+import sys
 import numpy as np
+
+# ── Timestamped stdout ────────────────────────────────────────────────────────
+# Wraps every print() call with [HH:MM:SS.mmm PID] so all log lines are
+# identifiable across threads and process restarts without changing call sites.
+class _TimestampedStream:
+    def __init__(self, stream):
+        self._stream = stream
+        self._pid = os.getpid()
+        self._lock = threading.Lock()
+        self._pending = ''
+
+    def write(self, text):
+        if not text:
+            return
+        with self._lock:
+            self._pending += text
+            while '\n' in self._pending:
+                line, self._pending = self._pending.split('\n', 1)
+                ts = time.strftime('%H:%M:%S') + f'.{int(time.time() * 1000) % 1000:03d}'
+                self._stream.write(f'[{ts} {self._pid}] {line}\n')
+            self._stream.flush()
+
+    def flush(self):
+        with self._lock:
+            if self._pending:
+                ts = time.strftime('%H:%M:%S') + f'.{int(time.time() * 1000) % 1000:03d}'
+                self._stream.write(f'[{ts} {self._pid}] {self._pending}')
+                self._pending = ''
+            self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+sys.stdout = _TimestampedStream(sys.stdout)
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     import bladerf                  # This is the high-level, user-friendly wrapper
     from bladerf import _bladerf    # This is the low-level module with all the constants
@@ -114,6 +150,7 @@ class TimeStampBasedReader:
         self.gcs_recording_active = False
         self.gcs_write_buffer = []  # list of (values_row_f32, quality_packed_u16)
         self.gcs_chunk_counter = 0
+        self._last_gcs_flush_time = 0.0  # wall-clock time of last successful flush
         self.gcs_session_id = None
         self.gcs_trigger_thread = None
         self._gcs_trigger_duration = None
@@ -148,24 +185,21 @@ class TimeStampBasedReader:
 
         self.running = False
         self._rx_running = False
-        self._sdr_restart_requested = threading.Event()
         self._sdr_restart_log = []  # list of {sample_idx, timestamp_utc, drop_rate, reason}
         self._rx_thread_ref = None
         self._proc_thread_ref = None
         self.sdr_watchdog_window_seconds = 20
         self.sdr_restart_drop_threshold = 0.50
         self.sdr_restart_rate_upper_factor = 1.10  # restart if rate > expected * this
-        self.restart_cooldown_s = 120.0
-        self.post_restart_quality_window_s = 5.0
-        self.post_restart_quality_threshold = 0.50
-        self.post_restart_max_gate_s = 120.0
 
-        self._last_restart_time = None
-        self._last_decoded_sample_time = None  # wall-clock time of most recent quality append
-        self._post_restart_hold = False
-        self._post_restart_hold_buffer = []
-        self._post_restart_hold_timestamps = []
-        self._post_restart_hold_start = None
+        self._last_decoded_sample_time = None      # wall-clock time of most recent quality append
+        self._last_chunk_end_word_timestamp = None  # wall-clock end of last consumed chunk
+        self._current_chunk_first_word_timestamp = None  # wall-clock start of chunk being extracted
+
+        # Blob chain tracking — populated on resume from a state file
+        self._restart_count = 0
+        self._original_blob_name = None   # the very first blob name in this session chain
+        self._previous_blob_name = None   # the blob that preceded this one
 
         self.device = None
         self.channel = None
@@ -304,6 +338,8 @@ class TimeStampBasedReader:
             'start_time_unix': self._gcs_recording_start_time,
             'duration_seconds': self._gcs_trigger_duration,
             'projected_end_time_unix': projected_end,
+            'restart_count': self._restart_count,
+            'original_blob_name': self._original_blob_name or self.gcs_blob_name,
         }
         try:
             with open(self._RECORDING_STATE_FILE, 'w') as f:
@@ -345,16 +381,32 @@ class TimeStampBasedReader:
         duration = state.get('duration_seconds')
         start_unix = state.get('start_time_unix')
 
-        if blob_name:
-            self.gcs_blob_name = blob_name
-            self.gcs_temp_name = f'{blob_name}.temp'
+        # Derive a new blob name — state file presence means the previous run was
+        # unclean (signal loss, power failure, OOM kill). Never append to the old blob;
+        # start a fresh one so the gap is explicit rather than silent.
+        restart_count = int(state.get('restart_count', 0)) + 1
+        original = state.get('original_blob_name') or blob_name or self.gcs_blob_name
+        if original and '.' in original.split('/')[-1]:
+            base, ext = original.rsplit('.', 1)
+            new_blob = f'{base}_r{restart_count}.{ext}'
+        elif original:
+            new_blob = f'{original}_r{restart_count}'
+        else:
+            new_blob = self.gcs_blob_name  # fallback: no blob name known
 
-        print(f'Resuming recording from state file (session={session_id}, blob={blob_name}).')
+        self._restart_count = restart_count
+        self._original_blob_name = original
+        self._previous_blob_name = blob_name
+        self.gcs_blob_name = new_blob
+        self.gcs_temp_name = f'{new_blob}.temp'
+
+        print(
+            f'Resuming after unclean exit: previous blob={blob_name}, '
+            f'new blob={new_blob} (restart #{restart_count}).'
+        )
         self._start_gcs_recording()
-        # Override session_id and start/duration fields after _start_gcs_recording() so that
-        # _start_gcs_recording()'s resets don't clobber the values we care about.
+        # Restore duration/start fields if a timed session was in progress.
         with self._gcs_buffer_lock:
-            self.gcs_session_id = session_id
             if duration is not None and start_unix is not None:
                 self._gcs_trigger_duration = duration
                 self._gcs_recording_start_time = start_unix
@@ -363,6 +415,8 @@ class TimeStampBasedReader:
             'sample_idx_at_restart': 0,
             'drop_rate_pct': None,
             'reason': 'process_restart_resume',
+            'previous_blob': blob_name,
+            'new_blob': new_blob,
         })
 
     def _start_gcs_recording(self):
@@ -386,18 +440,64 @@ class TimeStampBasedReader:
         print(f'GCS recording started (session={self.gcs_session_id}, blob={self.gcs_blob_name}).')
         self._write_recording_state_file()
 
-    def _stop_gcs_recording(self):
+    # Blobs with fewer than this many samples on unplanned exit are treated as
+    # near-empty and deleted rather than kept as orphaned stubs.
+    _NEAR_EMPTY_SAMPLE_THRESHOLD = 400  # one GCS chunk
+
+    def _stop_gcs_recording(self, intentional: bool = False):
         with self._gcs_buffer_lock:
             was_active = bool(self.gcs_recording_active)
             self.gcs_recording_active = False
             self._gcs_recording_start_time = None
-        if was_active:
-            try:
-                self._flush_gcs_buffer(force=True)
-            except Exception as exc:
-                print(f'GCS flush error during stop: {exc}')
+        if not was_active:
+            return
+        try:
+            self._flush_gcs_buffer(force=True)
+        except Exception as exc:
+            print(f'GCS flush error during stop: {exc}')
+
+        if intentional:
             self._delete_recording_state_file()
             print('GCS recording stopped.')
+            return
+
+        # Unplanned exit path — keep state file so monitor can trigger a new-blob resume.
+        # But if this blob is near-empty, delete it and roll back the restart counter so
+        # the next resume retries the same blob name rather than creating another stub.
+        if self.gcs_samples_written < self._NEAR_EMPTY_SAMPLE_THRESHOLD:
+            blob_name = self.gcs_blob_name
+            if blob_name and self.gcs_bucket_obj is not None:
+                try:
+                    b = self.gcs_bucket_obj.blob(blob_name)
+                    if b.exists():
+                        b.delete()
+                        print(f'Deleted near-empty blob ({self.gcs_samples_written} samples): gs://{self.gcs_bucket}/{blob_name}')
+                except Exception as exc:
+                    print(f'Warning: could not delete near-empty blob: {exc}')
+
+            if self._restart_count == 0:
+                # This was the very first blob — no prior data to resume from.
+                self._delete_recording_state_file()
+                print('GCS recording stopped (near-empty original blob removed).')
+                return
+
+            # Roll back so the next resume retries this blob name instead of advancing.
+            self._restart_count = max(0, self._restart_count - 1)
+            orig = self._original_blob_name or blob_name
+            if self._restart_count == 0:
+                predecessor = orig
+            else:
+                if '.' in orig.split('/')[-1]:
+                    base, ext = orig.rsplit('.', 1)
+                    predecessor = f'{base}_r{self._restart_count}.{ext}'
+                else:
+                    predecessor = f'{orig}_r{self._restart_count}'
+            self.gcs_blob_name = predecessor
+            self.gcs_temp_name = f'{predecessor}.temp'
+            print(f'Near-empty blob removed; rolled back to predecessor ({predecessor}).')
+
+        self._write_recording_state_file()
+        print('GCS recording stopped.')
 
     def _handle_gcs_trigger_message(self, payload: str):
         text = (payload or '').strip()
@@ -436,9 +536,9 @@ class TimeStampBasedReader:
             if self.secondary_reader is not None:
                 self.secondary_reader._start_gcs_recording()
         elif command in ('stop', 'pause', 'end'):
-            self._stop_gcs_recording()
+            self._stop_gcs_recording(intentional=True)
             if self.secondary_reader is not None:
-                self.secondary_reader._stop_gcs_recording()
+                self.secondary_reader._stop_gcs_recording(intentional=True)
 
     def _poll_gcs_triggers(self):
         if not self.enable_gcs or not self.enable_gcs_trigger or self.gcs_subscriber is None:
@@ -467,8 +567,13 @@ class TimeStampBasedReader:
                 if ack_ids:
                     self.gcs_subscriber.acknowledge(request={'subscription': subscription_path, 'ack_ids': ack_ids})
             except Exception as exc:
-                print(f'GCS trigger poll error: {exc}')
+                _trigger_err_count = getattr(self, '_trigger_poll_err_count', 0) + 1
+                self._trigger_poll_err_count = _trigger_err_count
+                if _trigger_err_count == 1 or _trigger_err_count % 60 == 0:
+                    print(f'GCS trigger poll error (#{_trigger_err_count}): {exc}')
                 time.sleep(0.5)
+                continue
+            self._trigger_poll_err_count = 0
 
             # Duration check: auto-stop if recording has run past the requested duration
             if (
@@ -486,6 +591,11 @@ class TimeStampBasedReader:
                 if self.secondary_reader is not None:
                     self.secondary_reader._stop_gcs_recording()
                 self._delete_recording_state_file()
+
+            # When recording is active we only need to catch stop commands — a few
+            # seconds of lag is fine and avoids hammering Pub/Sub every 0.5s.
+            if self.gcs_recording_active:
+                time.sleep(5.0)
 
     def _append_gcs_group(self, group_values: dict, group_raw_values: dict, group_quality: dict, group_sample_timestamps=None):
         """Append one decoded group (4 time slots) as 4 rows to the GCS write buffer.
@@ -517,51 +627,6 @@ class TimeStampBasedReader:
                 vals_row.append(np.int32(r))
                 packed_quality = np.uint16(packed_quality | ((q & 0xF) << (4 * ch_idx)))
             rows_to_add.append((np.asarray(vals_row, dtype=np.int32), packed_quality))
-
-        if self._post_restart_hold:
-            # Check if we've been stuck in the gate too long — force a new restart
-            if (time.time() - self._post_restart_hold_start) > self.post_restart_max_gate_s:
-                print(f'Post-restart quality gate exceeded {self.post_restart_max_gate_s:.0f}s — requesting SDR restart.')
-                self._post_restart_hold_buffer.clear()
-                self._post_restart_hold_timestamps.clear()
-                self._post_restart_hold = False
-                self._sdr_restart_requested.set()
-                return
-
-            # Buffer rows and timestamps during gate
-            self._post_restart_hold_buffer.extend(rows_to_add)
-            if group_sample_timestamps is not None:
-                self._post_restart_hold_timestamps.append(group_sample_timestamps)
-
-            # Evaluate rolling window once we have enough samples
-            window_samples = int(self.post_restart_quality_window_s * self.output_rate_hz)
-            total = len(self._post_restart_hold_buffer)
-            if total >= window_samples:
-                recent = self._post_restart_hold_buffer[-window_samples:]
-                good = sum(1 for _, pq in recent if pq != 0)
-                ratio = good / window_samples
-                if ratio >= self.post_restart_quality_threshold:
-                    self._post_restart_hold = False
-                    print(
-                        f'Post-restart quality gate cleared ({ratio*100:.0f}% good over {window_samples} samples) '
-                        f'— flushing {total} buffered samples and resuming GCS writes.'
-                    )
-                    with self._gcs_buffer_lock:
-                        if self.gcs_recording_active:
-                            if self._post_restart_hold_timestamps:
-                                first_ts = self._post_restart_hold_timestamps[0]
-                                self.gcs_timestamp_log.append({
-                                    'gcs_sample_idx': int(self.gcs_samples_written + len(self.gcs_write_buffer)),
-                                    'sample_timestamp_s': float(first_ts[0]),
-                                    'system_time_s': time.time(),
-                                    'reason': 'post_restart_quality_gate_cleared',
-                                })
-                            self.gcs_write_buffer.extend(self._post_restart_hold_buffer)
-                    self._post_restart_hold_buffer.clear()
-                    self._post_restart_hold_timestamps.clear()
-                    self._force_timestamp_after_restart = False  # already logged above
-                # If ratio failed, keep accumulating — window re-evaluates next group
-            return  # don't fall through to normal write path while gate active
 
         should_flush = False
         with self._gcs_buffer_lock:
@@ -620,6 +685,15 @@ class TimeStampBasedReader:
                 return
             if not force and len(self.gcs_write_buffer) < int(self.gcs_buffer_size):
                 return
+            # GCS limits mutation operations to ~1/second per object. If a previous
+            # flush failed and requeued data, or a large gap fill caused rapid
+            # re-triggering, enforce a minimum interval so the backlog accumulates
+            # into one large write instead of many small ones.
+            if not force:
+                since_last = time.time() - self._last_gcs_flush_time
+                if since_last < 1.5:
+                    return
+            # Take everything — if there's a backlog we flush it all in one Compose.
             buffer_snapshot = list(self.gcs_write_buffer)
             self.gcs_write_buffer = []
 
@@ -690,6 +764,7 @@ class TimeStampBasedReader:
         n_samples = len(new_data_chunk)
         self.gcs_samples_written += n_samples
         self.gcs_chunk_counter += 1
+        self._last_gcs_flush_time = time.time()
         self._write_gcs_metadata() # This MUST be called after updating samples_written
         
         print(
@@ -766,6 +841,11 @@ class TimeStampBasedReader:
                 'timestamp_log_interval_samples': int(self.gcs_timestamp_log_interval),
                 'notes': 'Load with numpy.load(). Structured array field `values` contains channel amplitudes; `quality_packed` stores one 4-bit quality code per selected channel. timestamp_log provides periodic sample-accurate UTC synchronization checkpoints.',
             }
+            if self._previous_blob_name:
+                metadata['previous_blob'] = self._previous_blob_name
+            if self._original_blob_name:
+                metadata['original_blob'] = self._original_blob_name
+                metadata['restart_count'] = self._restart_count
 
             meta_blob.upload_from_string(json.dumps(metadata, indent=2), content_type='application/json')
         except Exception as exc:
@@ -900,7 +980,7 @@ class TimeStampBasedReader:
         return float(np.sum(q == 0)) / float(q.size)
 
     def _watchdog_thread_func(self):
-        """Checks drop rate every watchdog_window_seconds; requests SDR restart if too high."""
+        """Checks drop rate every watchdog_window_seconds; exits the process if too high."""
         cycle = 0
         count_before = self.decoded_sample_count_by_channel[self.channel_to_decode]
         t_before = time.time()
@@ -923,18 +1003,6 @@ class TimeStampBasedReader:
 
             cycle += 1
             ts = time.strftime('%H:%M:%S', time.gmtime())
-
-            # Skip this cycle if we are still within the post-restart cooldown window
-            if self._last_restart_time is not None:
-                elapsed_since_restart = time.time() - self._last_restart_time
-                if elapsed_since_restart < self.restart_cooldown_s:
-                    remaining = self.restart_cooldown_s - elapsed_since_restart
-                    print(
-                        f'[{ts}] Watchdog cycle {cycle}: in post-restart cooldown, '
-                        f'{remaining:.0f}s remaining (cooldown={self.restart_cooldown_s:.0f}s)  '
-                        f'measured_rate={measured_rate_hz:.1f}Hz (expected={self.output_rate_hz:.1f}Hz)'
-                    )
-                    continue
 
             drop_rate = self._recent_drop_rate()
             window = int(self.sdr_watchdog_window_seconds * self.output_rate_hz)
@@ -968,14 +1036,14 @@ class TimeStampBasedReader:
                         if sec_drop_rate <= self.sdr_restart_drop_threshold:
                             print(
                                 f'⚠️  Watchdog: primary drop rate {drop_rate*100:.1f}% is high but '
-                                f'secondary is healthy ({sec_drop_rate*100:.1f}%) — not restarting.'
+                                f'secondary is healthy ({sec_drop_rate*100:.1f}%) — not exiting.'
                             )
                             continue
                 print(
                     f'⚠️  Watchdog: drop rate {drop_rate*100:.1f}% > '
-                    f'{self.sdr_restart_drop_threshold*100:.0f}% threshold — requesting SDR restart.'
+                    f'{self.sdr_restart_drop_threshold*100:.0f}% threshold — exiting for monitor-driven restart.'
                 )
-                self._sdr_restart_requested.set()
+                self.running = False
                 continue
 
             upper_rate_limit = self.output_rate_hz * self.sdr_restart_rate_upper_factor
@@ -983,111 +1051,9 @@ class TimeStampBasedReader:
                 print(
                     f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz exceeds '
                     f'{upper_rate_limit:.1f}Hz ({self.sdr_restart_rate_upper_factor:.0%} of expected) '
-                    f'— requesting SDR restart.'
+                    f'— exiting for monitor-driven restart.'
                 )
-                self._sdr_restart_requested.set()
-
-    def _restart_sdr(self):
-        """Stop the rx thread, close the device, wait 10s, then reinitialise and restart."""
-        sample_idx = self.decoded_sample_count_by_channel[self.channel_to_decode]
-        drop_rate = self._recent_drop_rate()
-        ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        entry = {
-            'timestamp_utc': ts,
-            'sample_idx_at_restart': int(sample_idx),
-            'drop_rate_pct': round(drop_rate * 100, 2),
-            'reason': 'watchdog_drop_threshold',
-        }
-        self._sdr_restart_log.append(entry)
-        print(f'⚠️  SDR restart #{len(self._sdr_restart_log)} @ {ts}  drop_rate={drop_rate*100:.1f}%')
-
-        # Update metadata immediately so the restart is recorded even if we crash later
-        self._write_gcs_metadata()
-
-        # Stop rx thread cleanly
-        self._rx_running = False
-        rx_t = self._rx_thread_ref
-        if rx_t is not None:
-            rx_t.join(timeout=5.0)
-
-        # Close device
-        try:
-            if self.channel is not None:
-                self.channel.enable = False
-            if self.channel2 is not None:
-                self.channel2.enable = False
-        except Exception:
-            pass
-        try:
-            if self.device is not None:
-                self.device.close()
-        except Exception:
-            pass
-        self.device = None
-
-        # The rx thread's finally block puts None into data_queue to signal the
-        # processing thread to stop. Wait for the processing thread to consume it
-        # and exit so we can restart it cleanly below.
-        proc_t = self._proc_thread_ref
-        if proc_t is not None:
-            proc_t.join(timeout=3.0)
-        sec_proc_t = self._secondary_proc_thread
-        if sec_proc_t is not None:
-            sec_proc_t.join(timeout=3.0)
-
-        # Drain any remaining stale items (including any un-consumed None sentinels)
-        while not self.data_queue.empty():
-            try:
-                self.data_queue.get_nowait()
-            except Exception:
-                break
-        if self.secondary_reader is not None:
-            while not self.secondary_reader.data_queue.empty():
-                try:
-                    self.secondary_reader.data_queue.get_nowait()
-                except Exception:
-                    break
-
-        print('SDR stopped. Waiting 10 seconds before restart...')
-        for _ in range(40):
-            if not self.running:
-                return
-            time.sleep(0.25)
-
-        if not self.running:
-            return
-
-        try:
-            self.setup_device()
-            self._rx_running = True
-            rx_t = threading.Thread(target=self.rx_thread, daemon=True)
-            self._rx_thread_ref = rx_t
-            rx_t.start()
-            # Restart the processing thread — it exited when the rx thread put None
-            # in data_queue to signal shutdown. Without a fresh processing thread
-            # no data is decoded and GCS writes stop permanently.
-            new_proc_t = threading.Thread(target=self.processing_thread, daemon=True)
-            self._proc_thread_ref = new_proc_t
-            new_proc_t.start()
-            if self.secondary_reader is not None:
-                new_sec_proc_t = threading.Thread(target=self.secondary_reader.processing_thread, daemon=True)
-                self._secondary_proc_thread = new_sec_proc_t
-                new_sec_proc_t.start()
-            self._force_timestamp_after_restart = True
-            self._last_restart_time = time.time()
-            self._post_restart_hold = True
-            self._post_restart_hold_buffer = []
-            self._post_restart_hold_timestamps = []
-            self._post_restart_hold_start = time.time()
-            if self.secondary_reader is not None:
-                self.secondary_reader._force_timestamp_after_restart = True
-                self.secondary_reader._post_restart_hold = True
-                self.secondary_reader._post_restart_hold_buffer = []
-                self.secondary_reader._post_restart_hold_timestamps = []
-                self.secondary_reader._post_restart_hold_start = time.time()
-            print(f'SDR restarted (restart #{len(self._sdr_restart_log)}). Post-restart quality gate active.')
-        except Exception as exc:
-            print(f'⚠️  SDR restart failed: {exc}')
+                self.running = False
 
     def setup_device(self):
         if _bladerf is None:
@@ -1422,27 +1388,30 @@ class TimeStampBasedReader:
             cur_abs_start = int(self._words_processed_total + int(start_idx) - prefix_len)
 
             # Cross-chunk gap: first frame of this chunk vs last frame of previous chunk.
+            # Neither packet numbers (unreliable due to bit errors) nor word-distance
+            # (inflated by buffer-boundary artifacts) can be trusted here.
+            # Use wall-clock time between chunk boundaries as the reliable estimator.
             if prev_start is None and prev_packet_num is not None:
-                observed_step = (packet_num - prev_packet_num) % 8
-                missing_from_numbers = max(0, observed_step - 1)
-                missing_from_distance = 0
-                if prev_abs_start is not None:
-                    distance_words = int(cur_abs_start - int(prev_abs_start))
-                    expected_frames_in_gap = self._estimate_frames_in_gap_linear(distance_words)
-                    missing_from_distance = max(0, expected_frames_in_gap - 1)
-                    if missing_from_distance == missing_from_numbers:
-                        self.gap_estimate_agree_count += 1
-                    else:
-                        self.gap_estimate_disagree_count += 1
-                missing = max(missing_from_numbers, missing_from_distance)
-                if missing > 0:
-                    if not self.quiet:
-                        _ts = self._words_processed_total / self.bit_clock_hz
+                missing = 0
+                t0 = self._last_chunk_end_word_timestamp
+                t1 = self._current_chunk_first_word_timestamp
+                if t0 is not None and t1 is not None:
+                    gap_s = max(0.0, t1 - t0)
+                    fps = self.bit_clock_hz / float(np.mean(list(self.accepted_frame_lengths)))
+                    raw_missing = max(0, int(round(gap_s * fps)) - 1)
+                    max_fill = int(self.sdr_watchdog_window_seconds * fps)
+                    missing = min(raw_missing, max_fill)
+                    _ts = self._words_processed_total / self.bit_clock_hz
+                    if raw_missing > max_fill and not self.quiet:
                         print(
-                            f"⚠️  Cross-chunk gap @ t={_ts:.3f}s: prev={prev_packet_num}, "
-                            f"first_fresh={packet_num}, missing_num={missing_from_numbers}, "
-                            f"missing_dist={missing_from_distance}, inserting={missing}"
+                            f"⚠️  Cross-chunk gap {gap_s:.2f}s @ t={_ts:.3f}s exceeds watchdog window "
+                            f"— capping fill at {missing} frames (raw={raw_missing})"
                         )
+                    elif missing > 0 and not self.quiet:
+                        print(
+                            f"⚠️  Cross-chunk gap {gap_s:.3f}s @ t={_ts:.3f}s: inserting={missing} frames"
+                        )
+                if missing > 0:
                     last_num = prev_packet_num
                     for _ in range(missing):
                         last_num = (last_num + 1) % 8
@@ -1460,15 +1429,10 @@ class TimeStampBasedReader:
                 expected_frames_in_gap = self._estimate_frames_in_gap_linear(distance)
                 expected_next = (prev_packet_num + 1) % 8 if prev_packet_num is not None else None
                 expected_at_current = None
-                observed_step = None
                 missing_from_distance = 0
-                missing_from_numbers = 0
                 if prev_packet_num is not None and expected_frames_in_gap >= 1:
                     expected_at_current = (prev_packet_num + expected_frames_in_gap) % 8
-                    observed_step = (packet_num - prev_packet_num) % 8
                     missing_from_distance = max(0, expected_frames_in_gap - 1)
-                    if observed_step is not None and observed_step > 0:
-                        missing_from_numbers = max(0, observed_step - 1)
                 seq_anomaly = False
                 if expected_at_current is not None and packet_num != expected_at_current:
                     seq_anomaly = True
@@ -1513,17 +1477,11 @@ class TimeStampBasedReader:
                         self.packet_sequence_anomaly_count += 1
                         continue
 
-                # Insert placeholders using the stronger of distance-based and packet-number-based inference.
-                # This catches cases where malformed frame lengths make distance-based inference undercount losses.
-                missing = max(missing_from_distance, missing_from_numbers)
+                # Use distance-based inference only — packet numbers are unreliable
+                # (bit errors corrupt the number field, causing false large gaps).
+                # Within a single buffer the word distance is accurate.
+                missing = missing_from_distance
                 if missing > 0 and prev_packet_num is not None:
-                    if missing_from_numbers > missing_from_distance and not self.quiet:
-                        print(
-                            f"⚠️  Packet-gap undercount by frame distance: "
-                            f"distance inferred missing={missing_from_distance}, "
-                            f"packet-number inferred missing={missing_from_numbers} "
-                            f"(prev={prev_packet_num}, observed={packet_num})"
-                        )
                     last_num = prev_packet_num
                     for _ in range(missing):
                         last_num = (last_num + 1) % 8
@@ -1533,10 +1491,6 @@ class TimeStampBasedReader:
                             )
                             packet_word_positions[ch].append(None)
                     self.placeholder_inserts_intra_chunk += int(missing)
-                    if missing_from_distance == missing_from_numbers:
-                        self.gap_estimate_agree_count += 1
-                    else:
-                        self.gap_estimate_disagree_count += 1
 
             # Packet-level error flag: hardware interference flag OR packet sequence anomaly.
             _pkt_err_end = start_idx + 4 * self.bits_per_channel
@@ -1562,9 +1516,6 @@ class TimeStampBasedReader:
 
                 bits_block = data_bit[ch_start:ch_end]
                 valid_block = valid_flag[ch_start+2:ch_end+2]
-                if sum(valid_block) != 20:
-                    print(ch,valid_block, len(valid_block), sum(valid_block))
-                    print(bits_block)
                 selected_bits = bits_block[valid_block == 1]
                 self.valid_flag_bitcount_hist_by_channel[ch][len(selected_bits)] += 1
                 packets_by_channel[ch].append(
@@ -1941,25 +1892,28 @@ class TimeStampBasedReader:
                     self._word_timestamps = []
                 self._word_timestamps.extend(chunk_timestamps)
             
+            self._current_chunk_first_word_timestamp = chunk_first_word_timestamp
             result, consumed = self._extract_channel_packets(self._decode_buffer)
-            
+
             if consumed > 0:
                 # Unpack packets and positions
                 packets_by_channel, packet_word_positions = result
-                
+
                 # Extract timestamps for consumed words
                 consumed_word_timestamps = None
                 if hasattr(self, '_word_timestamps') and self._word_timestamps is not None and len(self._word_timestamps) >= consumed:
                     consumed_word_timestamps = self._word_timestamps[:consumed]
                     self._word_timestamps = self._word_timestamps[consumed:]
-                
+
                 self._decode_packet_groups(
-                    packets_by_channel, 
+                    packets_by_channel,
                     packet_word_positions=packet_word_positions,
                     word_timestamps=consumed_word_timestamps
                 )
                 self._words_processed_total += consumed
                 self._decode_buffer = self._decode_buffer[consumed:]
+                if chunk_first_word_timestamp is not None:
+                    self._last_chunk_end_word_timestamp = chunk_first_word_timestamp + consumed / self.bit_clock_hz
 
         # Final flush
         if len(self._decode_buffer) > 0:
@@ -2706,7 +2660,6 @@ class TimeStampBasedReader:
 
         self.running = True
         self._rx_running = True
-        self._sdr_restart_requested.clear()
         self.capture_start_time = time.time()
 
         rx_t = threading.Thread(target=self.rx_thread, daemon=True)
@@ -2745,9 +2698,6 @@ class TimeStampBasedReader:
             while self.running:
                 if end_time is not None and time.time() >= end_time:
                     break
-                if self._sdr_restart_requested.is_set():
-                    self._sdr_restart_requested.clear()
-                    self._restart_sdr()
                 time.sleep(0.25)
         except KeyboardInterrupt:
             print('Stopping capture (KeyboardInterrupt).')
