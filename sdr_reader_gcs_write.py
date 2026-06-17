@@ -267,6 +267,7 @@ class TimeStampBasedReader:
         self._phase_agreement_run = 0        # consecutive detect-vs-distance agreements toward lock
         self._phase_mismatch_run = 0         # leaky mismatch run toward re-acquire unlock
         self.phase_relocks = 0               # times the phase lock was dropped to re-acquire
+        self._group_builder_input_log = []   # (packet_num, is_valid) for ch1, capped at 100k
         self.gap_estimate_agree_count = 0
         self.gap_estimate_disagree_count = 0
         self.decoded_groups = self.decoded_groups_by_channel[self.channel_to_decode]

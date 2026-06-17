@@ -31,13 +31,14 @@
             "decode_scale": 0.00025
         }
     },
-    "active_board": "4",
+    "active_board": "5",
     "device1_identifier": "*:serial=1e165c5f0bc94c0c85c5092c27a93427",
     "device2_board": null,
     "device2_settings": {
         "bladerf_identifier": null
     },
     "dual_rx_antenna": false,
-    "dual_rx_primary_board": "4",
-    "rbf_file": "ueeg-pi/SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf"
+    "dual_rx_primary_board": "1",
+    "rbf_file": "ueeg-pi/SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf",
+    "block_resume_after_unclean_exit": true
 }

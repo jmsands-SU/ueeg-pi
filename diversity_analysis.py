@@ -43,6 +43,7 @@ import sys
 import os
 import numpy as np
 import scipy.io
+from scipy.signal import find_peaks
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -62,13 +63,13 @@ except ImportError:
 
 # ── File paths ─────────────────────────────────────────────────────────────────
 # MATLAB writes mat files to C:\Temp; those appear at /mnt/c/Temp in WSL.
-MAT_ANT1 = '/mnt/c/Temp/interferencelosstest_ant1only.mat'
-MAT_ANT2 = '/mnt/c/Temp/interferencelosstest_ant2only.mat'
-MAT_BOTH = '/mnt/c/Temp/interferencelosstest_both.mat'
+MAT_ANT1 = '/mnt/c/Temp/stream_out_ant1only.mat'
+MAT_ANT2 = '/mnt/c/Temp/stream_out_ant2only.mat'
+MAT_BOTH = '/mnt/c/Temp/stream_out_both.mat'
 
 # Raw IQ binaries (float32 interleaved I/Q, 8 MHz)
-IQ_FILE1 = '/home/joannas/interferencelosstest_ant1.bin'
-IQ_FILE2 = '/home/joannas/interferencelosstest_ant2.bin'
+IQ_FILE1 = '/home/joannas/inbed_raw_ch2.bin'
+IQ_FILE2 = '/home/joannas/inbed_raw_ch3.bin'
 
 # ── Parameters ─────────────────────────────────────────────────────────────────
 PACKET_RATE  = 400      # Hz  — packet windows are 2.5 ms wide
@@ -78,6 +79,8 @@ CONFLICT_THR = 10      # co-occurring push1 + changeofstrength1 samples ≤ this
 GCS_CHANNEL  = '2'      # channel index for TimeStampBasedReader.get_decoded_arrays()
 FRAME_LEVEL_STEP_PLOTS = False  # True → step plots at raw frame rate (~400 Hz, pre-diversity)
                                  # False → quality-code based (~200 Hz EEG rate)
+PREAMBLE_DURATION = 500e-6      # s — OOK preamble = continuous 1s for this long
+IQ_DISPLAY_THIN   = 8           # plot every Nth IQ sample (8 → 1 MHz display rate)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -138,6 +141,92 @@ def read_iq_magnitude(filepath, start_time, duration):
     if len(raw) % 2:
         raw = np.append(raw, np.float32(0))
     return np.abs(raw[0::2] + 1j * raw[1::2])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# detect_preambles / find_iq_drops
+# ══════════════════════════════════════════════════════════════════════════════
+def detect_preambles(mag):
+    """
+    Detect packet preamble locations in an IQ magnitude trace.
+
+    Each packet starts with PREAMBLE_DURATION seconds of continuous OOK high
+    (all-ones bit stream), which produces a sustained high IQ magnitude.
+    A sliding window mean matched to that duration peaks once per preamble.
+
+    Returns:
+        preamble_indices  int ndarray  — sample indices of preamble peaks in mag
+        envelope          float ndarray — sliding-window-mean trace,
+                                         length = len(mag) - win + 1
+    """
+    win = max(1, round(PREAMBLE_DURATION * FS_IQ))
+    cs  = np.cumsum(np.concatenate([[0.0], mag.astype(float)]))
+    envelope = (cs[win:] - cs[:-win]) / win        # length = len(mag) - win + 1
+
+    # Use the 10th percentile as the noise floor (quiet periods) and the 90th
+    # as a proxy for the data-phase signal level.  This decouples the threshold
+    # from widespread interference that would otherwise pull up the median.
+    noise_floor  = np.percentile(envelope, 10)
+    signal_level = np.percentile(envelope, 90)
+    threshold    = noise_floor + 0.7 * (signal_level - noise_floor)
+    prominence   = 0.4 * (signal_level - noise_floor)
+    min_dist     = round(FS_IQ / PACKET_RATE * 0.7)   # 70% of expected packet period
+    peaks, _     = find_peaks(envelope, height=threshold, distance=min_dist,
+                              prominence=prominence)
+
+    # peaks index into envelope; shift by win//2 to get the preamble centre in mag
+    preamble_indices = np.clip(peaks + win // 2, 0, len(mag) - 1)
+    return preamble_indices, envelope
+
+
+def classify_iq_gaps(preamble_indices, envelope):
+    """
+    Classify anomalous inter-preamble gaps as USB errors or RF errors.
+
+    Short gap (ratio < 0.9): GNURadio USB overrun mid-packet — samples
+    dropped, shortening the apparent time to the next preamble.
+
+    Long gap (ratio > 1.06) with sustained high envelope between the two
+    preambles: RF error — interference was present and prevented clean
+    preamble detection (no distinct narrow peak).
+
+    Long gaps where the envelope in the gap region is low are not classified
+    here (likely a missed preamble from weak signal, already in quality codes).
+
+    Returns:
+        usb_errors  list of (start_sample, end_sample)
+        rf_errors   list of (start_sample, end_sample)
+    """
+    if len(preamble_indices) < 2:
+        return [], []
+
+    win = max(1, round(PREAMBLE_DURATION * FS_IQ))
+    expected = FS_IQ / PACKET_RATE
+
+    # Typical preamble amplitude: median of envelope values at detected preamble locations
+    env_idx      = np.clip(preamble_indices.astype(int) - win // 2, 0, len(envelope) - 1)
+    peak_level   = np.median(envelope[env_idx])
+    interf_thr   = peak_level * 0.7   # envelope above this in a gap = interference
+
+    usb_errors = []
+    rf_errors  = []
+
+    for i, gap in enumerate(np.diff(preamble_indices.astype(float))):
+        ratio = gap / expected
+        s = int(preamble_indices[i])
+        e = int(preamble_indices[i + 1])
+
+        if ratio < 0.9:
+            usb_errors.append((s, e))
+        elif ratio > 1.06:
+            e0 = max(0,               s - win // 2)
+            e1 = min(len(envelope)-1, e - win // 2)
+            if e1 > e0 and np.max(envelope[e0:e1]) > interf_thr:
+                rf_errors.append((s, e))
+            else:
+                usb_errors.append((s, e))
+
+    return usb_errors, rf_errors
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -313,7 +402,7 @@ def decode_time_diversity(mat_path, max_duration):
         loss_nodiv     float
     Returns None on failure.
     """
-    reader = TimeStampBasedReader(enable_gcs=False, gcs_channels=(1, 2, 3, 4))
+    reader = TimeStampBasedReader(enable_gcs=False, gcs_channels=(1, 2, 3, 4),accepted_frame_lengths=(250, 248))
     try:
         d         = _load_mat(mat_path, ['push1', 'databit1', 'changeofstrength1', 'packetnum1'])
         push      = np.asarray(d['push1'],                                             dtype=np.uint16).ravel()
@@ -321,8 +410,6 @@ def decode_time_diversity(mat_path, max_duration):
         databit   = np.asarray(d.get('databit1',          np.zeros(N0, np.uint16)),   dtype=np.uint16).ravel()
         error     = np.asarray(d.get('changeofstrength1', np.zeros(N0, np.uint16)),   dtype=np.uint16).ravel()
         packetnum = np.asarray(d.get('packetnum1',        np.zeros(N0, np.uint16)),   dtype=np.uint16).ravel()
-        plt.plot(packetnum)
-        plt.show()
         # Arrays may arrive at different rates; the longest is the 100 kHz word clock.
         # Upsample shorter arrays by integer repeat to match.
         max_len = max(len(push), len(databit), len(error), len(packetnum))
@@ -405,8 +492,8 @@ def decode_time_diversity(mat_path, max_duration):
 # main
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    start_time   = float(sys.argv[1]) if len(sys.argv) > 1 else 8.0
-    max_duration = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    start_time   = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
+    max_duration = float(sys.argv[2]) if len(sys.argv) > 2 else .5
 
     labels    = ['Ant 1 only', 'Ant 2 only', 'Both antennas']
     mat_paths = [MAT_ANT1,    MAT_ANT2,    MAT_BOTH]
@@ -437,12 +524,36 @@ def main():
     print('\n══ Loading raw IQ ══')
     iq_start = start_time + SKIP_S
     iq_dur   = max(0.0, max_duration - SKIP_S)
+    mag1 = mag2 = None
     mag1_ds = mag2_ds = t_mag = None
+    preambles1 = preambles2 = None
+    env1 = env2 = None
+    usb_errors1 = usb_errors2 = []
+    rf_errors1  = rf_errors2  = []
 
     if iq_dur > 0:
         try:
             mag1 = read_iq_magnitude(IQ_FILE1, iq_start, iq_dur)
             mag2 = read_iq_magnitude(IQ_FILE2, iq_start, iq_dur)
+
+            # Preamble detection and gap classification
+            preambles1, env1 = detect_preambles(mag1)
+            preambles2, env2 = detect_preambles(mag2)
+            usb_errors1, rf_errors1 = classify_iq_gaps(preambles1, env1)
+            usb_errors2, rf_errors2 = classify_iq_gaps(preambles2, env2)
+            print(f'  Ch1: {len(preambles1)} preambles, '
+                  f'{len(usb_errors1)} USB error(s), {len(rf_errors1)} RF error(s)')
+            print(f'  Ch2: {len(preambles2)} preambles, '
+                  f'{len(usb_errors2)} USB error(s), {len(rf_errors2)} RF error(s)')
+            for ch, elist, kind in (('Ch1', usb_errors1, 'USB'), ('Ch2', usb_errors2, 'USB'),
+                                    ('Ch1', rf_errors1,  'RF'),  ('Ch2', rf_errors2,  'RF')):
+                for e in elist:
+                    t0 = iq_start + e[0] / FS_IQ
+                    t1 = iq_start + e[1] / FS_IQ
+                    gap_ms = (e[1] - e[0]) / FS_IQ * 1e3
+                    print(f'    {ch} {kind} error: t=[{t0:.4f}, {t1:.4f}] s  '
+                          f'gap={gap_ms:.2f} ms')
+
             if WINDOW is not None and Fs_push is not None:
                 WINDOW_IQ = max(1, round(WINDOW * FS_IQ / Fs_push))
                 nWin_raw  = len(mag1) // WINDOW_IQ
@@ -641,6 +752,95 @@ def main():
     ax2.legend(loc='lower right', fontsize=9)
     ax2.grid(axis='y', alpha=0.35, zorder=0)
     fig2.tight_layout()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Figure 3 — non-downsampled IQ magnitude + inter-preamble spacing
+    # ══════════════════════════════════════════════════════════════════════════
+    if mag1 is not None and mag2 is not None:
+        thin = IQ_DISPLAY_THIN
+        fig3, ax3s = plt.subplots(4, 1, figsize=(14, 10), sharex=True,
+                                  constrained_layout=True)
+
+        for grp, (mag, env, pream, usb_errs, rf_errs, color, lbl) in enumerate([
+            (mag1, env1, preambles1, usb_errors1, rf_errors1, '#7733bb', 'Antenna 1'),
+            (mag2, env2, preambles2, usb_errors2, rf_errors2, '#e07820', 'Antenna 2'),
+        ]):
+            ax_iq   = ax3s[grp * 2]
+            ax_gaps = ax3s[grp * 2 + 1]
+
+            # — IQ magnitude (max-envelope thinned for display) —
+            n_thin = len(mag) // thin
+            if n_thin > 0:
+                t_thin   = iq_start + (np.arange(n_thin) * thin + thin / 2) / FS_IQ
+                mag_thin = mag[:n_thin * thin].reshape(n_thin, thin).max(axis=1)
+                ax_iq.plot(t_thin, mag_thin, color=color, linewidth=0.4,
+                           rasterized=True, label='|IQ| (max envelope)')
+
+            # — Preamble sliding-window envelope —
+            if env is not None:
+                n_env    = len(env) // thin
+                t_env    = iq_start + (np.arange(n_env) * thin + thin / 2) / FS_IQ
+                env_thin = env[:n_env * thin].reshape(n_env, thin).max(axis=1)
+                ax_iq.plot(t_env, env_thin, color='black', linewidth=0.6,
+                           alpha=0.5, linestyle='--',
+                           label=f'{PREAMBLE_DURATION*1e6:.0f} µs window mean')
+
+            # — USB error regions (grey — recording artifact, not an RF issue) —
+            for e in usb_errs:
+                t0 = iq_start + e[0] / FS_IQ
+                t1 = iq_start + e[1] / FS_IQ
+                ax_iq.axvspan(t0, t1, color='grey', alpha=0.30, linewidth=0, zorder=2)
+
+            # — RF error regions (orange — interference caused preamble miss) —
+            for e in rf_errs:
+                t0 = iq_start + e[0] / FS_IQ
+                t1 = iq_start + e[1] / FS_IQ
+                ax_iq.axvspan(t0, t1, color='#e07820', alpha=0.30, linewidth=0, zorder=2)
+
+            ann = []
+            if usb_errs: ann.append(f'{len(usb_errs)} USB error(s) [grey]')
+            if rf_errs:  ann.append(f'{len(rf_errs)} RF error(s) [orange]')
+            ann_str = '  —  ' + ', '.join(ann) if ann else ''
+            ax_iq.set_yscale('log')
+            ax_iq.set_ylabel('|IQ|')
+            ax_iq.set_title(f'{lbl} — non-downsampled IQ{ann_str}')
+            ax_iq.legend(loc='upper right', fontsize=7)
+            ax_iq.grid(True, linewidth=0.4)
+
+            # — Inter-preamble spacing —
+            if pream is not None and len(pream) > 1:
+                gaps_ms     = np.diff(pream.astype(float)) / FS_IQ * 1e3
+                t_gaps      = iq_start + pream[1:].astype(float) / FS_IQ
+                expected_ms = 1e3 / PACKET_RATE
+                ax_gaps.step(t_gaps, gaps_ms, where='pre',
+                             color=color, linewidth=0.7)
+                ax_gaps.axhline(expected_ms, color='black', linewidth=0.8,
+                                linestyle='--', alpha=0.6,
+                                label=f'expected {expected_ms:.1f} ms')
+                for e in usb_errs:
+                    t0 = iq_start + e[0] / FS_IQ
+                    t1 = iq_start + e[1] / FS_IQ
+                    ax_gaps.axvspan(t0, t1, color='grey', alpha=0.30,
+                                   linewidth=0, zorder=2)
+                for e in rf_errs:
+                    t0 = iq_start + e[0] / FS_IQ
+                    t1 = iq_start + e[1] / FS_IQ
+                    ax_gaps.axvspan(t0, t1, color='#e07820', alpha=0.30,
+                                   linewidth=0, zorder=2)
+                ax_gaps.legend(loc='upper right', fontsize=7)
+            else:
+                ax_gaps.text(0.5, 0.5, 'Too few preambles detected',
+                             ha='center', va='center',
+                             transform=ax_gaps.transAxes)
+            ax_gaps.set_ylabel('Inter-preamble\ngap (ms)')
+            ax_gaps.grid(True, linewidth=0.4)
+
+        ax3s[-1].set_xlabel('Time (s)')
+        ax3s[0].set_xlim(left=iq_start)
+        fig3.suptitle(
+            f'Raw IQ magnitude & preamble spacing  (×{thin} thinned for display)'
+            f'  —  t₀ = {start_time:.1f} s,  dur = {max_duration:.2f} s',
+            fontsize=11)
 
     plt.show()
 
