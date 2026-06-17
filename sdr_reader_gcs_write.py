@@ -63,6 +63,7 @@ class DecodedPacket:
     is_valid: bool
     bits: np.ndarray
     error_flag: bool = False
+    reason: str = ''  # why this packet is invalid: cross_gap, intra_gap, out_of_order, ch_bounds, group_builder
 
 # Set Google Cloud credentials (required for GCS access)
 # Path is relative to this script's directory
@@ -75,6 +76,15 @@ else:
     print("   GCS functionality will be disabled unless credentials are set via gcloud auth")
 
 class TimeStampBasedReader:
+    # Consecutive frames where detected pkt# agrees with the word-distance
+    # expectation before we trust distance to override the noisy pkt# field.
+    # Two full 8-packet groups of clean agreement = confident phase lock.
+    PHASE_LOCK_THRESHOLD = 16
+    # Leaky mismatch run (mismatch +1, agreement -1) that, once reached while
+    # locked, drops the lock to re-acquire phase. One group of net mismatch is a
+    # real phase shift, not isolated bit-error noise.
+    PHASE_UNLOCK_THRESHOLD = 8
+
     def __init__(
         self,
         sample_rate=8e6,
@@ -113,8 +123,10 @@ class TimeStampBasedReader:
         rx_channel=0,
         bladerf_identifier=None,
         block_resume_after_unclean_exit=False,
+        disable_header_drops=False,
     ):
         self.quiet = bool(quiet)  # suppress per-buffer decode warnings (e.g. for secondary reader)
+        self.disable_header_drops = bool(disable_header_drops)
         self.block_resume_after_unclean_exit = bool(block_resume_after_unclean_exit)
         self.reader_label = str(reader_label)
         self.sample_rate = int(sample_rate)
@@ -250,6 +262,11 @@ class TimeStampBasedReader:
         self.placeholder_inserts_cross_chunk = 0
         self.placeholder_inserts_intra_chunk = 0
         self.placeholder_inserts_group_builder = 0
+        self.packet_num_distance_corrections = 0  # frames relabeled from noisy pkt# to distance value
+        self._phase_locked = False           # when locked, distance overrides noisy pkt# field
+        self._phase_agreement_run = 0        # consecutive detect-vs-distance agreements toward lock
+        self._phase_mismatch_run = 0         # leaky mismatch run toward re-acquire unlock
+        self.phase_relocks = 0               # times the phase lock was dropped to re-acquire
         self.gap_estimate_agree_count = 0
         self.gap_estimate_disagree_count = 0
         self.decoded_groups = self.decoded_groups_by_channel[self.channel_to_decode]
@@ -1281,6 +1298,33 @@ class TimeStampBasedReader:
             return float(v1), 5, 'v1', 'magnitude'
         return float(v2), 6, 'v2', 'magnitude'
 
+    def _is_exact_multi_frame_length(self, length: int) -> bool:
+        """True if length is an exact sum of N >= 1 accepted frame lengths.
+
+        For (248, 250): a length L achievable with N frames satisfies
+          N*248 <= L <= N*250  and  (L - N*248) % 2 == 0.
+        The step between adjacent lengths is max_len - min_len (= 2 for this system).
+        """
+        length = int(length)
+        if length <= 0:
+            return False
+        min_len = min(self.accepted_frame_lengths)
+        max_len = max(self.accepted_frame_lengths)
+        step = max_len - min_len
+        n_min = max(1, int(np.floor(length / max_len)))
+        n_max = int(np.ceil(length / min_len))
+        for n in range(n_min, n_max + 1):
+            remainder = length - n * min_len
+            if remainder < 0:
+                continue
+            if step == 0:
+                if remainder == 0:
+                    return True
+            else:
+                if remainder % step == 0 and remainder // step <= n:
+                    return True
+        return False
+
     def _estimate_frames_in_gap_linear(self, distance_words: int) -> int:
         """Estimate frame count using linear combinations of accepted frame lengths.
 
@@ -1381,7 +1425,8 @@ class TimeStampBasedReader:
 
         starts_in_fresh_data = frame_starts >= prefix_len 
         self.prefix_overlap_frames_skipped += int(np.sum(~starts_in_fresh_data))
-        valid_mask = np.isin(frame_lengths, self.accepted_frame_lengths) & starts_in_fresh_data
+        valid_mask = (np.array([self._is_exact_multi_frame_length(int(fl)) for fl in frame_lengths])
+                      & starts_in_fresh_data)
         valid_frame_starts = frame_starts[valid_mask]
 
         # Log every detected frame before the valid-length gate
@@ -1391,6 +1436,11 @@ class TimeStampBasedReader:
             abs_word = self._words_processed_total + int(_fs) - prefix_len
             pkt_n = int(packet_nums_for_edges[_fs])
             self._raw_frame_log.append((int(abs_word), pkt_n, int(_fl), bool(_fv)))
+            if not bool(_fv) and not self.quiet:
+                print(
+                    f'⚠️  Frame rejected (len={_fl}, not a valid N×frame-length): '
+                    f'pkt#{pkt_n} @ word={abs_word} t={abs_word/self.bit_clock_hz:.3f}s'
+                )
 
         if len(valid_frame_starts) == 0:
             consumed = int(process_until_input)
@@ -1438,7 +1488,7 @@ class TimeStampBasedReader:
                         last_num = (last_num + 1) % 8
                         for ch in range(1, 5):
                             packets_by_channel[ch].append(
-                                DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8))
+                                DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8), reason='cross_gap')
                             )
                             packet_word_positions[ch].append(None)
                     self.packet_sequence_anomaly_count += missing
@@ -1477,38 +1527,95 @@ class TimeStampBasedReader:
                     #     f"distance={distance} words (~{expected_frames_in_gap} frame(s))"
                     # )
 
-                    # If this frame should be the immediate next packet (1 frame apart)
-                    # but packet_num disagrees, treat it as a bad header and discard it.
-                    # Keep prev_start/prev_packet_num unchanged so the next frame is compared
-                    # against the last known-good packet.
-                    if expected_frames_in_gap == 1 and expected_next is not None and packet_num != expected_next:
-                        self.packet_sequence_header_drops += 1
-                        if not self.quiet:
-                            ts_drop = (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz
-                            print(
-                                f"⚠️  Dropping out-of-order observed packet @ t={ts_drop:.3f}s: "
-                                f"expected {expected_next}, observed {packet_num}"
-                            )
-                        # Insert a quality=0 placeholder so the watchdog counts this loss.
-                        for ch in range(1, 5):
-                            packets_by_channel[ch].append(
-                                DecodedPacket(packet_num=expected_next, is_valid=False, bits=np.array([], dtype=np.uint8))
-                            )
-                            packet_word_positions[ch].append(None)
-                        self.packet_sequence_anomaly_count += 1
-                        continue
+                    # Sustained mismatches mean a real phase shift — e.g. the packet
+                    # counter advanced across a genuine signal dropout — not isolated
+                    # bit-error noise.  Track a leaky run; once it crosses the unlock
+                    # threshold, drop the lock and re-acquire phase from the real
+                    # packet numbers (exactly like startup).  Without this the lock
+                    # latches forever and every healthy post-gap frame is mis-scored,
+                    # producing a fake reception "cliff" while the signal is fine.
+                    if self._phase_locked:
+                        self._phase_mismatch_run += 1
+                        if self._phase_mismatch_run >= self.PHASE_UNLOCK_THRESHOLD:
+                            self._phase_locked = False
+                            self._phase_mismatch_run = 0
+                            self._phase_agreement_run = 0
+                            self.phase_relocks += 1
+                            if not self.quiet:
+                                _ts_ul = (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz
+                                print(f"↻ Phase unlock @ t={_ts_ul:.3f}s: sustained mismatch, re-acquiring phase")
+                        else:
+                            # Still locked: treat as isolated noise.
+                            # If this frame should be the immediate next packet (1 frame
+                            # apart) but packet_num disagrees, treat it as a bad header
+                            # and discard it.  Disabled when disable_header_drops=True.
+                            if (not self.disable_header_drops
+                                    and expected_frames_in_gap == 1
+                                    and expected_next is not None
+                                    and packet_num != expected_next):
+                                self.packet_sequence_header_drops += 1
+                                if not self.quiet:
+                                    ts_drop = (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz
+                                    print(
+                                        f"⚠️  Dropping out-of-order observed packet @ t={ts_drop:.3f}s: "
+                                        f"expected {expected_next}, observed {packet_num}"
+                                    )
+                                # Insert a quality=0 placeholder so the watchdog counts this loss.
+                                for ch in range(1, 5):
+                                    packets_by_channel[ch].append(
+                                        DecodedPacket(packet_num=expected_next, is_valid=False, bits=np.array([], dtype=np.uint8), reason='out_of_order')
+                                    )
+                                    packet_word_positions[ch].append(None)
+                                self.packet_sequence_anomaly_count += 1
+                                # Advance prev so the NEXT frame's distance is measured
+                                # from this dropped position, not from before it.
+                                prev_start = start_idx
+                                prev_packet_num = expected_next
+                                prev_abs_start = cur_abs_start
+                                continue
+
+                            # Multi-frame gap (isolated): distance is trusted over the
+                            # noisy number field — relabel so one misread can't seed a
+                            # phantom group in the builder downstream.
+                            self.packet_num_distance_corrections += 1
+                            packet_num = expected_at_current
+
+                    # Not locked (startup or just-unlocked): the real packet number
+                    # flows untouched so the group builder can (re)find true phase.
+                    # This frame disagreed, so the run toward (re)lock resets.
+                    if not self._phase_locked:
+                        self._phase_agreement_run = 0
+                elif expected_at_current is not None:
+                    # Detection agreed with distance.
+                    if self._phase_locked:
+                        # Decay the mismatch run; isolated noise recovers, only a
+                        # sustained run survives to trigger unlock.
+                        if self._phase_mismatch_run > 0:
+                            self._phase_mismatch_run -= 1
+                    else:
+                        # Build confidence toward (re)lock.
+                        self._phase_agreement_run += 1
+                        if self._phase_agreement_run >= self.PHASE_LOCK_THRESHOLD:
+                            self._phase_locked = True
+                            self._phase_mismatch_run = 0
 
                 # Use distance-based inference only — packet numbers are unreliable
                 # (bit errors corrupt the number field, causing false large gaps).
                 # Within a single buffer the word distance is accurate.
                 missing = missing_from_distance
                 if missing > 0 and prev_packet_num is not None:
+                    if not self.quiet:
+                        _ts_fill = (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz
+                        print(
+                            f'⚠️  Intra-chunk fill: {missing} placeholder(s) before pkt#{packet_num} '
+                            f'@ t={_ts_fill:.3f}s (dist={distance} words, expected {expected_frames_in_gap} frames, prev_pkt#{prev_packet_num})'
+                        )
                     last_num = prev_packet_num
                     for _ in range(missing):
                         last_num = (last_num + 1) % 8
                         for ch in range(1, 5):
                             packets_by_channel[ch].append(
-                                DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8))
+                                DecodedPacket(packet_num=last_num, is_valid=False, bits=np.array([], dtype=np.uint8), reason='intra_gap')
                             )
                             packet_word_positions[ch].append(None)
                     self.placeholder_inserts_intra_chunk += int(missing)
@@ -1530,7 +1637,7 @@ class TimeStampBasedReader:
                 ch_end = ch_start + self.bits_per_channel
                 if ch_start < 0 or ch_end+5 > len(packet_nums_raw):
                     packets_by_channel[ch].append(
-                        DecodedPacket(packet_num=packet_num, is_valid=False, bits=np.array([], dtype=np.uint8))
+                        DecodedPacket(packet_num=packet_num, is_valid=False, bits=np.array([], dtype=np.uint8), reason='ch_bounds')
                     )
                     packet_word_positions[ch].append(start_idx - prefix_len)
                     continue
@@ -1570,6 +1677,7 @@ class TimeStampBasedReader:
                         packet_num=expected_packet_num,
                         is_valid=False,
                         bits=np.array([], dtype=np.uint8),
+                        reason='group_builder',
                     )
                 )
                 self.placeholder_inserts_group_builder += 1
@@ -1579,6 +1687,9 @@ class TimeStampBasedReader:
         # Extend pending packets for each channel (no packet dropping/resync)
         for channel_idx, packets in packets_by_channel.items():
             pending = self._pending_packets_by_channel[channel_idx]
+            if channel_idx == 1 and len(self._group_builder_input_log) < 100_000:
+                for p in packets:
+                    self._group_builder_input_log.append((int(p.packet_num), bool(p.is_valid)))
             pending.extend(packets)
 
             # Also extend word positions if available
@@ -1807,20 +1918,20 @@ class TimeStampBasedReader:
                         else:
                             quality[s] = 0
                             # raw_ints[s] stays 0; will be overwritten by carry-forward in _append_gcs_group
-                        if self._carry_forward_log_count < self._carry_forward_log_max:
-                            self._carry_forward_log_count += 1
-                            _r1_attempt = self._decode_raw_int_from_packet_bits(p1.bits) if p1.bits is not None and len(p1.bits) >= 20 else None
-                            _r2_attempt = self._decode_raw_int_from_packet_bits(p2.bits) if p2.bits is not None and len(p2.bits) >= 20 else None
-                            print(
-                                f'[carry-fwd #{self._carry_forward_log_count}] ch{channel_idx} slot{s} '
-                                f'idx={sample_idx} t={sample_idx/self.output_rate_hz:.3f}s → both copies invalid, carry-forward will be used. '
-                                f'v1: pkt#{p1.packet_num} valid={p1.is_valid} err={p1.error_flag} '
-                                f'bits={len(p1.bits) if p1.bits is not None else 0} raw_attempt={_r1_attempt} | '
-                                f'v2: pkt#{p2.packet_num} valid={p2.is_valid} err={p2.error_flag} '
-                                f'bits={len(p2.bits) if p2.bits is not None else 0} raw_attempt={_r2_attempt}'
-                            )
-                            if self._carry_forward_log_count == self._carry_forward_log_max:
-                                print(f'[carry-fwd] log limit ({self._carry_forward_log_max}) reached, suppressing further carry-forward logs')
+                            if self._carry_forward_log_count < self._carry_forward_log_max:
+                                self._carry_forward_log_count += 1
+                                _r1_attempt = self._decode_raw_int_from_packet_bits(p1.bits) if p1.bits is not None and len(p1.bits) >= 20 else None
+                                _r2_attempt = self._decode_raw_int_from_packet_bits(p2.bits) if p2.bits is not None and len(p2.bits) >= 20 else None
+                                print(
+                                    f'[carry-fwd #{self._carry_forward_log_count}] ch{channel_idx} slot{s} '
+                                    f'idx={sample_idx} t={sample_idx/self.output_rate_hz:.3f}s → both copies invalid, carry-forward will be used. '
+                                    f'v1: pkt#{p1.packet_num} valid={p1.is_valid} err={p1.error_flag} reason={p1.reason!r} '
+                                    f'bits={len(p1.bits) if p1.bits is not None else 0} raw_attempt={_r1_attempt} | '
+                                    f'v2: pkt#{p2.packet_num} valid={p2.is_valid} err={p2.error_flag} reason={p2.reason!r} '
+                                    f'bits={len(p2.bits) if p2.bits is not None else 0} raw_attempt={_r2_attempt}'
+                                )
+                                if self._carry_forward_log_count == self._carry_forward_log_max:
+                                    print(f'[carry-fwd] log limit ({self._carry_forward_log_max}) reached, suppressing further carry-forward logs')
 
                 prev_neighbor = None
                 if len(self.decoded_groups_by_channel[channel_idx]) > 0:
@@ -1991,6 +2102,12 @@ class TimeStampBasedReader:
         self.placeholder_inserts_cross_chunk = 0
         self.placeholder_inserts_intra_chunk = 0
         self.placeholder_inserts_group_builder = 0
+        self.packet_num_distance_corrections = 0  # frames relabeled from noisy pkt# to distance value
+        self._phase_locked = False           # when locked, distance overrides noisy pkt# field
+        self._phase_agreement_run = 0        # consecutive detect-vs-distance agreements toward lock
+        self._phase_mismatch_run = 0         # leaky mismatch run toward re-acquire unlock
+        self.phase_relocks = 0               # times the phase lock was dropped to re-acquire
+        self._group_builder_input_log = []   # (packet_num, is_valid) for ch1, capped at 2000
         self.gap_estimate_agree_count = 0
         self.gap_estimate_disagree_count = 0
         self.decoded_groups = self.decoded_groups_by_channel[self.channel_to_decode]
@@ -2798,10 +2915,10 @@ if __name__ == '__main__':
         accepted_frame_lengths=(248, 250),
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
-        channel_to_decode=3,
+        channel_to_decode=1,
         gcs_bucket="ueegbucket",
         gcs_buffer_size=400,
-        gcs_channels=[2, 3],
+        gcs_channels=[1,2, 3],
         gcs_format='binary',
         enable_gcs_trigger=True,
         enable_gcs=True,
