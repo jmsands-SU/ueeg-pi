@@ -77,6 +77,12 @@ CCW_COLOR   = 'magenta'     # Lap 2, counter-clockwise
 START_COLOR = 'white'       # Start/End diamond (black-edged; limegreen blends w/ viridis)
 RX_COLOR    = 'crimson'     # Rx star
 
+# Distance zones for Figure 3 (rate vs distance-from-Rx). None → auto quantile
+# bands (~equal sample count each). Set explicit metre edges for physically
+# meaningful bands, e.g. [0, 3, 6, 9, 16].
+DISTANCE_ZONE_EDGES = [0,2.5,5,7.5,10]
+N_DISTANCE_ZONES    = 5   # number of auto zones when DISTANCE_ZONE_EDGES is None
+
 LABELS   = ['Ant 1 only', 'Ant 2 only', 'Both antennas']
 
 # Every figure is saved here (PNG) for review before you choose which to keep.
@@ -598,32 +604,32 @@ COND_COLORS = {
 
 
 def _auto_distance_zones(dists, n_zones=4):
-    """Split pooled distances into n_zones ordered bands at the largest gaps in
-    the sorted distribution. The room perimeter only sits at a few distances from
-    a fixed Rx, so distance is effectively clumpy — splitting at the natural gaps
-    recovers those bands. Returns bin edges (length n_zones+1)."""
-    d = np.sort(np.asarray(dists, float))
+    """Quantile-based distance zones: each zone holds ~equal sample count, so the
+    zones are always well-populated and never degenerate (unlike gap-splitting,
+    which collapses when the distance spread is fairly continuous). Returns bin
+    edges (length ≤ n_zones+1; duplicates collapse if distances are very clumped).
+    Pass explicit edges to DISTANCE_ZONE_EDGES to override with physical bands."""
+    d = np.asarray(dists, float)
     d = d[np.isfinite(d)]
     if len(d) < 2:
         lo = d[0] if len(d) else 0.0
         return np.array([lo - 1e-6, lo + 1e-6])
-    n_zones = max(1, min(n_zones, len(d) - 1))
-    if n_zones == 1:
-        return np.array([d[0] - 1e-6, d[-1] + 1e-6])
-    split_at = np.sort(np.argsort(np.diff(d))[-(n_zones - 1):])  # largest gaps
-    bounds = [(d[i] + d[i + 1]) / 2.0 for i in split_at]
-    return np.array([d[0] - 1e-6, *bounds, d[-1] + 1e-6])
+    edges = np.unique(np.quantile(d, np.linspace(0.0, 1.0, n_zones + 1)))
+    edges[0] -= 1e-6
+    edges[-1] += 1e-6
+    return edges
 
 
-def plot_rate_vs_distance(configs, t_waypoints_raw, W, H, rx, delta, n_zones=4):
-    """Reception rate aggregated into distance zones, one series per antenna
-    config — a readable replacement for the raw scatter.
+def plot_rate_vs_distance(configs, t_waypoints_raw, W, H, rx, delta,
+                          n_zones=4, zone_edges=None):
+    """Grouped stacked bars of reception rate per distance zone, one bar per
+    antenna config — a readable replacement for the staggered line plot.
 
-    Distance from Rx is binned into ~n_zones natural bands (the perimeter clumps
-    at a few distances). Per zone × config the three configs are dodged apart and
-    shown as: time-diversity median ± IQR (filled marker, solid line across
-    zones) and no-diversity median (hollow marker, dashed line). The vertical
-    segment joining them is the time-diversity gain.
+    Distance from Rx is binned into zones (quantile bands, or DISTANCE_ZONE_EDGES).
+    Within each zone the configs are grouped side by side. Each bar is stacked:
+    the solid lower segment is the no-diversity (single-copy) median; the lighter
+    top segment is the time-diversity gain, so the full bar height is the
+    time-diversity median. A thin cap shows the IQR of the time-diversity rate.
 
     configs: (label, t_walk, rate_timdiv_walk, rate_nodiv_walk) — skip Nones.
     """
@@ -641,7 +647,10 @@ def plot_rate_vs_distance(configs, t_waypoints_raw, W, H, rx, delta, n_zones=4):
         all_d.append(dist)
     all_d = np.concatenate(all_d) if all_d else np.array([0.0, 1.0])
 
-    edges = _auto_distance_zones(all_d, n_zones)
+    if zone_edges is not None:
+        edges = np.asarray(zone_edges, float)
+    else:
+        edges = _auto_distance_zones(all_d, n_zones)
     K = len(edges) - 1
     xpos = np.arange(K)
     zmask = lambda d, z: ((d >= edges[z]) & (d <= edges[z + 1])) if z == K - 1 \
@@ -653,35 +662,33 @@ def plot_rate_vs_distance(configs, t_waypoints_raw, W, H, rx, delta, n_zones=4):
         return f'{edges[z]:.1f}–{edges[z + 1]:.1f} m'
     zlabels = [_zlabel(z) for z in range(K)]
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.6), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(7.4, 4.6), constrained_layout=True)
+    ax.set_axisbelow(True)
     n_cfg = len(series)
-    dodge = np.linspace(-0.24, 0.24, n_cfg) if n_cfg > 1 else np.array([0.0])
+    group_w = 0.82
+    bw      = group_w / n_cfg
+    offs    = (np.arange(n_cfg) - (n_cfg - 1) / 2.0) * bw
 
     for ci, (label, dist, r_div, r_nodiv) in enumerate(series):
         color = COND_COLORS.get(label)
-        xs, dmed, dlo, dhi, nmed = [], [], [], [], []
         for z in range(K):
             m = zmask(dist, z)
             if not np.any(m):
                 continue
-            xs.append(xpos[z] + dodge[ci])
-            dv, nv = r_div[m], r_nodiv[m]
-            dmed.append(100 * np.nanmedian(dv))
-            dlo.append(100 * np.nanpercentile(dv, 25))
-            dhi.append(100 * np.nanpercentile(dv, 75))
-            nmed.append(100 * np.nanmedian(nv))
-        xs, dmed, nmed = np.array(xs), np.array(dmed), np.array(nmed)
-        # vertical gain connectors (no-div → div)
-        for x, dm, nm in zip(xs, dmed, nmed):
-            ax.plot([x, x], [nm, dm], color=color, lw=1.0, alpha=0.45, zorder=2)
-        # no-div: hollow markers + faint dashed line
-        ax.plot(xs, nmed, linestyle=(0, (4, 2)), color=color, lw=1.1, alpha=0.6, zorder=3)
-        ax.plot(xs, nmed, 'o', mfc='white', mec=color, mew=1.4, ms=6, zorder=3)
-        # div: median ± IQR, filled marker, solid line
-        yerr = np.vstack([dmed - np.array(dlo), np.array(dhi) - dmed])
-        ax.errorbar(xs, dmed, yerr=yerr, fmt='-o', color=color, ecolor=color,
-                    elinewidth=1.0, capsize=3, ms=7, lw=2.0,
-                    markeredgecolor='white', markeredgewidth=0.6, zorder=4, label=label)
+            x = xpos[z] + offs[ci]
+            dv, nv  = r_div[m], r_nodiv[m]
+            div_med = 100 * np.nanmedian(dv)
+            nod_med = 100 * np.nanmedian(nv)          # always ≤ div_med (div ≥ nodiv pointwise)
+            q25, q75 = 100 * np.nanpercentile(dv, 25), 100 * np.nanpercentile(dv, 75)
+            # solid base = no diversity; lighter top = diversity gain (total = with diversity)
+            ax.bar(x, nod_med, width=bw * 0.9, color=color,
+                   edgecolor='white', linewidth=0.4, zorder=3)
+            ax.bar(x, div_med - nod_med, bottom=nod_med, width=bw * 0.9, color=color,
+                   alpha=0.35, edgecolor='white', linewidth=0.4, zorder=3)
+            # IQR cap on the time-diversity median (bar top)
+            ax.errorbar(x, div_med, yerr=[[div_med - q25], [q75 - div_med]],
+                        fmt='none', ecolor='0.25', elinewidth=0.9, capsize=2.5,
+                        alpha=0.7, zorder=4)
 
     ax.set_xticks(xpos)
     ax.set_xticklabels(zlabels)
@@ -690,18 +697,15 @@ def plot_rate_vs_distance(configs, t_waypoints_raw, W, H, rx, delta, n_zones=4):
     ax.set_ylim(0, 103)
     ax.set_xlim(-0.5, K - 0.5)
     ax.grid(True, axis='y', alpha=0.3)
+    ax.set_title('bar = with time diversity   ·   solid = no diversity   ·   '
+                 'light top = diversity gain', fontsize=8, color='0.3')
 
-    leg1 = ax.legend(title='Antenna config', loc='lower left', framealpha=0.9, fontsize=9)
-    ax.add_artist(leg1)
-    from matplotlib.lines import Line2D
-    enc = [
-        Line2D([0], [0], marker='o', color='gray', mfc='gray', mec='white',
-               linestyle='-', label='time diversity (med ± IQR)'),
-        Line2D([0], [0], marker='o', color='gray', mfc='white', mec='gray',
-               linestyle=(0, (4, 2)), label='no diversity (median)'),
-    ]
-    ax.legend(handles=enc, loc='upper right', framealpha=0.9, fontsize=8,
-              title='vertical gap = diversity gain')
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=COND_COLORS.get(lbl), label=lbl) for lbl, *_ in series]
+    # Outside the axes (constrained_layout reserves the space) so it never covers
+    # bars or IQR caps.
+    fig.legend(handles=handles, title='Antenna config', loc='outside right upper',
+               framealpha=0.9, fontsize=9)
     fig.suptitle('Reception rate vs distance from receiver', fontsize=11)
     return fig
 
@@ -850,7 +854,8 @@ def main():
                              rate_timdiv[walk_mask], rate_nodiv[walk_mask]))
     print('Plotting Figure 3 (rate vs distance) ...')
     plot_rate_vs_distance(fig3_configs, t_waypoints_raw,
-                          W_M, H_M, RX_M, DELTA_PATH)
+                          W_M, H_M, RX_M, DELTA_PATH,
+                          n_zones=N_DISTANCE_ZONES, zone_edges=DISTANCE_ZONE_EDGES)
 
     _save_all_figures(PLOTS_DIR)
     plt.show()
