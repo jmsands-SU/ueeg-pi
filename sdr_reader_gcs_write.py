@@ -112,8 +112,10 @@ class TimeStampBasedReader:
         reader_label='ant1',
         rx_channel=0,
         bladerf_identifier=None,
+        block_resume_after_unclean_exit=False,
     ):
         self.quiet = bool(quiet)  # suppress per-buffer decode warnings (e.g. for secondary reader)
+        self.block_resume_after_unclean_exit = bool(block_resume_after_unclean_exit)
         self.reader_label = str(reader_label)
         self.sample_rate = int(sample_rate)
         self.frequency = int(frequency)
@@ -369,6 +371,15 @@ class TimeStampBasedReader:
             print(f'Warning: could not read recording state file: {exc}')
             return
 
+        if self.block_resume_after_unclean_exit:
+            print(
+                f'WARNING: Unclean exit detected (state file: {self._RECORDING_STATE_FILE}). '
+                f'block_resume_after_unclean_exit is set — recording will NOT auto-resume. '
+                f'To clear this block and allow recording, delete the state file:\n'
+                f'  rm {self._RECORDING_STATE_FILE}'
+            )
+            return
+
         projected_end = state.get('projected_end_time_unix')
         now = time.time()
 
@@ -523,9 +534,10 @@ class TimeStampBasedReader:
                 self.secondary_reader.gcs_blob_name = sec_blob
                 self.secondary_reader.gcs_temp_name = f'{sec_blob}.temp'
                 print(f'GCS blob name for antenna 2 updated to: {sec_blob}')
-        if 'duration_seconds' in msg:
+        _dur_raw = msg.get('duration_seconds', msg.get('duration'))
+        if _dur_raw is not None:
             try:
-                self._gcs_trigger_duration = float(msg['duration_seconds'])
+                self._gcs_trigger_duration = float(_dur_raw)
                 print(f'GCS trigger duration set to: {self._gcs_trigger_duration}s')
                 if self.secondary_reader is not None:
                     self.secondary_reader._gcs_trigger_duration = self._gcs_trigger_duration
@@ -560,23 +572,21 @@ class TimeStampBasedReader:
                 )
                 ack_ids = []
                 for received in response.received_messages:
-                    
                     ack_ids.append(received.ack_id)
                     data = received.message.data.decode('utf-8', errors='ignore')
                     print(f'GCS trigger message received: {data!r}')
                     self._handle_gcs_trigger_message(data)
                 if ack_ids:
                     self.gcs_subscriber.acknowledge(request={'subscription': subscription_path, 'ack_ids': ack_ids})
+                self._trigger_poll_err_count = 0
             except Exception as exc:
                 _trigger_err_count = getattr(self, '_trigger_poll_err_count', 0) + 1
                 self._trigger_poll_err_count = _trigger_err_count
                 if _trigger_err_count == 1 or _trigger_err_count % 60 == 0:
                     print(f'GCS trigger poll error (#{_trigger_err_count}): {exc}')
                 time.sleep(0.5)
-                continue
-            self._trigger_poll_err_count = 0
 
-            # Duration check: auto-stop if recording has run past the requested duration
+            # Duration check: always runs regardless of whether the Pub/Sub pull succeeded.
             if (
                 self.gcs_recording_active
                 and self._gcs_trigger_duration is not None
@@ -2778,6 +2788,7 @@ if __name__ == '__main__':
         decode_scale=_primary_board['decode_scale'],
         gain_mode='manual',
         gain=40,
+        block_resume_after_unclean_exit=_board_cfg.get('block_resume_after_unclean_exit', False),
         counter=False,
         raw=False,
         bandwidth=2e6,
