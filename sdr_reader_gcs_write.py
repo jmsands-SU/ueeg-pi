@@ -115,6 +115,8 @@ class TimeStampBasedReader:
         frame_length_counts=None,
         bits_per_channel=40,
         channel_to_decode=3,
+        plot_channels=None,
+        save_plot_csv=True,
         mismatch_threshold=0.001,
         decode_scale=1/512*.3,#0.03 / 256 * 2,
         decoded_group_maxlen=5000,
@@ -197,6 +199,19 @@ class TimeStampBasedReader:
         if self.channel_to_decode < 1 or self.channel_to_decode > 4:
             raise ValueError('channel_to_decode must be 1..4')
 
+        # Channels stacked as subplots by the post-capture plot. Defaults to the
+        # decode channel; set to a list (e.g. [1, 2, 3, 4]) to plot several at once.
+        if plot_channels is None:
+            self.plot_channels = [self.channel_to_decode]
+        elif isinstance(plot_channels, (list, tuple, set)):
+            self.plot_channels = [self._normalize_channel_index(c, self.channel_to_decode)
+                                  for c in plot_channels]
+        else:
+            self.plot_channels = [self._normalize_channel_index(plot_channels, self.channel_to_decode)]
+
+        # When False, the post-capture plot is shown but no per-channel CSV is written.
+        self.save_plot_csv = bool(save_plot_csv)
+
         self.running = False
         self._rx_running = False
         self._sdr_restart_log = []  # list of {sample_idx, timestamp_utc, drop_rate, reason}
@@ -206,6 +221,13 @@ class TimeStampBasedReader:
         self.sdr_restart_drop_threshold = 0.50
         self.sdr_restart_rate_upper_factor = 1.10  # restart if rate > expected * this
         self.sdr_restart_rate_lower_factor = 0.50  # restart if rate < expected * this
+        # Rate is measured per-window from a bursty producer, so a single stall in
+        # one window is followed by a catch-up burst in the next (e.g. a GCS write
+        # 504 holds back counting, then the backlog flushes). Either window alone
+        # can fall out of band while the two-window average is fine. Require this
+        # many *consecutive* out-of-band windows before restarting on a rate
+        # excursion, so a lone stall/catch-up pair averages out.
+        self.sdr_restart_rate_consecutive_windows = 2
 
         self._last_decoded_sample_time = None      # wall-clock time of most recent quality append
         self._last_chunk_end_word_timestamp = None  # wall-clock end of last consumed chunk
@@ -1013,6 +1035,8 @@ class TimeStampBasedReader:
         cycle = 0
         count_before = self.decoded_sample_count_by_channel[self.channel_to_decode]
         t_before = time.time()
+        rate_high_strikes = 0  # consecutive windows above the upper rate limit
+        rate_low_strikes = 0   # consecutive windows below the lower rate limit
 
         while self.running:
             for _ in range(int(self.sdr_watchdog_window_seconds * 4)):
@@ -1076,23 +1100,45 @@ class TimeStampBasedReader:
                 continue
 
             upper_rate_limit = self.output_rate_hz * self.sdr_restart_rate_upper_factor
+            lower_rate_limit = self.output_rate_hz * self.sdr_restart_rate_lower_factor
+            need_strikes = max(1, int(self.sdr_restart_rate_consecutive_windows))
+
             if measured_rate_hz > upper_rate_limit and self._last_decoded_sample_time is not None:
+                rate_high_strikes += 1
+                rate_low_strikes = 0
+                if rate_high_strikes >= need_strikes:
+                    print(
+                        f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz exceeds '
+                        f'{upper_rate_limit:.1f}Hz ({self.sdr_restart_rate_upper_factor:.0%} of expected) '
+                        f'for {rate_high_strikes} consecutive windows — exiting for monitor-driven restart.'
+                    )
+                    self.running = False
+                    continue
                 print(
                     f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz exceeds '
-                    f'{upper_rate_limit:.1f}Hz ({self.sdr_restart_rate_upper_factor:.0%} of expected) '
-                    f'— exiting for monitor-driven restart.'
+                    f'{upper_rate_limit:.1f}Hz — transient (strike {rate_high_strikes}/{need_strikes}), '
+                    f'likely stall/catch-up; confirming next window before restart.'
                 )
-                self.running = False
-                continue
-
-            lower_rate_limit = self.output_rate_hz * self.sdr_restart_rate_lower_factor
-            if measured_rate_hz < lower_rate_limit and self._last_decoded_sample_time is not None:
+            elif measured_rate_hz < lower_rate_limit and self._last_decoded_sample_time is not None:
+                rate_low_strikes += 1
+                rate_high_strikes = 0
+                if rate_low_strikes >= need_strikes:
+                    print(
+                        f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz below '
+                        f'{lower_rate_limit:.1f}Hz ({self.sdr_restart_rate_lower_factor:.0%} of expected) '
+                        f'for {rate_low_strikes} consecutive windows — exiting for monitor-driven restart.'
+                    )
+                    self.running = False
+                    continue
                 print(
                     f'⚠️  Watchdog: measured rate {measured_rate_hz:.1f}Hz below '
-                    f'{lower_rate_limit:.1f}Hz ({self.sdr_restart_rate_lower_factor:.0%} of expected) '
-                    f'— exiting for monitor-driven restart.'
+                    f'{lower_rate_limit:.1f}Hz — transient (strike {rate_low_strikes}/{need_strikes}), '
+                    f'likely stall/catch-up; confirming next window before restart.'
                 )
-                self.running = False
+            else:
+                # In band: a lone excursion was just a stall/catch-up pair averaging out.
+                rate_high_strikes = 0
+                rate_low_strikes = 0
 
     def setup_device(self):
         if _bladerf is None:
@@ -2702,56 +2748,52 @@ class TimeStampBasedReader:
 
         return freqs, psd_accum / len(tapers)
 
-    def plot_channel(self, channel_idx=None, matlab_compare_path=None, matlab_var='data'):
-        idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
+    # Shared quality→colour styling for the decoded time-series scatter.
+    _QUAL_STYLE = {
+        0: ('red',       'q=0 no_packet'),
+        1: ('orange',    'q=1 only_v1'),
+        2: ('gold',      'q=2 only_v2'),
+        3: ('steelblue', 'q=3 both_match'),
+        5: ('magenta',   'q=5 mismatch→v1'),
+        6: ('purple',    'q=6 mismatch→v2'),
+    }
+
+    def _draw_channel_timeseries(self, ax, idx, save_csv=True):
+        """Draw one channel's quality-coloured time series onto ``ax``.
+
+        When ``save_csv`` is True the per-channel CSV artifact is also exported.
+        Returns True if data was plotted, False if the channel had no decoded
+        samples.
+        """
         series, quality_series = self.get_channel_series(idx)
         if len(series) == 0:
-            print('No decoded data to plot.')
-            return
+            print(f'No decoded data to plot for channel {idx}.')
+            return False
 
         fs_output = self.output_rate_hz
         t = np.arange(len(series)) / fs_output
 
-        csv_path = f'/home/joannas/bladeRF/hdl/pythonscripts/time_domain_python_artifact_{self.reader_label}_ch{idx}.csv'
-        export_matrix = np.column_stack((t, series, quality_series))
-        np.savetxt(
-            csv_path,
-            export_matrix,
-            delimiter=',',
-            header=(
-                'time_s,amplitude,quality_code | '
-                'quality mapping: bits[2:0]: 0=no_packet, 1=only_v1(v2_errored), 2=only_v2(v1_errored), '
-                '3=both_match, 5=mismatch_picked_v1, 6=mismatch_picked_v2; '
-                'bit3(0x08)=error_flag (OR\'d into base code)'
-            ),
-            comments='',
-        )
-        print(f'Exported decoded time-domain CSV: {csv_path}')
-
-        QUAL_STYLE = {
-            0: ('red',       'q=0 no_packet'),
-            1: ('orange',    'q=1 only_v1'),
-            2: ('gold',      'q=2 only_v2'),
-            3: ('steelblue', 'q=3 both_match'),
-            5: ('magenta',   'q=5 mismatch→v1'),
-            6: ('purple',    'q=6 mismatch→v2'),
-        }
+        if save_csv:
+            csv_path = f'/home/joannas/ueeg-recordings/chip23_shorttogroundnoise{self.reader_label}ch{idx}.csv'
+            export_matrix = np.column_stack((t, series, quality_series))
+            np.savetxt(
+                csv_path,
+                export_matrix,
+                delimiter=',',
+                header=(
+                    'time_s,amplitude,quality_code | '
+                    'quality mapping: bits[2:0]: 0=no_packet, 1=only_v1(v2_errored), 2=only_v2(v1_errored), '
+                    '3=both_match, 5=mismatch_picked_v1, 6=mismatch_picked_v2; '
+                    'bit3(0x08)=error_flag (OR\'d into base code)'
+                ),
+                comments='',
+            )
+            print(f'Exported decoded time-domain CSV: {csv_path}')
 
         base_quality_series = quality_series & np.int8(0x07)
         err_mask = (quality_series & np.int8(0x08)) != 0
 
-        iq_data = getattr(self, '_iq_plot_data', None)
-        if iq_data is not None:
-            iq_t, iq_i, iq_q, win_lo, win_hi, iq_name = iq_data
-            fig, (ax, ax_i, ax_q) = plt.subplots(3, 1, sharex=True,
-                                                  figsize=(14, 8),
-                                                  gridspec_kw={'height_ratios': [2, 1, 1]})
-            ax.set_xlim(win_lo, win_hi)
-        else:
-            fig, ax = plt.subplots(figsize=(14, 4))
-            ax_i = ax_q = None
-
-        for q, (color, label) in QUAL_STYLE.items():
+        for q, (color, label) in self._QUAL_STYLE.items():
             mask = base_quality_series == q
             if not np.any(mask):
                 continue
@@ -2766,6 +2808,53 @@ class TimeStampBasedReader:
         ax.set_ylabel('Amplitude (V)')
         ax.legend(loc='upper right', markerscale=3, fontsize=9)
         ax.grid(True, alpha=0.4)
+        print(f'ch{idx}: max={max(series)} min={min(series)}')
+        return True
+
+    def plot_channel(self, channel_idx=None, matlab_compare_path=None, matlab_var='data', save_csv=True):
+        # Accept a single channel or a list/tuple of channels → stacked subplots.
+        if isinstance(channel_idx, (list, tuple, set)):
+            channels = [self._normalize_channel_index(c, self.channel_to_decode)
+                        for c in channel_idx]
+        else:
+            channels = [self._normalize_channel_index(channel_idx, self.channel_to_decode)]
+        if not channels:
+            print('No channels requested to plot.')
+            return
+
+        # Multi-channel: one stacked subplot per channel, shared time axis.
+        # (IQ overlay is single-channel only; it is skipped for multi-channel.)
+        if len(channels) > 1:
+            fig, axes = plt.subplots(len(channels), 1, sharex=True,
+                                     figsize=(14, 3 * len(channels)), squeeze=False)
+            axes = axes[:, 0]
+            any_drawn = False
+            for ax, idx in zip(axes, channels):
+                any_drawn |= self._draw_channel_timeseries(ax, idx, save_csv=save_csv)
+            if not any_drawn:
+                plt.close(fig)
+                return
+            axes[-1].set_xlabel('Time (s)')
+            fig.tight_layout()
+            plt.show()
+            return
+
+        # Single channel: preserve the optional raw-I/Q subplots.
+        idx = channels[0]
+        iq_data = getattr(self, '_iq_plot_data', None)
+        if iq_data is not None:
+            iq_t, iq_i, iq_q, win_lo, win_hi, iq_name = iq_data
+            fig, (ax, ax_i, ax_q) = plt.subplots(3, 1, sharex=True,
+                                                  figsize=(14, 8),
+                                                  gridspec_kw={'height_ratios': [2, 1, 1]})
+            ax.set_xlim(win_lo, win_hi)
+        else:
+            fig, ax = plt.subplots(figsize=(14, 4))
+            ax_i = ax_q = None
+
+        if not self._draw_channel_timeseries(ax, idx, save_csv=save_csv):
+            plt.close(fig)
+            return
 
         if ax_i is not None:
             ax_i.plot(iq_t, iq_i, linewidth=0.4, color='steelblue')
@@ -2780,8 +2869,6 @@ class TimeStampBasedReader:
             ax.set_xlabel('Time (s)')
 
         fig.tight_layout()
-        print(max(series), min(series))
-
         plt.show()
 
     def start_capture(self, duration_seconds=None):
@@ -2871,9 +2958,12 @@ class TimeStampBasedReader:
                 self.secondary_reader.print_stats()
 
             if self.enable_plotting:
-                self.plot_channel(self.channel_to_decode)
+                self.plot_channel(self.plot_channels, save_csv=self.save_plot_csv)
                 if self.secondary_reader is not None and self.secondary_reader.enable_plotting:
-                    self.secondary_reader.plot_channel(self.secondary_reader.channel_to_decode)
+                    self.secondary_reader.plot_channel(
+                        self.secondary_reader.plot_channels,
+                        save_csv=self.secondary_reader.save_plot_csv,
+                    )
             elif self.enable_gcs:
                 series, quality_series = self.get_channel_series(self.channel_to_decode)
                 self._upload_series_to_gcs_binary(series, quality_series)
@@ -2890,8 +2980,12 @@ if __name__ == '__main__':
         _board_cfg = json.load(_f)
     _board = _board_cfg['boards'][_board_cfg['active_board']]
 
-    # In dual_rx_antenna mode: active_board → secondary (RX1); dual_rx_primary_board → primary (RX0).
-    # If dual_rx_primary_board is null, the primary also uses active_board settings.
+    # In dual_rx_antenna mode the BladeRF is tuned to active_board.frequency_hz (the LOWER of the
+    # two uEEG carriers) and both antennas share that single LO. The two uEEGs then separate by I/Q:
+    #   primary (ant1)   = RX0 I (real) → higher-freq uEEG, uses dual_rx_primary_board.decode_scale
+    #   secondary (ant2) = RX0 Q (imag) → lower-freq  uEEG, uses active_board.decode_scale
+    # So active_board governs both the RX LO frequency and ant2's scale; dual_rx_primary_board
+    # governs only ant1's scale. If dual_rx_primary_board is null, the primary also uses active_board.
     _dual_primary_key = _board_cfg.get('dual_rx_primary_board')
     _primary_board = (
         _board_cfg['boards'][str(_dual_primary_key)]
@@ -2916,10 +3010,12 @@ if __name__ == '__main__':
         accepted_frame_lengths=(248, 250),
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
-        channel_to_decode=1,
+        channel_to_decode=2,
+        plot_channels=[2,3],
+        save_plot_csv=True,
         gcs_bucket="ueegbucket",
         gcs_buffer_size=400,
-        gcs_channels=[1,2, 3],
+        gcs_channels=[2, 3],
         gcs_format='binary',
         enable_gcs_trigger=True,
         enable_gcs=True,
@@ -2940,7 +3036,8 @@ if __name__ == '__main__':
     )
 
     # Antenna 2 — two modes, mutually exclusive:
-    #   dual_rx_antenna=true  → RX1 I channel of the same device (shares BladeRF with reader 1)
+    #   dual_rx_antenna=true  → RX0 Q (imaginary) stream of the same device; the primary's rx_thread
+    #                           feeds it rx_samples[1::4] (shares BladeRF with reader 1)
     #   device2_board != null → independent BladeRF; set device2_settings.bladerf_identifier
     #                           in board_config.json to select which physical device to open.
     _reader2 = None
@@ -2953,7 +3050,8 @@ if __name__ == '__main__':
                 'decode_scale': _board['decode_scale'],
             },
             device=1,
-            rx_channel=1,
+            rx_channel=1,  # vestigial: the secondary never runs its own rx_thread/_extract_output_stream;
+                           # the primary feeds it RX0 Q via rx_samples[1::4], so this value is unused.
             gcs_blob_name="ada_eyesclosed_ant2.bin",
             quiet=True,
             reader_label='rx1',
