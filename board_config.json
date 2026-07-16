@@ -21,17 +21,22 @@
             "decode_scale": 0.0005
         },
         "5": {
-            "label": "chip 29, may be dead due to burning issue",
+            "label": "chip 32, current has 500M resistors on board",
             "frequency_hz": 914800000,
             "decode_scale": 0.00056
         },
         "6": {
             "label": "chip 31 saving 30 for ada)",
-            "frequency_hz": 902800000,
+            "frequency_hz": 903600000,
+            "decode_scale": 0.00025
+        },
+                "7": {
+            "label": "chip 19 prbs",
+            "frequency_hz": 919600000,
             "decode_scale": 0.00025
         }
     },
-    "active_board": "5",
+    "active_board": "1",
     "device1_identifier": "*:serial=1e165c5f0bc94c0c85c5092c27a93427",
     "device2_board": null,
     "device2_settings": {
@@ -39,6 +44,6 @@
     },
     "dual_rx_antenna": false,
     "dual_rx_primary_board": "1",
-    "rbf_file": "ueeg-pi/SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf",
-    "block_resume_after_unclean_exit": true
+    "rbf_file": "SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf",
+    "block_resume_after_unclean_exit": false
 }
