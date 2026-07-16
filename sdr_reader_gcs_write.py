@@ -3021,7 +3021,6 @@ if __name__ == '__main__':
         enable_gcs=True,
         gcs_trigger_topic_id="sdr-commands",
         gcs_trigger_subscription_id="sdr-commands-pi-sub",
-        disable_header_drops = True
     )
     if _board_cfg.get('dual_rx_antenna'):
         _COMMON['sample_rate'] = 32e6  # for dual-antenna, use 32 MHz sample rate
