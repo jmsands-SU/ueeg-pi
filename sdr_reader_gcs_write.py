@@ -351,15 +351,28 @@ class TimeStampBasedReader:
         except Exception as exc:
             raise ImportError(f'Google Cloud packages not available: {exc}')
 
-        if self.gcs_client is None:
-            self.gcs_client = storage.Client()
-            self.gcs_bucket_obj = self.gcs_client.bucket(self.gcs_bucket)
+        if self.enable_gcs_trigger and not self.gcs_trigger_subscription_id:
+            raise ValueError('enable_gcs_trigger=True requires gcs_trigger_subscription_id.')
 
-        if self.enable_gcs_trigger:
-            if not self.gcs_trigger_subscription_id:
-                raise ValueError('enable_gcs_trigger=True requires gcs_trigger_subscription_id.')
-            if self.gcs_subscriber is None:
+        # Client construction can hit the network (credential refresh, metadata
+        # lookups) — if there's no internet at startup, don't let that take down
+        # the whole capture. Local decoding/plotting/CSV never depend on GCS, so
+        # fall back to running with GCS disabled for this session; every GCS call
+        # site already no-ops when gcs_bucket_obj/gcs_subscriber is None.
+        try:
+            if self.gcs_client is None:
+                self.gcs_client = storage.Client()
+                self.gcs_bucket_obj = self.gcs_client.bucket(self.gcs_bucket)
+
+            if self.enable_gcs_trigger and self.gcs_subscriber is None:
                 self.gcs_subscriber = pubsub_v1.SubscriberClient()
+        except Exception as exc:
+            print(f'⚠️  Could not initialize GCS/Pub-Sub clients ({exc}).')
+            print('   Continuing without GCS for this session — capture, decoding, '
+                  'and local plot/CSV output are unaffected.')
+            self.gcs_client = None
+            self.gcs_bucket_obj = None
+            self.gcs_subscriber = None
 
     @property
     def _RECORDING_STATE_FILE(self):
