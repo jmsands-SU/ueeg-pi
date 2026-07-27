@@ -18,6 +18,18 @@ class _TimestampedStream:
         self._lock = threading.Lock()
         self._pending = ''
 
+    def _safe_write(self, text):
+        # The underlying stream's encoding (e.g. cp1252 under some Windows
+        # Python environments) may not support every character a print()
+        # call happens to use (e.g. arrows, checkmarks) - fall back to a
+        # lossy-but-non-crashing encode rather than letting one debug
+        # print() abort the whole run.
+        try:
+            self._stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self._stream, 'encoding', None) or 'ascii'
+            self._stream.write(text.encode(encoding, errors='replace').decode(encoding))
+
     def write(self, text):
         if not text:
             return
@@ -26,14 +38,14 @@ class _TimestampedStream:
             while '\n' in self._pending:
                 line, self._pending = self._pending.split('\n', 1)
                 ts = time.strftime('%H:%M:%S') + f'.{int(time.time() * 1000) % 1000:03d}'
-                self._stream.write(f'[{ts} {self._pid}] {line}\n')
+                self._safe_write(f'[{ts} {self._pid}] {line}\n')
             self._stream.flush()
 
     def flush(self):
         with self._lock:
             if self._pending:
                 ts = time.strftime('%H:%M:%S') + f'.{int(time.time() * 1000) % 1000:03d}'
-                self._stream.write(f'[{ts} {self._pid}] {self._pending}')
+                self._safe_write(f'[{ts} {self._pid}] {self._pending}')
                 self._pending = ''
             self._stream.flush()
 
@@ -62,18 +74,106 @@ class DecodedPacket:
     packet_num: int
     is_valid: bool
     bits: np.ndarray
-    error_flag: bool = False
+    error_flag: bool = False  # changeofstrength_flag OR packetnum_anomaly_flag -
+                               # kept merged for the v1/v2 arbitration fallback
+                               # logic, which depends on this exact OR. Use the
+                               # two fields below instead when you need to know
+                               # which one actually fired (characterization only -
+                               # the persisted quality_packed/GCS output still
+                               # only carries this merged bit, by design - see
+                               # sdr_reader_gcs_write.py plan from this session).
+    changeofstrength_flag: bool = False  # bitThreshold_hdl.m's Changeofstrengthflag,
+                                          # OR'd across the packet's words - isolated
+                                          # from packetnum_anomaly_flag below
+    packetnum_anomaly_flag: bool = False  # this packet's packet_num field disagreed
+                                           # with what inter-packet timing/distance
+                                           # predicted - isolated from
+                                           # changeofstrength_flag above. packet_num
+                                           # is not Viterbi-protected and sits at the
+                                           # least-timing-settled point in the packet,
+                                           # so this fires far more than genuine link
+                                           # degradation does - see this session's
+                                           # header-drop investigation.
+    low_conf_count: int = 0  # softCombine_hdl.m's per-packet low-confidence-bit
+                              # count, saturating at 63 (6-bit field, same USB
+                              # word as packet_num/error_flag/valid_flag)
     reason: str = ''  # why this packet is invalid: cross_gap, intra_gap, out_of_order, ch_bounds, group_builder
 
-# Set Google Cloud credentials (required for GCS access)
-# Path is relative to this script's directory
+
+# Severe-packet low_conf_count cutoff, for characterization reporting
+# (get_decoded_flags()) only - not used by the v1/v2 arbitration logic, which
+# compares raw low_conf_count values directly rather than thresholding them.
+# Empirically validated earlier this session against real duplicate-pair
+# capture data: at this cutoff, the flagged side matched the actual weak side
+# (per per-bit margin analysis) in 8/8 pairs with enough disputed bits to be
+# a meaningful comparison. Not re-derived per-deployment - recalibrate if the
+# link/margin_cutoff characteristics change substantially.
+LOW_CONF_COUNT_THRESHOLD = 10
+
+# Cutoff for excluding a packet from group_builder's pending queue entirely
+# (see _decode_packet_groups) - deliberately a SEPARATE, much stricter
+# constant from LOW_CONF_COUNT_THRESHOLD above, not a reuse of it. The two
+# jobs have very different costs for a wrong call: v1/v2 arbitration just
+# picks the less-bad of two copies you already have (a soft choice), while
+# excluding a packet here throws away real decodable data outright (a much
+# higher-cost mistake). Calibrated 2026-07-26 via a full threshold sweep
+# against PRBS ground truth on the agcslow_slowwalk survey (19 snapshots):
+# errors dropped ~24x (1914->79 on v1) from disabled down to 5, while
+# missing count barely moved (+4.5%) - see wireless_link/README or session
+# notes for the full sweep table. Only 2 hard-error events existed in the
+# smaller 10/15/20m PRBS comparison set, not enough on their own to
+# calibrate this - the slow-walk survey's larger sample is what grounds it.
+GROUP_BUILDER_LOW_CONF_CUTOFF = 5
+
+# Structured dtype for get_decoded_flags()/decoded_flags_by_channel - defined
+# once and reused so the empty-result case can't drift out of sync with the
+# real per-sample construction in _decode_packet_groups().
+DECODED_FLAGS_DTYPE = np.dtype([
+    ('changeofstrength_v1', bool), ('changeofstrength_v2', bool),
+    ('packetnum_anomaly_v1', bool), ('packetnum_anomaly_v2', bool),
+    ('low_conf_v1', bool), ('low_conf_v2', bool),
+])
+
+# Structured dtype for get_decoded_bits()/decoded_bits_by_channel - raw
+# pre-decode bits for both duplicate copies, for ground-truth (e.g. PRBS)
+# ber comparison rather than duplicate-copy-agreement proxy comparison.
+# v1_bits/v2_bits are zero-filled (not meaningful) wherever the
+# corresponding *_missing flag is True - check missing before using bits.
+DECODED_BITS_WIDTH = 20  # payload bits per channel per packet (see
+                          # _decode_value_from_packet_bits's bits[:20] use
+                          # elsewhere in this file)
+DECODED_BITS_DTYPE = np.dtype([
+    ('v1_bits', np.uint8, (DECODED_BITS_WIDTH,)),
+    ('v2_bits', np.uint8, (DECODED_BITS_WIDTH,)),
+    ('v1_missing', bool),
+    ('v2_missing', bool),
+    # Exact raw word position (same abs_word/bit_clock_hz domain as
+    # _raw_frame_log and the raw logged Outports - push1/packetnum1/
+    # accept_offset/use_last_good_dbg/low_conf_count) this sample's frame
+    # started at. -1 wherever *_missing is True (no real frame to point
+    # to). Use THIS for cross-referencing a decoded sample against raw
+    # signals/scope time - idx/output_rate_hz is only a nominal-cadence
+    # approximation and drifts from true time (confirmed - see PRBS
+    # debugging session), it is NOT a substitute for this field.
+    ('v1_word_pos', np.int64),
+    ('v2_word_pos', np.int64),
+    # Raw (unthresholded) low_conf_count per copy - packet-level, same
+    # value replicated across all 4 channels for a given packet (see
+    # pkt_low_conf_count in _extract_channel_packets), so any channel's
+    # copy is representative. Meaningless (0) wherever *_missing is True.
+    # Unlike get_decoded_flags()'s low_conf_v1/v2 (thresholded boolean at
+    # LOW_CONF_COUNT_THRESHOLD), this is the raw count, for quality-aware
+    # v1-vs-v2 arbitration rather than a fixed cutoff.
+    ('v1_low_conf', np.uint8),
+    ('v2_low_conf', np.uint8),
+])
+
+# GCS credentials file path - resolved lazily in _init_gcs_clients(), not at
+# import time. This used to run unconditionally on import (printing a
+# warning on every offline .mat-decode script that imports this module,
+# e.g. compare_prbs_ber.py, regardless of enable_gcs) - moved to only run
+# when a reader with enable_gcs=True actually initializes GCS clients.
 CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), 'ueegproject-aea2731f9c3a.json')
-if os.path.exists(CREDENTIALS_FILE):
-    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_FILE
-    print(f"✓ GCS credentials loaded from: {CREDENTIALS_FILE}")
-else:
-    print(f"⚠️  GCS credentials file not found: {CREDENTIALS_FILE}")
-    print("   GCS functionality will be disabled unless credentials are set via gcloud auth")
 
 class TimeStampBasedReader:
     # Consecutive frames where detected pkt# agrees with the word-distance
@@ -125,7 +225,7 @@ class TimeStampBasedReader:
         rx_channel=0,
         bladerf_identifier=None,
         block_resume_after_unclean_exit=False,
-        disable_header_drops=False,
+        disable_header_drops=True,
     ):
         self.quiet = bool(quiet)  # suppress per-buffer decode warnings (e.g. for secondary reader)
         self.disable_header_drops = bool(disable_header_drops)
@@ -250,6 +350,19 @@ class TimeStampBasedReader:
         self.decoded_quality_by_channel = {
             ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
         }
+        # Per-sample characterization diagnostics (changeofstrength/packetnum
+        # anomaly/low_conf, both copies) - parallel to decoded_quality_by_channel,
+        # same group-append cadence, not part of the persisted quality_packed/GCS
+        # path. See get_decoded_flags().
+        self.decoded_flags_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
+        # Raw pre-decode bits for both copies, for ground-truth (PRBS) BER
+        # comparison - same parallel structure as decoded_flags_by_channel.
+        # See get_decoded_bits().
+        self.decoded_bits_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
         self.decoded_sample_count_by_channel = {ch: 0 for ch in range(1, 5)}
         self.mismatch_events_by_channel = {
             ch: deque(maxlen=2000) for ch in range(1, 5)
@@ -284,6 +397,11 @@ class TimeStampBasedReader:
         self.placeholder_inserts_cross_chunk = 0
         self.placeholder_inserts_intra_chunk = 0
         self.placeholder_inserts_group_builder = 0
+        self.low_conf_filtered_before_builder = 0  # packets excluded from the group-builder
+            # queue entirely because low_conf_count>=LOW_CONF_COUNT_THRESHOLD (2026-07-26) -
+            # counted separately from placeholder_inserts_group_builder so the two causes
+            # (low-confidence exclusion vs a genuine distance-justified gap found inside
+            # group_builder itself) aren't conflated when reporting why a slot is missing.
         self.packet_num_distance_corrections = 0  # frames relabeled from noisy pkt# to distance value
         self._phase_locked = False           # when locked, distance overrides noisy pkt# field
         self._phase_agreement_run = 0        # consecutive detect-vs-distance agreements toward lock
@@ -310,6 +428,9 @@ class TimeStampBasedReader:
         self.gcs_timestamp_log = []  # List of {gcs_sample_idx, timestamp_utc, system_time_s}
         self.gcs_timestamp_log_interval = 12000  # Log timestamp every 12000 samples (60 seconds at 200 Hz)
         self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}  # Track word positions for packets
+        self._last_group_real_word_position = {ch: None for ch in range(1, 5)}  # word pos of the
+            # last REAL (non-placeholder) packet actually placed into a group, per channel -
+            # see _build_group_with_placeholders' distance check
         self._first_group_skipped = False  # Discard first decoded group (startup artifact)
         self._force_timestamp_after_restart = False  # Set True after SDR restart to force a checkpoint
         self.capture_start_time = None
@@ -346,33 +467,28 @@ class TimeStampBasedReader:
             return
         if not self.gcs_bucket or not self.gcs_blob_name:
             raise ValueError('enable_gcs=True requires gcs_bucket and gcs_blob_name.')
+
+        if os.path.exists(CREDENTIALS_FILE):
+            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_FILE
+            print(f"✓ GCS credentials loaded from: {CREDENTIALS_FILE}")
+        else:
+            print(f"⚠️  GCS credentials file not found: {CREDENTIALS_FILE}")
+            print("   GCS functionality will be disabled unless credentials are set via gcloud auth")
+
         try:
             from google.cloud import storage, pubsub_v1
         except Exception as exc:
             raise ImportError(f'Google Cloud packages not available: {exc}')
 
-        if self.enable_gcs_trigger and not self.gcs_trigger_subscription_id:
-            raise ValueError('enable_gcs_trigger=True requires gcs_trigger_subscription_id.')
+        if self.gcs_client is None:
+            self.gcs_client = storage.Client()
+            self.gcs_bucket_obj = self.gcs_client.bucket(self.gcs_bucket)
 
-        # Client construction can hit the network (credential refresh, metadata
-        # lookups) — if there's no internet at startup, don't let that take down
-        # the whole capture. Local decoding/plotting/CSV never depend on GCS, so
-        # fall back to running with GCS disabled for this session; every GCS call
-        # site already no-ops when gcs_bucket_obj/gcs_subscriber is None.
-        try:
-            if self.gcs_client is None:
-                self.gcs_client = storage.Client()
-                self.gcs_bucket_obj = self.gcs_client.bucket(self.gcs_bucket)
-
-            if self.enable_gcs_trigger and self.gcs_subscriber is None:
+        if self.enable_gcs_trigger:
+            if not self.gcs_trigger_subscription_id:
+                raise ValueError('enable_gcs_trigger=True requires gcs_trigger_subscription_id.')
+            if self.gcs_subscriber is None:
                 self.gcs_subscriber = pubsub_v1.SubscriberClient()
-        except Exception as exc:
-            print(f'⚠️  Could not initialize GCS/Pub-Sub clients ({exc}).')
-            print('   Continuing without GCS for this session — capture, decoding, '
-                  'and local plot/CSV output are unaffected.')
-            self.gcs_client = None
-            self.gcs_bucket_obj = None
-            self.gcs_subscriber = None
 
     @property
     def _RECORDING_STATE_FILE(self):
@@ -1361,29 +1477,55 @@ class TimeStampBasedReader:
     def _is_exact_multi_frame_length(self, length: int) -> bool:
         """True if length is an exact sum of N >= 1 accepted frame lengths.
 
-        For (248, 250): a length L achievable with N frames satisfies
-          N*248 <= L <= N*250  and  (L - N*248) % 2 == 0.
-        The step between adjacent lengths is max_len - min_len (= 2 for this system).
+        General coin-change reachability over self.accepted_frame_lengths - works
+        for any set of accepted lengths, not just a pair spaced by one consistent
+        step (a closed-form step formula lived here previously; it silently gave
+        wrong answers as soon as a third, non-arithmetic length was added).
         """
         length = int(length)
         if length <= 0:
             return False
-        min_len = min(self.accepted_frame_lengths)
-        max_len = max(self.accepted_frame_lengths)
-        step = max_len - min_len
-        n_min = max(1, int(np.floor(length / max_len)))
-        n_max = int(np.ceil(length / min_len))
-        for n in range(n_min, n_max + 1):
-            remainder = length - n * min_len
-            if remainder < 0:
-                continue
-            if step == 0:
-                if remainder == 0:
-                    return True
-            else:
-                if remainder % step == 0 and remainder // step <= n:
-                    return True
-        return False
+        lengths = [int(v) for v in self.accepted_frame_lengths if v > 0]
+        if not lengths:
+            return False
+        reachable = np.zeros(length + 1, dtype=bool)
+        reachable[0] = True
+        for total in range(1, length + 1):
+            for L in lengths:
+                if L <= total and reachable[total - L]:
+                    reachable[total] = True
+                    break
+        return bool(reachable[length])
+
+    def _find_boundary_duplicate_offset(self, valid_flag: np.ndarray, start_idx: int) -> int:
+        """Locate the single duplicate sample a run_sim_stream.m chunk
+        restart inserts into an otherwise-251-word frame (confirmed
+        empirically: valid_flag/push alternates 1,0,1,0,... starting at
+        start_idx for the entire channel-extraction span of a real frame;
+        the chunk-restart artifact repeats exactly one sample somewhere in
+        that span, breaking the alternation at exactly one point - not
+        always in the idle tail past the last real channel's window, as
+        first assumed, sometimes within it, which silently corrupts
+        channel bit-extraction if left uncorrected).
+
+        Search is bounded to the actual channel-extraction span (up to
+        channel 4's own ch_end, +margin) rather than the full 251-word
+        frame, because the idle tail beyond that span is constant 0 by
+        design - comparing it against a continued 1,0,1,0 alternation
+        would flag every single idle word as a false "duplicate".
+
+        Returns the offset (0-based, relative to start_idx) of the first
+        break from pure alternation, or None if the span is clean (the
+        real duplicate must then be further out in the harmless idle
+        tail - no correction needed for bit extraction in that case).
+        """
+        search_len = min(4 * self.bits_per_channel + 4, len(valid_flag) - start_idx)
+        if search_len <= 0:
+            return None
+        window = valid_flag[start_idx:start_idx + search_len]
+        expected = np.resize([1, 0], search_len)
+        mismatches = np.flatnonzero(window != expected)
+        return int(mismatches[0]) if len(mismatches) else None
 
     def _estimate_frames_in_gap_linear(self, distance_words: int) -> int:
         """Estimate frame count using linear combinations of accepted frame lengths.
@@ -1426,6 +1568,67 @@ class TimeStampBasedReader:
 
         return max(1, int(best_n))
 
+    def _lookahead_confirms_real_skip(self, valid_frame_starts, valid_frame_lengths,
+                                       packet_nums_for_edges, k, observed_packet_num,
+                                       distance_forced_packet_num):
+        """Disambiguates a single-frame packet_num/distance disagreement (distance
+        says 'just the next frame', packet_num disagrees) by checking whether the
+        FOLLOWING frames continue counting from the OBSERVED packet_num (a real
+        skip - e.g. GNU Radio dropped a USB packet, which removes that packet's
+        samples from the recorded file entirely, so the word-distance in the file
+        underestimates how many packets were actually skipped in the true
+        transmitted sequence, even though packet_num itself - not bit-error-
+        corrupted - is correct) or from the distance-forced value instead (isolated
+        packet_num bit-error noise on this one frame - the assumption the caller's
+        existing header-drop logic defaults to).
+
+        Checks up to 2 following valid frames, already available in this buffer's
+        precomputed frame arrays (the whole chunk is parsed into arrays before the
+        per-frame loop starts) - no lookahead buffering/restructuring needed.
+        Requires an UNAMBIGUOUS match: a following frame must agree with exactly one
+        hypothesis, not both (a distance-implied gap that's a multiple of 8 packets
+        aliases to the same packet_num under either hypothesis and can't be
+        disambiguated this way) and not neither (inconclusive - e.g. that frame has
+        its own independent anomaly). Stops at the first frame that cleanly resolves
+        it rather than requiring every checked frame to agree, since one clean
+        disambiguating match is already stronger evidence than the single-frame
+        distance estimate this is replacing.
+
+        Returns True if the observed packet_num is confirmed (trust it, treat as a
+        real skip), False if the distance-forced value is confirmed (current default
+        behavior was right), or None if inconclusive (caller should fall back to
+        that existing default, unchanged).
+        """
+        n = len(valid_frame_starts)
+        prev_start_for_lookahead = valid_frame_starts[k]
+        prev_observed = observed_packet_num
+        prev_distance_forced = distance_forced_packet_num
+
+        for j in range(k + 1, min(k + 3, n)):
+            next_start = valid_frame_starts[j]
+            next_distance = int(next_start) - int(prev_start_for_lookahead)
+            next_frames_in_gap = self._estimate_frames_in_gap_linear(next_distance)
+            next_actual = int(packet_nums_for_edges[next_start])
+
+            expected_from_observed = (prev_observed + next_frames_in_gap) % 8
+            expected_from_distance_forced = (prev_distance_forced + next_frames_in_gap) % 8
+
+            matches_observed = (next_actual == expected_from_observed)
+            matches_distance = (next_actual == expected_from_distance_forced)
+
+            if matches_observed and not matches_distance:
+                return True
+            if matches_distance and not matches_observed:
+                return False
+            # else: matches both (aliased at this gap size) or neither (this frame
+            # has its own anomaly too) - uninformative, keep looking
+
+            prev_start_for_lookahead = next_start
+            prev_observed = expected_from_observed
+            prev_distance_forced = expected_from_distance_forced
+
+        return None
+
     def _extract_channel_packets(self, data: np.ndarray):
         data = np.asarray(data, dtype=np.uint16).reshape(-1)
         prefix = self._extract_lookback_words
@@ -1439,6 +1642,10 @@ class TimeStampBasedReader:
         packet_nums_raw = (working_data & ((1 << 4) | (1 << 5) | (1 << 6))) >> 4
         valid_flag = (working_data & (1 << 8)) >> 8
         error_flag_arr = (working_data & (1 << 7)) >> 7
+        # bits [14:9]: softCombine_hdl.m's low_conf_count, saturating 6-bit
+        # per-packet count (held constant across a packet's words, like
+        # packet_num - not an OR-per-word flag like error_flag_arr).
+        low_conf_count_arr = (working_data & (0x3F << 9)) >> 9
         # print("error count:", sum(error_flag_arr),np.where(error_flag_arr==1))
         packet_nums_for_edges = packet_nums_raw.copy()
         valid_words = valid_flag.astype(bool)
@@ -1478,6 +1685,15 @@ class TimeStampBasedReader:
         data_bit = data_bit[:process_until]
         valid_flag = valid_flag[:process_until]
         error_flag_arr = error_flag_arr[:process_until]
+        # low_conf_count_arr is deliberately NOT truncated to process_until,
+        # unlike the parallel arrays above: a packet's own low_conf_count only
+        # lands one frame period after its start (see pkt_low_conf_count
+        # below), which for the last frames in this buffer falls beyond
+        # process_until. Those words are physically present in working_data -
+        # process_until bounds frame DETECTION, not data availability - so
+        # keeping the full array is what makes the one-frame-forward read
+        # possible without deferring packets across buffers. Nothing else
+        # indexes this array, so the length mismatch is contained here.
         transitions = np.where(np.diff(packet_nums_for_edges) != 0)[0]
         frame_starts = np.concatenate(([prefix_len], transitions+1))
         frame_ends = np.concatenate((transitions, [len(packet_nums_for_edges) - 1]))
@@ -1488,6 +1704,7 @@ class TimeStampBasedReader:
         valid_mask = (np.array([self._is_exact_multi_frame_length(int(fl)) for fl in frame_lengths])
                       & starts_in_fresh_data)
         valid_frame_starts = frame_starts[valid_mask]
+        valid_frame_lengths = frame_lengths[valid_mask]
 
         # Log every detected frame before the valid-length gate
         for _fs, _fl, _fv, _fresh in zip(frame_starts, frame_lengths, valid_mask, starts_in_fresh_data):
@@ -1514,7 +1731,9 @@ class TimeStampBasedReader:
         prev_packet_num = self._last_extracted_packet_num
         prev_abs_start = self._last_extracted_frame_abs_word_start
 
-        for start_idx in valid_frame_starts:
+        for k in range(len(valid_frame_starts)):
+            start_idx = valid_frame_starts[k]
+            frame_len = valid_frame_lengths[k]
             packet_num = int(packet_nums_for_edges[start_idx])
             cur_abs_start = int(self._words_processed_total + int(start_idx) - prefix_len)
 
@@ -1605,11 +1824,53 @@ class TimeStampBasedReader:
                                 _ts_ul = (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz
                                 print(f"↻ Phase unlock @ t={_ts_ul:.3f}s: sustained mismatch, re-acquiring phase")
                         else:
-                            # Still locked: treat as isolated noise.
+                            # Still locked: default assumption is isolated packet_num
+                            # bit-error noise on this one frame. But a dropped USB
+                            # packet on the CAPTURE side (GNU Radio) removes that
+                            # packet's samples from the recorded file entirely - the
+                            # word-distance in the file then underestimates how many
+                            # packets were really skipped in the true transmitted
+                            # sequence, even though packet_num itself is correct.
+                            # Both look identical from this one frame alone
+                            # (expected_frames_in_gap==1, packet_num disagrees) - check
+                            # whether the FOLLOWING frames confirm which is actually
+                            # true before assuming noise and discarding.
+                            # Scoped to exactly the header-drop's own precondition
+                            # (expected_frames_in_gap==1) - that's the only case where
+                            # expected_next IS the competing hypothesis being tested
+                            # against. When expected_frames_in_gap>1 the competing
+                            # hypothesis is expected_at_current instead (handled by
+                            # the existing distance-trusted correction below,
+                            # unchanged - not something this lookahead addresses).
+                            lookahead_confirms_real_skip = None
+                            if (expected_frames_in_gap == 1 and expected_next is not None
+                                    and packet_num != expected_next):
+                                lookahead_confirms_real_skip = self._lookahead_confirms_real_skip(
+                                    valid_frame_starts, valid_frame_lengths, packet_nums_for_edges,
+                                    k, packet_num, expected_next)
+
+                            if lookahead_confirms_real_skip:
+                                # Confirmed real skip, not noise - the mismatch-run
+                                # increment above was premature, undo it (mirrors the
+                                # decrement the agreement branch below already does on
+                                # confirmed-fine frames - this is a confirmed-fine
+                                # frame too, just not a distance-agreeing one).
+                                if self._phase_mismatch_run > 0:
+                                    self._phase_mismatch_run -= 1
+                                packet_num_jump = (packet_num - prev_packet_num) % 8
+                                missing_from_distance = max(0, packet_num_jump - 1)
+                                if not self.quiet:
+                                    ts_confirm = (self._words_processed_total + int(start_idx) - prefix_len) / self.bit_clock_hz
+                                    print(
+                                        f"✓ Lookahead confirms real skip (not header noise) @ t={ts_confirm:.3f}s: "
+                                        f"prev_pkt#{prev_packet_num}, observed pkt#{packet_num} "
+                                        f"(distance implied pkt#{expected_next}) - backfilling {missing_from_distance}"
+                                    )
                             # If this frame should be the immediate next packet (1 frame
                             # apart) but packet_num disagrees, treat it as a bad header
-                            # and discard it.  Disabled when disable_header_drops=True.
-                            if (not self.disable_header_drops
+                            # and discard it.  Disabled when disable_header_drops=True,
+                            # or when the lookahead above confirmed this isn't noise.
+                            elif (not self.disable_header_drops
                                     and expected_frames_in_gap == 1
                                     and expected_next is not None
                                     and packet_num != expected_next):
@@ -1634,11 +1895,16 @@ class TimeStampBasedReader:
                                 prev_abs_start = cur_abs_start
                                 continue
 
-                            # Multi-frame gap (isolated): distance is trusted over the
-                            # noisy number field — relabel so one misread can't seed a
-                            # phantom group in the builder downstream.
-                            self.packet_num_distance_corrections += 1
-                            packet_num = expected_at_current
+                            elif not lookahead_confirms_real_skip:
+                                # Multi-frame gap (isolated): distance is trusted over
+                                # the noisy number field — relabel so one misread can't
+                                # seed a phantom group in the builder downstream. Not
+                                # reached when lookahead confirmed a real skip above -
+                                # packet_num stays as observed in that case, and
+                                # missing_from_distance was already recomputed from the
+                                # packet_num jump instead of this distance estimate.
+                                self.packet_num_distance_corrections += 1
+                                packet_num = expected_at_current
 
                     # Not locked (startup or just-unlocked): the real packet number
                     # flows untouched so the group builder can (re)find true phase.
@@ -1681,35 +1947,103 @@ class TimeStampBasedReader:
                     self.placeholder_inserts_intra_chunk += int(missing)
 
             # Packet-level error flag: hardware interference flag OR packet sequence anomaly.
+            # Kept merged (pkt_error) for the v1/v2 arbitration fallback, which depends
+            # on this exact OR - pkt_changeofstrength/seq_anomaly below are the same two
+            # terms kept separate, for characterization reporting only.
             _pkt_err_end = start_idx + 4 * self.bits_per_channel
             if start_idx >= 0 and _pkt_err_end <= len(error_flag_arr):
                 _all_valid = valid_flag[start_idx:_pkt_err_end]
                 _all_error = error_flag_arr[start_idx:_pkt_err_end]
-                pkt_error = bool(np.any(_all_error[_all_valid == 1]))
+                pkt_changeofstrength = bool(np.any(_all_error[_all_valid == 1]))
             else:
-                pkt_error = False
+                pkt_changeofstrength = False
+            pkt_error = pkt_changeofstrength
             if seq_anomaly:
                 pkt_error = True
 
+            # low_conf_count is held constant across a packet's words (like
+            # packet_num), not per-word like error_flag - read one
+            # representative sample rather than OR/max-aggregating.
+            #
+            # ONE-FRAME LATENCY: the value held across THIS packet's words is
+            # the PREVIOUS packet's - softCombine_hdl streams the whole payload
+            # before the count settles, so a packet's own value only appears
+            # one frame period later (right where the next packet is read).
+            # Read at start_idx + frame_len instead; both are already in the
+            # 100 kHz word domain so no rescaling is needed. Validated against
+            # PRBS ground truth: raises low_conf-vs-actual-error correlation
+            # from r=0.36 to 0.48, cuts paired-arbitration misfires from 9.7%
+            # to 3.9%, and flips low_conf arbitration from net-harmful to
+            # net-helpful across all four characterization recordings.
+            _lc_idx = int(start_idx) + int(frame_len)
+            if 0 <= _lc_idx < len(low_conf_count_arr):
+                pkt_low_conf_count = int(low_conf_count_arr[_lc_idx])
+            else:
+                # Next frame genuinely hasn't arrived yet (packet at the very
+                # end of a buffer with no trailing words) - a real streaming
+                # limit, not an error. Rare, since the untruncated array
+                # normally extends past process_until by the partial trailing
+                # frame. 0 = "fully confident", matching the pre-existing
+                # out-of-range fallback.
+                pkt_low_conf_count = 0
+
+            # 251-word frames are run_sim_stream.m's chunk-restart artifact -
+            # one duplicate raw sample inserted somewhere in the frame
+            # (confirmed empirically, offset varies per-frame depending on
+            # where the chunk boundary lands). Tolerating the extra length
+            # (accepted_frame_lengths including 251) fixed packet-drop
+            # stats, but left the duplicate in place, shifting every
+            # channel's extraction window that starts after it by one word -
+            # splice it back out here so bit extraction sees a true 250-word
+            # frame again, instead of just accepting the wrong-length one.
+            dup_offset = None
+            corrected_data_bit = None
+            corrected_valid_flag = None
+            if int(frame_len) == 251:
+                dup_offset = self._find_boundary_duplicate_offset(valid_flag, start_idx)
+                if dup_offset is not None:
+                    span_end = min(start_idx + int(frame_len), len(data_bit))
+                    corrected_data_bit = np.delete(data_bit[start_idx:span_end], dup_offset)
+                    corrected_valid_flag = np.delete(valid_flag[start_idx:span_end], dup_offset)
+
             for ch in range(1, 5):
                 channel_offset = (ch - 1) * self.bits_per_channel
-                ch_start = start_idx + channel_offset-2
-                ch_end = ch_start + self.bits_per_channel
-                if ch_start < 0 or ch_end+5 > len(packet_nums_raw):
+                if corrected_data_bit is not None:
+                    # local corrected frame (duplicate already spliced out),
+                    # 0-indexed at start_idx instead of absolute
+                    ch_start = channel_offset - 2
+                    ch_end = ch_start + self.bits_per_channel
+                    bounds_ok = ch_start >= 0 and ch_end + 5 <= len(corrected_data_bit)
+                    src_data_bit, src_valid_flag = corrected_data_bit, corrected_valid_flag
+                else:
+                    ch_start = start_idx + channel_offset - 2
+                    ch_end = ch_start + self.bits_per_channel
+                    bounds_ok = ch_start >= 0 and ch_end + 5 <= len(packet_nums_raw)
+                    src_data_bit, src_valid_flag = data_bit, valid_flag
+
+                if not bounds_ok:
                     packets_by_channel[ch].append(
                         DecodedPacket(packet_num=packet_num, is_valid=False, bits=np.array([], dtype=np.uint8), reason='ch_bounds')
                     )
-                    packet_word_positions[ch].append(start_idx - prefix_len)
+                    # absolute position, same convention as _raw_frame_log's
+                    # abs_word - NOT chunk-relative, so it stays comparable
+                    # to raw signal indices even across multiple
+                    # decode_from_word_stream calls / internal sub-chunks
+                    packet_word_positions[ch].append(self._words_processed_total + start_idx - prefix_len)
                     continue
 
-                bits_block = data_bit[ch_start:ch_end]
-                valid_block = valid_flag[ch_start+2:ch_end+2]
+                bits_block = src_data_bit[ch_start:ch_end]
+                valid_block = src_valid_flag[ch_start+2:ch_end+2]
                 selected_bits = bits_block[valid_block == 1]
                 self.valid_flag_bitcount_hist_by_channel[ch][len(selected_bits)] += 1
                 packets_by_channel[ch].append(
-                    DecodedPacket(packet_num=packet_num, is_valid=True, bits=selected_bits.astype(np.uint8), error_flag=pkt_error)
+                    DecodedPacket(packet_num=packet_num, is_valid=True, bits=selected_bits.astype(np.uint8),
+                                  error_flag=pkt_error, changeofstrength_flag=pkt_changeofstrength,
+                                  packetnum_anomaly_flag=seq_anomaly, low_conf_count=pkt_low_conf_count)
                 )
-                packet_word_positions[ch].append(start_idx - prefix_len)
+                # absolute position, same convention as _raw_frame_log's
+                # abs_word - see comment on the other append site above
+                packet_word_positions[ch].append(self._words_processed_total + start_idx - prefix_len)
 
             prev_start = start_idx
             prev_packet_num = packet_num
@@ -1726,36 +2060,126 @@ class TimeStampBasedReader:
         return (packets_by_channel, packet_word_positions), consumed
 
     def _build_group_with_placeholders(self, channel_idx: int):
+        # Positions must be popped in lockstep with pending, not via a
+        # separate fixed "always advance by 8" slice elsewhere - pending
+        # only actually advances by however many REAL packets matched an
+        # expected_packet_num this call (0-8), since a placeholder branch
+        # deliberately does NOT consume from pending. A naive same-width
+        # pop of the positions queue desyncs from pending's true
+        # consumption rate the first time any placeholder is inserted, and
+        # that desync compounds on every subsequent group forever after -
+        # this was a real, confirmed bug (word positions drifting further
+        # from true time as the recording went on).
+        #
+        # DISTANCE CHECK (2026-07-26 fix - see project notes): this used to
+        # insert a placeholder purely because pending[0].packet_num didn't
+        # match the expected 0-7 counter value, with NO reference to real
+        # elapsed word-distance/time at all - unlike every other gap-filling
+        # path in this file (cross_chunk, intra_chunk), which all treat the
+        # raw packet_num field as unreliable (bit errors corrupt it) and
+        # trust word-distance instead. That made this the dominant source of
+        # placeholder insertions by a wide margin in real captures (400-576
+        # per snapshot vs 32-157 from intra_chunk), manufacturing "missing"
+        # frames whenever a channel's packets arrived in an order that
+        # didn't fit a rigid modulo-8 assumption, even when no real gap
+        # occurred. Now: before treating a mismatch as a genuine gap, check
+        # the word-distance from the last REAL packet actually placed into
+        # this channel's groups to the candidate packet's own position. If
+        # that distance implies essentially no time passed (<=1 frame),
+        # there's no room for a real missing frame - the packet_num
+        # mismatch is far more likely a residual numbering artifact than an
+        # actual drop, so take the packet as-is instead of manufacturing a
+        # placeholder. Falls back to the old (insert-a-placeholder) behavior
+        # whenever either position is unknown - conservative, doesn't change
+        # behavior without real evidence to act on.
         pending = self._pending_packets_by_channel[channel_idx]
+        positions = self._pending_packet_word_positions[channel_idx]
+        last_real_pos = self._last_group_real_word_position[channel_idx]
         group = []
+        group_positions = []
         for expected_packet_num in range(8):
             if len(pending) > 0 and int(pending[0].packet_num) == expected_packet_num:
+                pos = positions.pop(0) if len(positions) > 0 else None
                 group.append(pending.pop(0))
-            else:
-                group.append(
-                    DecodedPacket(
-                        packet_num=expected_packet_num,
-                        is_valid=False,
-                        bits=np.array([], dtype=np.uint8),
-                        reason='group_builder',
-                    )
+                group_positions.append(pos)
+                if pos is not None:
+                    last_real_pos = pos
+                continue
+
+            distance_justifies_gap = True
+            if len(pending) > 0 and len(positions) > 0 and positions[0] is not None and last_real_pos is not None:
+                distance = positions[0] - last_real_pos
+                expected_frames = self._estimate_frames_in_gap_linear(distance)
+                if expected_frames <= 1:
+                    distance_justifies_gap = False
+
+            if not distance_justifies_gap:
+                pos = positions.pop(0) if len(positions) > 0 else None
+                group.append(pending.pop(0))
+                group_positions.append(pos)
+                if pos is not None:
+                    last_real_pos = pos
+                continue
+
+            group.append(
+                DecodedPacket(
+                    packet_num=expected_packet_num,
+                    is_valid=False,
+                    bits=np.array([], dtype=np.uint8),
+                    reason='group_builder',
                 )
-                self.placeholder_inserts_group_builder += 1
-        return group
+            )
+            group_positions.append(None)
+            self.placeholder_inserts_group_builder += 1
+        self._last_group_real_word_position[channel_idx] = last_real_pos
+        return group, group_positions
 
     def _decode_packet_groups(self, packets_by_channel, packet_word_positions=None, word_timestamps=None):
         # Extend pending packets for each channel (no packet dropping/resync)
         for channel_idx, packets in packets_by_channel.items():
             pending = self._pending_packets_by_channel[channel_idx]
+            positions_in = (packet_word_positions or {}).get(channel_idx, [])
+
+            # LOW-CONFIDENCE FILTER (2026-07-26, user hypothesis): the raw
+            # packet_num sequence reaching group_builder was found to be
+            # scrambled/duplicate-laden in hard-RF snapshots (e.g. "4,4",
+            # "7,7", "0,0" repeated back-to-back, non-monotonic jumps) -
+            # not primarily real gaps. Cause: a packet whose bits decoded
+            # with a high low_conf_count is also more likely to have its
+            # packet_num field itself corrupted (same USB word, see
+            # DecodedPacket.low_conf_count) - group_builder was treating
+            # that corrupted number as a trustworthy sequence anchor.
+            # Excluding low_conf_count>=GROUP_BUILDER_LOW_CONF_CUTOFF packets
+            # from ever entering the pending queue (not just from being
+            # trusted for matching) means they can't seed a false "match",
+            # a false "no gap justified" distance decision, or a phantom
+            # duplicate. Uses its own dedicated, separately-calibrated
+            # constant (=5, see its docstring) - NOT LOW_CONF_COUNT_THRESHOLD
+            # (=10, a different job with a much softer cost for a wrong
+            # call: v1/v2 arbitration just picks the less-bad of two copies
+            # you already have, this decision throws real data away
+            # outright). Placeholders (cross_gap/intra_gap/out_of_order)
+            # default low_conf_count=0 and are unaffected. Positions are
+            # filtered in lockstep so a dropped packet's word position
+            # doesn't dangle out of sync with pending (same lockstep
+            # requirement noted in _build_group_with_placeholders above).
+            filtered_packets = []
+            filtered_positions = []
+            for i, p in enumerate(packets):
+                if p.low_conf_count >= GROUP_BUILDER_LOW_CONF_CUTOFF:
+                    self.low_conf_filtered_before_builder += 1
+                    continue
+                filtered_packets.append(p)
+                filtered_positions.append(positions_in[i] if i < len(positions_in) else None)
+
             if channel_idx == 1 and len(self._group_builder_input_log) < 100_000:
-                for p in packets:
+                for p in filtered_packets:
                     self._group_builder_input_log.append((int(p.packet_num), bool(p.is_valid)))
-            pending.extend(packets)
+            pending.extend(filtered_packets)
 
             # Also extend word positions if available
             if packet_word_positions is not None:
-                positions = packet_word_positions.get(channel_idx, [])
-                self._pending_packet_word_positions[channel_idx].extend(positions)
+                self._pending_packet_word_positions[channel_idx].extend(filtered_positions)
 
             if not self._synced_to_packet0_by_channel[channel_idx]:
                 if len(pending) > 0:
@@ -1772,8 +2196,6 @@ class TimeStampBasedReader:
             if not self._first_group_skipped:
                 self._first_group_skipped = True
                 for channel_idx in synced:
-                    if len(self._pending_packet_word_positions[channel_idx]) >= 8:
-                        self._pending_packet_word_positions[channel_idx] = self._pending_packet_word_positions[channel_idx][8:]
                     self._build_group_with_placeholders(channel_idx)
                 continue
 
@@ -1821,11 +2243,7 @@ class TimeStampBasedReader:
                     group_sample_timestamps[3] = packet_0_timestamp - 0.000
 
             for channel_idx in synced:
-                # Pop the word positions for this channel's group
-                if len(self._pending_packet_word_positions[channel_idx]) >= 8:
-                    self._pending_packet_word_positions[channel_idx] = self._pending_packet_word_positions[channel_idx][8:]
-
-                group = self._build_group_with_placeholders(channel_idx)
+                group, group_positions = self._build_group_with_placeholders(channel_idx)
 
                 values = np.full(4, np.nan, dtype=np.float64)
                 quality = np.zeros(4, dtype=np.int8)
@@ -1895,12 +2313,31 @@ class TimeStampBasedReader:
                             self.only_side_cause_counts_by_channel[channel_idx]['error_flag_mismatch_data_matched'] += 1
                     else:
                         # Not a match (mismatch or one/both sides missing).
-                        # Use error flags to prefer the clean copy when there is one.
+                        # low_conf_count takes priority over error_flag for now:
+                        # error_flag is really bitThreshold_hdl's
+                        # Changeofstrengthflag (avg0 > avg1_at_peak at a payload
+                        # sample) - a weak/indirect signal on its own, not a
+                        # direct per-bit error indicator, unlike low_conf_count
+                        # which this session's offline duplicate-pair margin
+                        # analysis validated as reliably picking the correct
+                        # side. Falls back to error_flag only when
+                        # low_conf_count ties (including both sides at 0).
                         error_occurred[s] = p1.error_flag or p2.error_flag
-                        if p1.error_flag and not p2.error_flag and v2 is not None:
+                        suppressed_side = None      # 'v1' or 'v2'
+                        suppression_reason = None   # 'low_conf_count' or 'error_flag'
+                        if v1 is not None and v2 is not None and p1.low_conf_count != p2.low_conf_count:
+                            if p1.low_conf_count > p2.low_conf_count:
+                                v1, r1 = None, None
+                                suppressed_side, suppression_reason = 'v1', 'low_conf_count'
+                            else:
+                                v2, r2 = None, None
+                                suppressed_side, suppression_reason = 'v2', 'low_conf_count'
+                        elif p1.error_flag and not p2.error_flag and v2 is not None:
                             v1, r1 = None, None
+                            suppressed_side, suppression_reason = 'v1', 'error_flag'
                         elif p2.error_flag and not p1.error_flag and v1 is not None:
                             v2, r2 = None, None
+                            suppressed_side, suppression_reason = 'v2', 'error_flag'
 
                         if v1 is not None and v2 is not None:
                             # Mismatch with no clear error-flag preference (both or neither errored)
@@ -1916,6 +2353,8 @@ class TimeStampBasedReader:
                             if not p2.is_valid:
                                 self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_packet_missing'] += 1
                                 self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v1'][int(p2.packet_num) % 8] += 1
+                            elif suppression_reason == 'low_conf_count':
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_low_conf_suppressed'] += 1
                             elif p2.error_flag:
                                 self.only_side_cause_counts_by_channel[channel_idx]['only_v1_v2_error_suppressed'] += 1
                             else:
@@ -1949,6 +2388,8 @@ class TimeStampBasedReader:
                             if not p1.is_valid:
                                 self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_packet_missing'] += 1
                                 self.only_side_missing_packetnum_by_channel[channel_idx]['for_only_v2'][int(p1.packet_num) % 8] += 1
+                            elif suppression_reason == 'low_conf_count':
+                                self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_low_conf_suppressed'] += 1
                             elif p1.error_flag:
                                 self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_error_suppressed'] += 1
                             else:
@@ -1968,7 +2409,7 @@ class TimeStampBasedReader:
                                 }
                                 self.payload_short_log_by_channel[channel_idx].append(ev)
                                 total_short = self.only_side_cause_counts_by_channel[channel_idx]['only_v2_v1_payload_short']
-                                if total_short <= 20:
+                                if total_short <= 20 and not self.quiet:
                                     t = sample_idx / self.output_rate_hz
                                     print(
                                         f'⚠️  payload_short ch{channel_idx} sample={sample_idx} t={t:.3f}s '
@@ -1978,7 +2419,7 @@ class TimeStampBasedReader:
                         else:
                             quality[s] = 0
                             # raw_ints[s] stays 0; will be overwritten by carry-forward in _append_gcs_group
-                            if self._carry_forward_log_count < self._carry_forward_log_max:
+                            if self._carry_forward_log_count < self._carry_forward_log_max and not self.quiet:
                                 self._carry_forward_log_count += 1
                                 _r1_attempt = self._decode_raw_int_from_packet_bits(p1.bits) if p1.bits is not None and len(p1.bits) >= 20 else None
                                 _r2_attempt = self._decode_raw_int_from_packet_bits(p2.bits) if p2.bits is not None and len(p2.bits) >= 20 else None
@@ -2035,10 +2476,42 @@ class TimeStampBasedReader:
 
                 quality[error_occurred] |= np.int8(0x08)
 
+                # Characterization-only diagnostics, parallel to quality[] -
+                # NOT part of the persisted quality_packed/GCS path. See
+                # get_decoded_flags() and LOW_CONF_COUNT_THRESHOLD.
+                flags = np.zeros(4, dtype=DECODED_FLAGS_DTYPE)
+                bits_rec = np.zeros(4, dtype=DECODED_BITS_DTYPE)
+                for s in range(4):
+                    p1, p2 = group[s], group[s + 4]
+                    flags['changeofstrength_v1'][s] = p1.changeofstrength_flag
+                    flags['changeofstrength_v2'][s] = p2.changeofstrength_flag
+                    flags['packetnum_anomaly_v1'][s] = p1.packetnum_anomaly_flag
+                    flags['packetnum_anomaly_v2'][s] = p2.packetnum_anomaly_flag
+                    flags['low_conf_v1'][s] = p1.low_conf_count >= LOW_CONF_COUNT_THRESHOLD
+                    flags['low_conf_v2'][s] = p2.low_conf_count >= LOW_CONF_COUNT_THRESHOLD
+
+                    v1_ok = p1.is_valid and p1.bits is not None and len(p1.bits) >= DECODED_BITS_WIDTH
+                    v2_ok = p2.is_valid and p2.bits is not None and len(p2.bits) >= DECODED_BITS_WIDTH
+                    bits_rec['v1_missing'][s] = not v1_ok
+                    bits_rec['v2_missing'][s] = not v2_ok
+                    if v1_ok:
+                        bits_rec['v1_bits'][s] = p1.bits[:DECODED_BITS_WIDTH]
+                    if v2_ok:
+                        bits_rec['v2_bits'][s] = p2.bits[:DECODED_BITS_WIDTH]
+
+                    pos_v1 = group_positions[s] if s < len(group_positions) else None
+                    pos_v2 = group_positions[s + 4] if s + 4 < len(group_positions) else None
+                    bits_rec['v1_word_pos'][s] = pos_v1 if pos_v1 is not None else -1
+                    bits_rec['v2_word_pos'][s] = pos_v2 if pos_v2 is not None else -1
+                    bits_rec['v1_low_conf'][s] = p1.low_conf_count
+                    bits_rec['v2_low_conf'][s] = p2.low_conf_count
+
                 self.decoded_groups_by_channel[channel_idx].append(values)
                 # if channel_idx == 2:
                     # print(f"Decoded group for channel {channel_idx}, sample_idx={sample_indices[0]}-{sample_indices[-1]}: values={values} quality={quality} raw_ints={raw_ints}")
                 self.decoded_quality_by_channel[channel_idx].append(quality)
+                self.decoded_flags_by_channel[channel_idx].append(flags)
+                self.decoded_bits_by_channel[channel_idx].append(bits_rec)
                 if channel_idx == self.channel_to_decode:
                     self._last_decoded_sample_time = time.time()
                 group_values[channel_idx] = values
@@ -2131,6 +2604,19 @@ class TimeStampBasedReader:
         self.decoded_quality_by_channel = {
             ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
         }
+        # Per-sample characterization diagnostics (changeofstrength/packetnum
+        # anomaly/low_conf, both copies) - parallel to decoded_quality_by_channel,
+        # same group-append cadence, not part of the persisted quality_packed/GCS
+        # path. See get_decoded_flags().
+        self.decoded_flags_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
+        # Raw pre-decode bits for both copies, for ground-truth (PRBS) BER
+        # comparison - same parallel structure as decoded_flags_by_channel.
+        # See get_decoded_bits().
+        self.decoded_bits_by_channel = {
+            ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
+        }
         self.decoded_sample_count_by_channel = {ch: 0 for ch in range(1, 5)}
         self.mismatch_events_by_channel = {
             ch: deque(maxlen=2000) for ch in range(1, 5)
@@ -2162,6 +2648,7 @@ class TimeStampBasedReader:
         self.placeholder_inserts_cross_chunk = 0
         self.placeholder_inserts_intra_chunk = 0
         self.placeholder_inserts_group_builder = 0
+        self.low_conf_filtered_before_builder = 0
         self.packet_num_distance_corrections = 0  # frames relabeled from noisy pkt# to distance value
         self._phase_locked = False           # when locked, distance overrides noisy pkt# field
         self._phase_agreement_run = 0        # consecutive detect-vs-distance agreements toward lock
@@ -2181,6 +2668,7 @@ class TimeStampBasedReader:
         self._words_processed_total = 0       # absolute word offset for timestamps
         self._raw_frame_log = []              # list of (abs_word_idx, packet_num, frame_length, passed_valid)
         self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}
+        self._last_group_real_word_position = {ch: None for ch in range(1, 5)}
         self._first_group_skipped = False
         self.gcs_write_buffer = []
 
@@ -2428,6 +2916,35 @@ class TimeStampBasedReader:
         values = np.vstack(channel_groups)
         quality = np.vstack(channel_quality)
         return values, quality
+
+    def get_decoded_flags(self, channel_idx=None):
+        """Characterization-only diagnostics: changeofstrength_flag,
+        packetnum_anomaly_flag, and low_conf_count>=LOW_CONF_COUNT_THRESHOLD,
+        for both duplicate copies, per decided sample. Same shape/ordering as
+        get_decoded_arrays()'s quality array (ravel and zip directly - no
+        separate alignment needed), but NOT part of the persisted
+        quality_packed/GCS output - see DecodedPacket's field comments and
+        this session's plan for why these are kept separate from that path.
+        """
+        idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
+        channel_flags = self.decoded_flags_by_channel[idx]
+        if len(channel_flags) == 0:
+            return np.empty((0, 4), dtype=DECODED_FLAGS_DTYPE)
+        return np.vstack(channel_flags)
+
+    def get_decoded_bits(self, channel_idx=None):
+        """Raw pre-decode bits for both duplicate copies, per decided sample -
+        for ground-truth (e.g. PRBS) BER comparison, as opposed to the
+        duplicate-copy-agreement proxy the quality byte encodes. Same
+        shape/ordering as get_decoded_arrays()/get_decoded_flags() - zip
+        directly, no separate alignment needed. v1_bits/v2_bits are
+        zero-filled (not meaningful) wherever v1_missing/v2_missing is True.
+        """
+        idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
+        channel_bits = self.decoded_bits_by_channel[idx]
+        if len(channel_bits) == 0:
+            return np.empty((0, 4), dtype=DECODED_BITS_DTYPE)
+        return np.vstack(channel_bits)
 
     def get_channel_series(self, channel_idx=None):
         idx = self._normalize_channel_index(channel_idx, self.channel_to_decode)
@@ -3024,7 +3541,7 @@ if __name__ == '__main__':
         frame_length_counts={250: 18, 248: 1},
         bits_per_channel=40,
         channel_to_decode=2,
-        plot_channels=[2,3],
+        plot_channels=[1,2,3],
         save_plot_csv=True,
         gcs_bucket="ueegbucket",
         gcs_buffer_size=400,
