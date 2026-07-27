@@ -470,9 +470,6 @@ class TimeStampBasedReader:
         self.gcs_timestamp_log = []  # List of {gcs_sample_idx, timestamp_utc, system_time_s}
         self.gcs_timestamp_log_interval = 12000  # Log timestamp every 12000 samples (60 seconds at 200 Hz)
         self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}  # Track word positions for packets
-        self._last_group_real_word_position = {ch: None for ch in range(1, 5)}  # word pos of the
-            # last REAL (non-placeholder) packet actually placed into a group, per channel -
-            # see _build_group_with_placeholders' distance check
         self._first_group_skipped = False  # Discard first decoded group (startup artifact)
         self._force_timestamp_after_restart = False  # Set True after SDR restart to force a checkpoint
         self.capture_start_time = None
@@ -2146,30 +2143,28 @@ class TimeStampBasedReader:
         # this was a real, confirmed bug (word positions drifting further
         # from true time as the recording went on).
         #
-        # DISTANCE CHECK (2026-07-26 fix - see project notes): this used to
-        # insert a placeholder purely because pending[0].packet_num didn't
-        # match the expected 0-7 counter value, with NO reference to real
-        # elapsed word-distance/time at all - unlike every other gap-filling
-        # path in this file (cross_chunk, intra_chunk), which all treat the
-        # raw packet_num field as unreliable (bit errors corrupt it) and
-        # trust word-distance instead. That made this the dominant source of
-        # placeholder insertions by a wide margin in real captures (400-576
-        # per snapshot vs 32-157 from intra_chunk), manufacturing "missing"
-        # frames whenever a channel's packets arrived in an order that
-        # didn't fit a rigid modulo-8 assumption, even when no real gap
-        # occurred. Now: before treating a mismatch as a genuine gap, check
-        # the word-distance from the last REAL packet actually placed into
-        # this channel's groups to the candidate packet's own position. If
-        # that distance implies essentially no time passed (<=1 frame),
-        # there's no room for a real missing frame - the packet_num
-        # mismatch is far more likely a residual numbering artifact than an
-        # actual drop, so take the packet as-is instead of manufacturing a
-        # placeholder. Falls back to the old (insert-a-placeholder) behavior
-        # whenever either position is unknown - conservative, doesn't change
-        # behavior without real evidence to act on.
+        # DISTANCE-ACCEPT BRANCH REVERTED (2026-07-27): a 2026-07-26 change
+        # here tried accepting a packet_num mismatch as-is (instead of
+        # placeholder-filling) whenever word-distance implied no real gap,
+        # to cut down on excessive placeholder insertion. Reverted - user
+        # confirmed packets cannot arrive out of order on this link, which
+        # means a group can legitimately be phase-offset (e.g. the true
+        # arrival sequence is {4,5,6,7,0,1,2,3}, not corrupted, just not
+        # starting at 0) - group[s]/group[s+4]'s downstream v1/v2 pairing
+        # assumes slot 0 is always the true start of a paired octet, so
+        # relabeling OR blindly accepting a mismatched packet_num into a
+        # fixed slot both corrupt real, distinct packets into looking like
+        # false "copies" of each other. That's a deeper phase-tracking
+        # problem (expected_packet_num needs to carry forward across calls
+        # instead of resetting to 0 every time), not something this
+        # function can safely paper over with either accept-as-is or
+        # relabel. Back to the simple, safe rule: any mismatch, regardless
+        # of distance, gets a placeholder - matches every version of this
+        # file before 2026-07-26. GROUP_BUILDER_LOW_CONF_CUTOFF (in
+        # _decode_packet_groups, filtering unreliable packets before they
+        # ever reach pending) is unrelated to this branch and stays.
         pending = self._pending_packets_by_channel[channel_idx]
         positions = self._pending_packet_word_positions[channel_idx]
-        last_real_pos = self._last_group_real_word_position[channel_idx]
         group = []
         group_positions = []
         log_ch1 = channel_idx == 1 and len(self._group_builder_decision_log) < 100_000
@@ -2180,45 +2175,10 @@ class TimeStampBasedReader:
                 pos = positions.pop(0) if len(positions) > 0 else None
                 group.append(pending.pop(0))
                 group_positions.append(pos)
-                if pos is not None:
-                    last_real_pos = pos
                 if log_ch1:
                     self._group_builder_decision_log.append({
                         'expected': expected_packet_num, 'pending_front_pkt': pending_front_pkt,
                         'action': 'match', 'accepted_pkt_num': expected_packet_num,
-                        'distance_words': None, 'expected_frames': None,
-                    })
-                continue
-
-            distance_justifies_gap = True
-            distance_val = None
-            expected_frames_val = None
-            if len(pending) > 0 and len(positions) > 0 and positions[0] is not None and last_real_pos is not None:
-                distance_val = positions[0] - last_real_pos
-                expected_frames_val = self._estimate_frames_in_gap_linear(distance_val)
-                if expected_frames_val <= 1:
-                    distance_justifies_gap = False
-
-            if not distance_justifies_gap:
-                pos = positions.pop(0) if len(positions) > 0 else None
-                accepted = pending.pop(0)
-                group.append(accepted)
-                group_positions.append(pos)
-                if pos is not None:
-                    last_real_pos = pos
-                if not self.quiet:
-                    _ts = pos / self.bit_clock_hz if pos is not None else float('nan')
-                    print(
-                        f"⚠️  group_builder distance-accept-mismatch ch{channel_idx} @ t={_ts:.3f}s: "
-                        f"slot expected pkt#{expected_packet_num}, queue had pkt#{pending_front_pkt} "
-                        f"(dist={distance_val} words, ~{expected_frames_val} frame(s)) - accepted as-is, "
-                        f"NOT relabeled - can duplicate/omit a packet_num if the real one shows up later"
-                    )
-                if log_ch1:
-                    self._group_builder_decision_log.append({
-                        'expected': expected_packet_num, 'pending_front_pkt': pending_front_pkt,
-                        'action': 'distance_accept_mismatch', 'accepted_pkt_num': int(accepted.packet_num),
-                        'distance_words': distance_val, 'expected_frames': expected_frames_val,
                     })
                 continue
 
@@ -2236,9 +2196,7 @@ class TimeStampBasedReader:
                 self._group_builder_decision_log.append({
                     'expected': expected_packet_num, 'pending_front_pkt': pending_front_pkt,
                     'action': 'placeholder', 'accepted_pkt_num': None,
-                    'distance_words': distance_val, 'expected_frames': expected_frames_val,
                 })
-        self._last_group_real_word_position[channel_idx] = last_real_pos
         return group, group_positions
 
     def _decode_packet_groups(self, packets_by_channel, packet_word_positions=None, word_timestamps=None):
@@ -2778,7 +2736,6 @@ class TimeStampBasedReader:
         self._words_processed_total = 0       # absolute word offset for timestamps
         self._raw_frame_log = []              # list of (abs_word_idx, packet_num, frame_length, passed_valid)
         self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}
-        self._last_group_real_word_position = {ch: None for ch in range(1, 5)}
         self._first_group_skipped = False
         self.gcs_write_buffer = []
 
