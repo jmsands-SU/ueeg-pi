@@ -36,7 +36,7 @@
             "decode_scale": 0.00025
         }
     },
-    "active_board": "1",
+    "active_board": "2",
     "device1_identifier": "*:serial=1e165c5f0bc94c0c85c5092c27a93427",
     "device2_board": null,
     "device2_settings": {
