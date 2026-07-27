@@ -1678,7 +1678,18 @@ class TimeStampBasedReader:
         # since nothing here depends on group_builder's output. Called
         # right after _extract_channel_packets, ahead of
         # _decode_packet_groups, at both processing_thread call sites.
-        if self._raw_packet_dump_file is None:
+        #
+        # Gated on gcs_recording_active (the runtime flag toggled by
+        # _start_gcs_recording/_stop_gcs_recording via the pub/sub trigger,
+        # NOT the static enable_gcs constructor flag) - this is meant as a
+        # companion to an actual recording session, not something that
+        # writes during arbitrary test/idle runs where GCS recording isn't
+        # even on. The file itself stays open for the reader's whole
+        # lifetime (one per-session timestamped file, see __init__) even
+        # across multiple start/stop toggles - only the writes are gated,
+        # so word_pos/t_s stay globally consistent within one file rather
+        # than needing a new file per recording start/stop.
+        if self._raw_packet_dump_file is None or not self.gcs_recording_active:
             return
         positions = packet_word_positions or {}
         for ch, packets in packets_by_channel.items():
