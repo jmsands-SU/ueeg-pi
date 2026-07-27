@@ -44,6 +44,6 @@
     },
     "dual_rx_antenna": false,
     "dual_rx_primary_board": "1",
-    "rbf_file": "SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf",
+    "rbf_file": "SoftDetect-2026-07-26_23.07.17/RMSxA4.rbf",
     "block_resume_after_unclean_exit": false
 }
