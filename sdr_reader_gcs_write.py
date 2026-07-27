@@ -240,15 +240,31 @@ class TimeStampBasedReader:
         # trusting the live grouping. Local file, NOT routed through the GCS
         # write path - that pipeline is untouched and keeps writing the
         # normal processed output to the cloud as before.
+        #
+        # raw_packet_dump_path is a BASE path, not the literal filename - a
+        # session timestamp is inserted before the extension so an
+        # autorestart (systemd, watchdog, crash-recovery, etc.) always gets
+        # its own fresh file instead of appending into the previous
+        # session's, which would otherwise silently collide: word_pos/t_s
+        # both reset to 0 on every fresh reader instance (relative to this
+        # instance's own _words_processed_total), so two sessions appended
+        # into one file would have overlapping, ambiguous position/time
+        # values with no marker showing where one session ends and the next
+        # begins.
         self.raw_packet_dump_path = raw_packet_dump_path
         self._raw_packet_dump_file = None
         if self.raw_packet_dump_path:
+            _base, _ext = os.path.splitext(self.raw_packet_dump_path)
+            _session_id = time.strftime('%Y%m%d_%H%M%S') + f'_{int((time.time() % 1) * 1000):03d}'
+            self.raw_packet_dump_path = f'{_base}_{_session_id}{_ext or ".csv"}'
             self._raw_packet_dump_file = open(self.raw_packet_dump_path, 'a', newline='')
             if self._raw_packet_dump_file.tell() == 0:
                 self._raw_packet_dump_file.write(
                     'word_pos,t_s,channel,packet_num,is_valid,low_conf_count,reason,bits\n'
                 )
                 self._raw_packet_dump_file.flush()
+            if not self.quiet:
+                print(f'Raw packet dump: {self.raw_packet_dump_path}')
         self.reader_label = str(reader_label)
         self.sample_rate = int(sample_rate)
         self.frequency = int(frequency)
