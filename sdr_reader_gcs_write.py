@@ -226,10 +226,29 @@ class TimeStampBasedReader:
         bladerf_identifier=None,
         block_resume_after_unclean_exit=False,
         disable_header_drops=True,
+        raw_packet_dump_path=None,
     ):
         self.quiet = bool(quiet)  # suppress per-buffer decode warnings (e.g. for secondary reader)
         self.disable_header_drops = bool(disable_header_drops)
         self.block_resume_after_unclean_exit = bool(block_resume_after_unclean_exit)
+        # Opt-in, off by default: dump every RAW extracted packet (both
+        # "copies", before group_builder assigns them to v1/v2 slots) to a
+        # local CSV as they're extracted from the live BladeRF stream - a
+        # post-processing safety net for the group_builder packet_num
+        # swap/duplication issue (2026-07-27), so pairing can be
+        # reconstructed offline from ground-truth per-packet data instead of
+        # trusting the live grouping. Local file, NOT routed through the GCS
+        # write path - that pipeline is untouched and keeps writing the
+        # normal processed output to the cloud as before.
+        self.raw_packet_dump_path = raw_packet_dump_path
+        self._raw_packet_dump_file = None
+        if self.raw_packet_dump_path:
+            self._raw_packet_dump_file = open(self.raw_packet_dump_path, 'a', newline='')
+            if self._raw_packet_dump_file.tell() == 0:
+                self._raw_packet_dump_file.write(
+                    'word_pos,t_s,channel,packet_num,is_valid,low_conf_count,reason,bits\n'
+                )
+                self._raw_packet_dump_file.flush()
         self.reader_label = str(reader_label)
         self.sample_rate = int(sample_rate)
         self.frequency = int(frequency)
@@ -408,6 +427,13 @@ class TimeStampBasedReader:
         self._phase_mismatch_run = 0         # leaky mismatch run toward re-acquire unlock
         self.phase_relocks = 0               # times the phase lock was dropped to re-acquire
         self._group_builder_input_log = []   # (packet_num, is_valid) for ch1, capped at 100k
+        self._group_builder_decision_log = []  # per-slot decision trace for ch1, capped at 100k -
+            # each entry: expected/pending_front_pkt/action(match|distance_accept_mismatch|
+            # placeholder)/accepted_pkt_num/distance_words/expected_frames - see
+            # _build_group_with_placeholders. Added 2026-07-26 to trace exactly how a
+            # confirmed real anomaly (a live recording producing garbled packet_num
+            # sequences like {4,5,6,7,1,2,3,4} instead of the expected {0,1,...,7} cycle)
+            # actually happens, one slot-fill decision at a time.
         self.gap_estimate_agree_count = 0
         self.gap_estimate_disagree_count = 0
         self.decoded_groups = self.decoded_groups_by_channel[self.channel_to_decode]
@@ -1629,6 +1655,28 @@ class TimeStampBasedReader:
 
         return None
 
+    def _dump_raw_packets(self, packets_by_channel, packet_word_positions):
+        # Writes every raw extracted packet (both copies, whatever channel
+        # they belong to) to a local CSV, BEFORE group_builder does any
+        # slot assignment - immune to the packet_num swap/duplication issue
+        # since nothing here depends on group_builder's output. Called
+        # right after _extract_channel_packets, ahead of
+        # _decode_packet_groups, at both processing_thread call sites.
+        if self._raw_packet_dump_file is None:
+            return
+        positions = packet_word_positions or {}
+        for ch, packets in packets_by_channel.items():
+            pos_list = positions.get(ch, [])
+            for i, p in enumerate(packets):
+                wp = pos_list[i] if i < len(pos_list) else None
+                t_s = (wp / self.bit_clock_hz) if wp is not None else ''
+                bits_str = ''.join(str(int(b)) for b in p.bits) if p.bits is not None and len(p.bits) else ''
+                self._raw_packet_dump_file.write(
+                    f'{wp if wp is not None else ""},{t_s},{ch},{int(p.packet_num)},'
+                    f'{int(p.is_valid)},{int(p.low_conf_count)},{p.reason},{bits_str}\n'
+                )
+        self._raw_packet_dump_file.flush()
+
     def _extract_channel_packets(self, data: np.ndarray):
         data = np.asarray(data, dtype=np.uint16).reshape(-1)
         prefix = self._extract_lookback_words
@@ -2097,28 +2145,54 @@ class TimeStampBasedReader:
         last_real_pos = self._last_group_real_word_position[channel_idx]
         group = []
         group_positions = []
+        log_ch1 = channel_idx == 1 and len(self._group_builder_decision_log) < 100_000
         for expected_packet_num in range(8):
+            pending_front_pkt = int(pending[0].packet_num) if len(pending) > 0 else None
+
             if len(pending) > 0 and int(pending[0].packet_num) == expected_packet_num:
                 pos = positions.pop(0) if len(positions) > 0 else None
                 group.append(pending.pop(0))
                 group_positions.append(pos)
                 if pos is not None:
                     last_real_pos = pos
+                if log_ch1:
+                    self._group_builder_decision_log.append({
+                        'expected': expected_packet_num, 'pending_front_pkt': pending_front_pkt,
+                        'action': 'match', 'accepted_pkt_num': expected_packet_num,
+                        'distance_words': None, 'expected_frames': None,
+                    })
                 continue
 
             distance_justifies_gap = True
+            distance_val = None
+            expected_frames_val = None
             if len(pending) > 0 and len(positions) > 0 and positions[0] is not None and last_real_pos is not None:
-                distance = positions[0] - last_real_pos
-                expected_frames = self._estimate_frames_in_gap_linear(distance)
-                if expected_frames <= 1:
+                distance_val = positions[0] - last_real_pos
+                expected_frames_val = self._estimate_frames_in_gap_linear(distance_val)
+                if expected_frames_val <= 1:
                     distance_justifies_gap = False
 
             if not distance_justifies_gap:
                 pos = positions.pop(0) if len(positions) > 0 else None
-                group.append(pending.pop(0))
+                accepted = pending.pop(0)
+                group.append(accepted)
                 group_positions.append(pos)
                 if pos is not None:
                     last_real_pos = pos
+                if not self.quiet:
+                    _ts = pos / self.bit_clock_hz if pos is not None else float('nan')
+                    print(
+                        f"⚠️  group_builder distance-accept-mismatch ch{channel_idx} @ t={_ts:.3f}s: "
+                        f"slot expected pkt#{expected_packet_num}, queue had pkt#{pending_front_pkt} "
+                        f"(dist={distance_val} words, ~{expected_frames_val} frame(s)) - accepted as-is, "
+                        f"NOT relabeled - can duplicate/omit a packet_num if the real one shows up later"
+                    )
+                if log_ch1:
+                    self._group_builder_decision_log.append({
+                        'expected': expected_packet_num, 'pending_front_pkt': pending_front_pkt,
+                        'action': 'distance_accept_mismatch', 'accepted_pkt_num': int(accepted.packet_num),
+                        'distance_words': distance_val, 'expected_frames': expected_frames_val,
+                    })
                 continue
 
             group.append(
@@ -2131,6 +2205,12 @@ class TimeStampBasedReader:
             )
             group_positions.append(None)
             self.placeholder_inserts_group_builder += 1
+            if log_ch1:
+                self._group_builder_decision_log.append({
+                    'expected': expected_packet_num, 'pending_front_pkt': pending_front_pkt,
+                    'action': 'placeholder', 'accepted_pkt_num': None,
+                    'distance_words': distance_val, 'expected_frames': expected_frames_val,
+                })
         self._last_group_real_word_position[channel_idx] = last_real_pos
         return group, group_positions
 
@@ -2563,6 +2643,7 @@ class TimeStampBasedReader:
             if consumed > 0:
                 # Unpack packets and positions
                 packets_by_channel, packet_word_positions = result
+                self._dump_raw_packets(packets_by_channel, packet_word_positions)
 
                 # Extract timestamps for consumed words
                 consumed_word_timestamps = None
@@ -2587,11 +2668,12 @@ class TimeStampBasedReader:
             )
             if consumed > 0:
                 packets_by_channel, packet_word_positions = packets
+                self._dump_raw_packets(packets_by_channel, packet_word_positions)
                 consumed_word_timestamps = None
                 if hasattr(self, '_word_timestamps') and self._word_timestamps is not None and len(self._word_timestamps) >= consumed:
                     consumed_word_timestamps = self._word_timestamps[:consumed]
                 self._decode_packet_groups(
-                    packets_by_channel, 
+                    packets_by_channel,
                     packet_word_positions=packet_word_positions,
                     word_timestamps=consumed_word_timestamps
                 )
@@ -2655,6 +2737,7 @@ class TimeStampBasedReader:
         self._phase_mismatch_run = 0         # leaky mismatch run toward re-acquire unlock
         self.phase_relocks = 0               # times the phase lock was dropped to re-acquire
         self._group_builder_input_log = []   # (packet_num, is_valid) for ch1, capped at 2000
+        self._group_builder_decision_log = []
         self.gap_estimate_agree_count = 0
         self.gap_estimate_disagree_count = 0
         self.decoded_groups = self.decoded_groups_by_channel[self.channel_to_decode]
