@@ -3059,6 +3059,7 @@ class TimeStampBasedReader:
         print(f'  Placeholder inserts (cross): {self.placeholder_inserts_cross_chunk:6d}')
         print(f'  Placeholder inserts (intra): {self.placeholder_inserts_intra_chunk:6d}')
         print(f'  Placeholder inserts (group): {self.placeholder_inserts_group_builder:6d}')
+        print(f'  Low-conf packets excluded before group_builder (cutoff={GROUP_BUILDER_LOW_CONF_CUTOFF}): {self.low_conf_filtered_before_builder:6d}')
         print(
             f'  Gap estimate agree/disagree: {self.gap_estimate_agree_count:6d}/{self.gap_estimate_disagree_count:6d}'
         )
