@@ -42,7 +42,7 @@
         }
     },
     "active_board": "5",
-    "device1_identifier": "*:serial=1e165c5f0bc94c0c85c5092c27a93427",
+    "device1_identifier": null,
     "device2_board": null,
     "device2_settings": {
         "bladerf_identifier": null
