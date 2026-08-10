@@ -52,7 +52,11 @@ def trigger_sdr(request):
     # --- Parse URL Parameters ---
     request_args = request.args
     action = request_args.get("action", "start")
-    
+    # Optional: target a single device. Only devices with a matching device_id in their
+    # board_config.json will act on this message; omit to broadcast to every device (the
+    # default, and the only option when nobody has device_id filtering turned on).
+    device_id = request_args.get("device_id")
+
     if action == "start":
         blob_name = request_args.get("blob")
         try:
@@ -60,16 +64,19 @@ def trigger_sdr(request):
         except (ValueError, TypeError):
             return ("Invalid 'duration' parameter.", 400, headers)
         overwrite = request_args.get("overwrite", "false").lower() == "true"
-        
+
         if not blob_name or duration_seconds <= 0:
             return ("'blob' and a positive 'duration' are required for start action.", 400, headers)
-        
+
         payload = { "action": "start", "blob": blob_name, "duration_seconds": duration_seconds, "overwrite": overwrite }
 
     elif action == "stop":
         payload = { "action": "stop" }
     else:
         return (f"Invalid action: '{action}'. Must be 'start' or 'stop'.", 400, headers)
+
+    if device_id:
+        payload["device_id"] = device_id
 
     # --- Publish the Payload to Pub/Sub ---
     try:

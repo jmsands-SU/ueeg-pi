@@ -34,7 +34,7 @@
             "label": "chip 19 prbs",
             "frequency_hz": 919600000,
             "decode_scale": 0.00025
-        }
+        },
         "36": {
             "label": "chip 36 ada 1st device",
             "frequency_hz": 916000000,
@@ -42,6 +42,7 @@
         }
     },
     "active_board": "5",
+    "device_id": null,
     "device1_identifier": null,
     "device2_board": null,
     "device2_settings": {
@@ -50,5 +51,5 @@
     "dual_rx_antenna": false,
     "dual_rx_primary_board": "1",
     "rbf_file": "SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf",
-    "block_resume_after_unclean_exit": false
+    "block_resume_after_unclean_exit": true
 }

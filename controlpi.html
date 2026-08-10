@@ -106,7 +106,12 @@
             <input type="password" id="secretKey" placeholder="Enter your secret key here" required>
         </div>
         <hr style="border: 0; border-top: 1px solid #e9ecef; margin: 2em 0;">
-        
+
+        <div class="form-group">
+            <label for="deviceId">Device ID (optional — leave blank to target all devices)</label>
+            <input type="text" id="deviceId" placeholder="e.g. pi1">
+        </div>
+
         <div class="form-group">
             <label for="blobName">Blob Name (used as file in GCS)</label>
             <input type="text" id="blobName" value="my-recording-session" required>
@@ -133,8 +138,10 @@
     <script>
         const CLOUD_FUNCTION_URL = "https://trigger-sdr-108359996380.us-west1.run.app";
         const SECRET_KEY_STORAGE_ID = "sdrSecretKey";
+        const DEVICE_ID_STORAGE_ID = "sdrDeviceId";
 
         const secretKeyInput = document.getElementById('secretKey');
+        const deviceIdInput = document.getElementById('deviceId');
         const blobNameInput = document.getElementById('blobName');
         const durationInput = document.getElementById('duration');
         const overwriteInput = document.getElementById('overwrite');
@@ -145,6 +152,11 @@
         secretKeyInput.value = localStorage.getItem(SECRET_KEY_STORAGE_ID) || '';
         secretKeyInput.addEventListener('input', () => {
             localStorage.setItem(SECRET_KEY_STORAGE_ID, secretKeyInput.value);
+        });
+
+        deviceIdInput.value = localStorage.getItem(DEVICE_ID_STORAGE_ID) || '';
+        deviceIdInput.addEventListener('input', () => {
+            localStorage.setItem(DEVICE_ID_STORAGE_ID, deviceIdInput.value);
         });
 
         async function sendCommand(params) {
@@ -187,10 +199,15 @@
                 duration: durationInput.value,
                 overwrite: overwriteInput.checked.toString()
             };
-            
+
             if (!params.blob) {
                 alert('Please enter a Session Name.');
                 return;
+            }
+
+            const deviceId = deviceIdInput.value.trim();
+            if (deviceId) {
+                params.device_id = deviceId;
             }
 
             sendCommand(params);
@@ -200,6 +217,12 @@
             const params = {
                 action: 'stop'
             };
+
+            const deviceId = deviceIdInput.value.trim();
+            if (deviceId) {
+                params.device_id = deviceId;
+            }
+
             sendCommand(params);
         });
     </script>

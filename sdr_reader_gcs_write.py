@@ -104,6 +104,7 @@ class TimeStampBasedReader:
         gcs_trigger_topic_id='sdr-commands',
         gcs_trigger_subscription_id='sdr-commands-pi-sub',
         gcs_trigger_pull_timeout=.5,
+        gcs_trigger_device_id=None,
         enable_plotting=True,
         enable_gcs=False,
         enable_bandpass_filter=True,
@@ -159,6 +160,12 @@ class TimeStampBasedReader:
         self.gcs_trigger_topic_id = gcs_trigger_topic_id
         self.gcs_trigger_subscription_id = gcs_trigger_subscription_id
         self.gcs_trigger_pull_timeout = gcs_trigger_pull_timeout
+        # If set, only trigger messages tagged with a matching device_id are acted on;
+        # messages for other devices are released immediately (not acked) so they stay
+        # available for their intended device instead of sitting out the ack deadline.
+        # If None (default), filtering is disabled and every message on the shared
+        # subscription is processed — the original single-device behavior.
+        self.gcs_trigger_device_id = gcs_trigger_device_id
 
         self.gcs_client = None
         self.gcs_bucket_obj = None
@@ -564,6 +571,23 @@ class TimeStampBasedReader:
         self._write_recording_state_file()
         print('GCS recording stopped.')
 
+    def _gcs_trigger_targets_me(self, payload: str) -> bool:
+        """Whether this device should consume a pulled trigger message.
+
+        Filtering is off (returns True unconditionally) unless gcs_trigger_device_id is
+        set. When set, messages without a device_id are treated as broadcast (e.g. a
+        stop-all) and accepted by everyone; messages with a device_id are only accepted
+        by the matching device.
+        """
+        if self.gcs_trigger_device_id is None:
+            return True
+        try:
+            msg = json.loads(payload)
+        except Exception:
+            return True
+        target = msg.get('device_id')
+        return target is None or str(target) == str(self.gcs_trigger_device_id)
+
     def _handle_gcs_trigger_message(self, payload: str):
         text = (payload or '').strip()
         # Default: treat plain text as a command word
@@ -624,13 +648,25 @@ class TimeStampBasedReader:
                     timeout=float(self.gcs_trigger_pull_timeout),
                 )
                 ack_ids = []
+                nack_ids = []
                 for received in response.received_messages:
-                    ack_ids.append(received.ack_id)
                     data = received.message.data.decode('utf-8', errors='ignore')
-                    print(f'GCS trigger message received: {data!r}')
-                    self._handle_gcs_trigger_message(data)
+                    if self._gcs_trigger_targets_me(data):
+                        print(f'GCS trigger message received: {data!r}')
+                        self._handle_gcs_trigger_message(data)
+                        ack_ids.append(received.ack_id)
+                    else:
+                        print(f'GCS trigger message ignored (not for device_id={self.gcs_trigger_device_id!r}): {data!r}')
+                        nack_ids.append(received.ack_id)
                 if ack_ids:
                     self.gcs_subscriber.acknowledge(request={'subscription': subscription_path, 'ack_ids': ack_ids})
+                if nack_ids:
+                    # Release immediately (ack_deadline_seconds=0) instead of acking, so the
+                    # message is redelivered right away rather than sitting out the full
+                    # ack-deadline window before another puller can see it.
+                    self.gcs_subscriber.modify_ack_deadline(
+                        request={'subscription': subscription_path, 'ack_ids': nack_ids, 'ack_deadline_seconds': 0}
+                    )
                 self._trigger_poll_err_count = 0
             except Exception as exc:
                 _trigger_err_count = getattr(self, '_trigger_poll_err_count', 0) + 1
@@ -961,14 +997,20 @@ class TimeStampBasedReader:
             return
 
         ack_ids = []
+        nack_ids = []
         for msg in response.received_messages:
-            ack_ids.append(msg.ack_id)
             try:
                 payload = msg.message.data.decode('utf-8') if msg.message.data else '{}'
-                print(f'GCS trigger message received: {payload!r}')
-                self._handle_gcs_trigger_message(payload)
+                if self._gcs_trigger_targets_me(payload):
+                    print(f'GCS trigger message received: {payload!r}')
+                    self._handle_gcs_trigger_message(payload)
+                    ack_ids.append(msg.ack_id)
+                else:
+                    print(f'GCS trigger message ignored (not for device_id={self.gcs_trigger_device_id!r}): {payload!r}')
+                    nack_ids.append(msg.ack_id)
             except Exception as exc:
                 print(f'GCS trigger message parse error: {exc}')
+                ack_ids.append(msg.ack_id)
         if ack_ids:
             try:
                 self.gcs_subscriber.acknowledge(
@@ -979,6 +1021,17 @@ class TimeStampBasedReader:
                 )
             except Exception as exc:
                 print(f'GCS trigger ack error: {exc}')
+        if nack_ids:
+            try:
+                self.gcs_subscriber.modify_ack_deadline(
+                    request={
+                        'subscription': subscription_path,
+                        'ack_ids': nack_ids,
+                        'ack_deadline_seconds': 0,
+                    }
+                )
+            except Exception as exc:
+                print(f'GCS trigger nack error: {exc}')
 
     def _upload_series_to_gcs_binary(self, series: np.ndarray, quality_series: np.ndarray = None):
         if not self.enable_gcs:
@@ -3034,6 +3087,7 @@ if __name__ == '__main__':
         enable_gcs=True,
         gcs_trigger_topic_id="sdr-commands",
         gcs_trigger_subscription_id="sdr-commands-pi-sub",
+        gcs_trigger_device_id=_board_cfg.get('device_id'),
     )
     if _board_cfg.get('dual_rx_antenna'):
         _COMMON['sample_rate'] = 32e6  # for dual-antenna, use 32 MHz sample rate
