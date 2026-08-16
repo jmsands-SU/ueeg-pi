@@ -3064,7 +3064,7 @@ if __name__ == '__main__':
         sample_rate=8e6,
         frequency=_board['frequency_hz'],
         decode_scale=_primary_board['decode_scale'],
-        gain_mode='manual',
+        gain_mode='slowattack',
         gain=40,
         block_resume_after_unclean_exit=_board_cfg.get('block_resume_after_unclean_exit', False),
         counter=False,

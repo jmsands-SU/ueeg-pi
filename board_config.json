@@ -41,8 +41,8 @@
             "decode_scale": 0.00056
         }
     },
-    "active_board": "5",
-    "device_id": null,
+    "active_board": "2",
+    "device_id": "joanna",
     "device1_identifier": null,
     "device2_board": null,
     "device2_settings": {
@@ -51,5 +51,5 @@
     "dual_rx_antenna": false,
     "dual_rx_primary_board": "1",
     "rbf_file": "SingleDeviceSingleAntennaNoOverflow_0427_fixerrorflag/RMSxA4.rbf",
-    "block_resume_after_unclean_exit": true
+    "block_resume_after_unclean_exit": false
 }
