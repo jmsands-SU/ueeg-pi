@@ -2,6 +2,7 @@ import threading
 import queue
 import time
 import json
+from datetime import datetime, timezone
 from collections import deque, Counter
 from dataclasses import dataclass
 import os
@@ -178,6 +179,7 @@ class TimeStampBasedReader:
         self.gcs_trigger_thread = None
         self._gcs_trigger_duration = None
         self._gcs_recording_start_time = None
+        self._gcs_recording_start_time_created = None  # GCS server clock at first-chunk write (see _write_gcs_metadata)
         self._gcs_buffer_lock = threading.RLock()
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         self.gcs_samples_written = 0
@@ -314,8 +316,12 @@ class TimeStampBasedReader:
         # Set to (start_s, end_s) to print raw packet bits and decoded ints for every
         # sample whose time (sample_idx / output_rate_hz) falls in the window.
         self.debug_packet_window = None
-        self.gcs_timestamp_log = []  # List of {gcs_sample_idx, timestamp_utc, system_time_s}
-        self.gcs_timestamp_log_interval = 12000  # Log timestamp every 12000 samples (60 seconds at 200 Hz)
+        # Timestamp checkpoints are appended directly to a separate GCS blob
+        # (see _append_gcs_timestamp_checkpoint) rather than accumulated here,
+        # so only the most recent one is kept locally for the status metadata.
+        self._last_timestamp_checkpoint = None
+        self._gcs_timestamp_chunk_counter = 0
+        self.gcs_timestamp_log_interval = 2000  # Log timestamp every 2000 samples (10 seconds at 200 Hz)
         self._pending_packet_word_positions = {ch: [] for ch in range(1, 5)}  # Track word positions for packets
         self._first_group_skipped = False  # Discard first decoded group (startup artifact)
         self._force_timestamp_after_restart = False  # Set True after SDR restart to force a checkpoint
@@ -503,8 +509,10 @@ class TimeStampBasedReader:
             self.gcs_chunk_counter = 0
             self.gcs_session_id = time.strftime('%Y%m%d_%H%M%S')
             self.gcs_samples_written = 0
-            self.gcs_timestamp_log = []
+            self._last_timestamp_checkpoint = None
+            self._gcs_timestamp_chunk_counter = 0
             self._gcs_recording_start_time = time.time()
+            self._gcs_recording_start_time_created = None
             self._gcs_last_good_values = {ch: np.int32(0) for ch in range(1, 5)}
             self._carry_forward_log_count = 0
         # Update blob/temp names from trigger message if blob was updated
@@ -728,6 +736,7 @@ class TimeStampBasedReader:
             rows_to_add.append((np.asarray(vals_row, dtype=np.int32), packed_quality))
 
         should_flush = False
+        new_checkpoint = None
         with self._gcs_buffer_lock:
             if not self.gcs_recording_active:
                 return
@@ -741,35 +750,38 @@ class TimeStampBasedReader:
                 if current_total == 0:
                     ts_val = group_sample_timestamps[0]
                     if not np.isnan(ts_val):
-                        self.gcs_timestamp_log.append({
+                        new_checkpoint = {
                             'gcs_sample_idx': 0,
                             'sample_timestamp_s': float(ts_val),
                             'system_time_s': time.time(),
-                        })
+                        }
                 elif self._force_timestamp_after_restart:
                     ts_val = group_sample_timestamps[0]
                     if not np.isnan(ts_val):
-                        self.gcs_timestamp_log.append({
+                        new_checkpoint = {
                             'gcs_sample_idx': int(current_total),
                             'sample_timestamp_s': float(ts_val),
                             'system_time_s': time.time(),
                             'reason': 'sdr_restart',
-                        })
+                        }
                     self._force_timestamp_after_restart = False
                 elif interval > 0 and (new_total // interval) > (current_total // interval):
                     milestone = (new_total // interval) * interval
                     s_idx = max(0, min(3, milestone - current_total - 1))
                     ts_val = group_sample_timestamps[s_idx]
                     if not np.isnan(ts_val):
-                        self.gcs_timestamp_log.append({
+                        new_checkpoint = {
                             'gcs_sample_idx': int(milestone),
                             'sample_timestamp_s': float(ts_val),
                             'system_time_s': time.time(),
-                        })
+                        }
 
             self.gcs_write_buffer.extend(rows_to_add)
             if len(self.gcs_write_buffer) >= int(self.gcs_buffer_size):
                 should_flush = True
+        if new_checkpoint is not None:
+            self._last_timestamp_checkpoint = new_checkpoint
+            self._append_gcs_timestamp_checkpoint(new_checkpoint)
         if should_flush:
             self._flush_gcs_buffer(force=False)
 
@@ -842,6 +854,27 @@ class TimeStampBasedReader:
                 self.gcs_bucket_obj.rename_blob(temp_blob, new_name=self.gcs_blob_name)
                 main_blob = self.gcs_bucket_obj.blob(self.gcs_blob_name)
                 temp_blob = None  # already gone; skip delete below
+                # Capture GCS's own server-side clock for the moment this recording's
+                # first chunk landed, so it can be compared against this Pi's local
+                # time.time() (recorded as recording_start_time_local_utc) to sanity-check
+                # the Pi's clock isn't drifted relative to an authoritative external clock.
+                try:
+                    main_blob.reload()
+                    self._gcs_recording_start_time_created = main_blob.time_created
+                    gcs_dt = self._gcs_recording_start_time_created
+                    msg = f'Clock check: gcs={gcs_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}'
+                    if self._gcs_recording_start_time:
+                        local_dt = datetime.fromtimestamp(self._gcs_recording_start_time, tz=timezone.utc)
+                        skew_s = (gcs_dt - local_dt).total_seconds()
+                        msg += (
+                            f' local={local_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")} '
+                            f'(gcs - local = {skew_s:+.3f}s)'
+                        )
+                    else:
+                        msg += ' (no local reference)'
+                    print(msg)
+                except Exception as exc:
+                    print(f'Warning: could not read GCS server timestamp for recording start: {exc}')
         except Exception as exc:
             print(f'GCS compose/append error: {exc}')
             # Try to clean up the orphaned temp blob, then requeue
@@ -871,6 +904,57 @@ class TimeStampBasedReader:
             f"GCS append: gs://{self.gcs_bucket}/{self.gcs_blob_name} "
             f"(+{n_samples} samples, total={self.gcs_samples_written} at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})"
         )
+
+    def _gcs_timestamp_log_blob_name(self):
+        return f"{self.gcs_blob_name}.timestamps.jsonl"
+
+    def _append_gcs_timestamp_checkpoint(self, entry: dict):
+        """Append one timestamp checkpoint to the JSONL sync-log blob.
+
+        Uses the same temp-blob-then-compose trick as the binary data path
+        (GCS has no native append), but keeps each write to just the one new
+        line instead of rewriting the whole growing history like the old
+        embedded-in-.meta list did.
+        """
+        if not self.enable_gcs or self.gcs_bucket_obj is None or not self.gcs_blob_name:
+            return
+
+        log_blob_name = self._gcs_timestamp_log_blob_name()
+        line_bytes = (json.dumps(entry) + '\n').encode('utf-8')
+
+        counter = self._gcs_timestamp_chunk_counter
+        self._gcs_timestamp_chunk_counter += 1
+        temp_blob_name = f"{log_blob_name}.temp.{self.gcs_session_id}.{counter}"
+        temp_blob = self.gcs_bucket_obj.blob(temp_blob_name)
+        try:
+            temp_blob.upload_from_string(line_bytes, content_type='application/x-ndjson')
+        except Exception as exc:
+            print(f'GCS timestamp checkpoint upload error: {exc}')
+            return
+
+        main_blob = self.gcs_bucket_obj.blob(log_blob_name)
+        try:
+            if main_blob.exists():
+                main_blob.compose([main_blob, temp_blob])
+            else:
+                # First checkpoint of this recording: rename becomes the log blob.
+                # rename_blob is a server-side copy+delete, so temp_blob is gone
+                # afterwards — do NOT call temp_blob.delete() on this path.
+                self.gcs_bucket_obj.rename_blob(temp_blob, new_name=log_blob_name)
+                temp_blob = None
+        except Exception as exc:
+            print(f'GCS timestamp checkpoint compose error: {exc}')
+            try:
+                temp_blob.delete()
+            except Exception:
+                pass
+            return
+
+        if temp_blob is not None:
+            try:
+                temp_blob.delete()
+            except Exception:
+                pass  # 404 here just means it was already cleaned up; not an error
 
     def _write_gcs_metadata(self):
         """Write/update metadata describing the current GCS binary layout."""
@@ -936,10 +1020,28 @@ class TimeStampBasedReader:
                 'session_id': self.gcs_session_id,
                 'blob_name': self.gcs_blob_name,
                 'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                # Pi's local time.time() vs GCS's own server-side clock, both anchored to
+                # the same event (the recording's first chunk write) — diff them to check
+                # the Pi's clock isn't drifted relative to an authoritative external clock.
+                'recording_start_time_local_utc': (
+                    time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self._gcs_recording_start_time))
+                    if self._gcs_recording_start_time else None
+                ),
+                'gcs_recording_start_time_created_utc': (
+                    self._gcs_recording_start_time_created.strftime('%Y-%m-%dT%H:%M:%SZ')
+                    if self._gcs_recording_start_time_created else None
+                ),
                 'sdr_restart_log': list(self._sdr_restart_log),
-                'timestamp_log': list(self.gcs_timestamp_log),
+                'timestamp_log_blob': self._gcs_timestamp_log_blob_name(),
                 'timestamp_log_interval_samples': int(self.gcs_timestamp_log_interval),
-                'notes': 'Load with numpy.load(). Structured array field `values` contains channel amplitudes; `quality_packed` stores one 4-bit quality code per selected channel. timestamp_log provides periodic sample-accurate UTC synchronization checkpoints.',
+                'last_timestamp_checkpoint': self._last_timestamp_checkpoint,
+                'notes': (
+                    'Load with numpy.load(). Structured array field `values` contains channel amplitudes; '
+                    '`quality_packed` stores one 4-bit quality code per selected channel. Periodic '
+                    'sample-accurate UTC synchronization checkpoints are appended to `timestamp_log_blob` '
+                    '(JSON Lines, one {gcs_sample_idx, sample_timestamp_s, system_time_s} object per line) '
+                    'rather than stored inline here.'
+                ),
             }
             if self._previous_blob_name:
                 metadata['previous_blob'] = self._previous_blob_name
