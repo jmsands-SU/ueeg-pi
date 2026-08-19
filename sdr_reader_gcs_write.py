@@ -238,6 +238,17 @@ class TimeStampBasedReader:
         # excursion, so a lone stall/catch-up pair averages out.
         self.sdr_restart_rate_consecutive_windows = 2
 
+        # Packet-alignment watchdog: interference that shifts bit/frame alignment
+        # can garble decoded values while packets keep arriving at the expected
+        # rate — sometimes with v1/v2 still agreeing on the (wrong) decode — so
+        # neither the drop-rate check above (quality==0 only) nor the throughput
+        # check catches it. packet_sequence_anomaly_count/packet_sequence_header_drops
+        # (see _extract_channel_packets) already detect this directly via observed
+        # vs. expected packet numbering; this tracks their rate per watchdog window
+        # and restarts on sustained misalignment rather than letting it run for hours.
+        self.sdr_restart_anomaly_rate_threshold = 0.02  # fraction of expected samples/window
+        self.sdr_restart_anomaly_consecutive_windows = 3
+
         self._last_decoded_sample_time = None      # wall-clock time of most recent quality append
         self._last_chunk_end_word_timestamp = None  # wall-clock end of last consumed chunk
         self._current_chunk_first_word_timestamp = None  # wall-clock start of chunk being extracted
@@ -1205,6 +1216,12 @@ class TimeStampBasedReader:
         t_before = time.time()
         rate_high_strikes = 0  # consecutive windows above the upper rate limit
         rate_low_strikes = 0   # consecutive windows below the lower rate limit
+        anomaly_strikes = 0    # consecutive windows above the packet-alignment anomaly rate
+        anomaly_count_before = self.packet_sequence_anomaly_count + self.packet_sequence_header_drops
+        sec_anomaly_count_before = (
+            self.secondary_reader.packet_sequence_anomaly_count + self.secondary_reader.packet_sequence_header_drops
+            if self.secondary_reader is not None else 0
+        )
 
         while self.running:
             for _ in range(int(self.sdr_watchdog_window_seconds * 4)):
@@ -1307,6 +1324,57 @@ class TimeStampBasedReader:
                 # In band: a lone excursion was just a stall/catch-up pair averaging out.
                 rate_high_strikes = 0
                 rate_low_strikes = 0
+
+            # Packet-alignment watchdog: sustained interference can shift frame/bit
+            # alignment enough that both v1/v2 copies decode the same garbled value
+            # (still "matched" quality) while throughput stays ~nominal — invisible
+            # to the drop-rate and rate checks above, but visible directly as a spike
+            # in observed-vs-expected packet numbering (see _extract_channel_packets).
+            expected_samples_per_window = self.sdr_watchdog_window_seconds * self.output_rate_hz
+            anomaly_count_after = self.packet_sequence_anomaly_count + self.packet_sequence_header_drops
+            anomaly_delta = anomaly_count_after - anomaly_count_before
+            anomaly_count_before = anomaly_count_after
+            anomaly_rate = anomaly_delta / expected_samples_per_window if expected_samples_per_window > 0 else 0.0
+
+            if anomaly_delta > 0:
+                print(f'[{ts}] Watchdog cycle {cycle}: packet-alignment anomalies this window={anomaly_delta} '
+                      f'({anomaly_rate*100:.2f}% of expected samples, threshold='
+                      f'{self.sdr_restart_anomaly_rate_threshold*100:.1f}%)')
+
+            if anomaly_rate > self.sdr_restart_anomaly_rate_threshold:
+                sec_anomaly_rate = None
+                if self.secondary_reader is not None:
+                    sec_anomaly_count_after = (
+                        self.secondary_reader.packet_sequence_anomaly_count
+                        + self.secondary_reader.packet_sequence_header_drops
+                    )
+                    sec_anomaly_delta = sec_anomaly_count_after - sec_anomaly_count_before
+                    sec_anomaly_count_before = sec_anomaly_count_after
+                    sec_anomaly_rate = sec_anomaly_delta / expected_samples_per_window if expected_samples_per_window > 0 else 0.0
+                    if sec_anomaly_rate <= self.sdr_restart_anomaly_rate_threshold:
+                        print(
+                            f'⚠️  Watchdog: primary packet-alignment anomaly rate {anomaly_rate*100:.2f}% is high but '
+                            f'secondary is healthy ({sec_anomaly_rate*100:.2f}%) — not exiting.'
+                        )
+                        anomaly_strikes = 0
+                        continue
+
+                anomaly_strikes += 1
+                if anomaly_strikes >= max(1, int(self.sdr_restart_anomaly_consecutive_windows)):
+                    print(
+                        f'⚠️  Watchdog: packet-alignment anomaly rate {anomaly_rate*100:.2f}% > '
+                        f'{self.sdr_restart_anomaly_rate_threshold*100:.1f}% threshold for {anomaly_strikes} '
+                        f'consecutive windows — exiting for monitor-driven restart.'
+                    )
+                    self.running = False
+                    continue
+                print(
+                    f'⚠️  Watchdog: packet-alignment anomaly rate {anomaly_rate*100:.2f}% exceeds threshold — '
+                    f'transient (strike {anomaly_strikes}/{self.sdr_restart_anomaly_consecutive_windows}), '
+                    f'confirming next window before restart.'
+                )
+            else:
+                anomaly_strikes = 0
 
     def setup_device(self):
         if _bladerf is None:
