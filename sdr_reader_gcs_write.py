@@ -276,6 +276,10 @@ class TimeStampBasedReader:
         self.channel2 = None
 
         self.data_queue = queue.Queue(maxsize=64)
+        # Count of raw SDR chunks silently dropped because data_queue was full
+        # (rx_thread outrunning processing_thread) — see rx_thread's queue.Full
+        # handling. Each drop is real, permanent loss of that chunk's samples.
+        self.data_queue_full_drops = 0
         self.decoded_group_maxlen = int(decoded_group_maxlen)
         self.decoded_groups_by_channel = {
             ch: deque(maxlen=self.decoded_group_maxlen) for ch in range(1, 5)
@@ -890,11 +894,19 @@ class TimeStampBasedReader:
 
         # 4. Use GCS Compose to append the new chunk to the main blob
         main_blob = self.gcs_bucket_obj.blob(self.gcs_blob_name)
+        # Check if the main blob exists to decide whether to compose or rename.
+        # Reload (not just exists()) so .size below reflects the blob as of right
+        # before we mutate it — needed to verify the mutation afterward if the
+        # client-side call raises (see except block).
+        is_first_chunk = not main_blob.exists()
+        pre_size = 0
+        if not is_first_chunk:
+            main_blob.reload()
+            pre_size = main_blob.size
+        expected_size_after = pre_size + len(new_bytes)
 
         try:
-            # Check if the main blob exists to decide whether to compose or rename
-            # This is a lightweight metadata call
-            if main_blob.exists():
+            if not is_first_chunk:
                 # Append temp_blob to the end of main_blob
                 main_blob.compose([main_blob, temp_blob])
             else:
@@ -927,14 +939,34 @@ class TimeStampBasedReader:
                     print(f'Warning: could not read GCS server timestamp for recording start: {exc}')
         except Exception as exc:
             print(f'GCS compose/append error: {exc}')
-            # Try to clean up the orphaned temp blob, then requeue
+            # This exception is ambiguous: GCS may have already applied the mutation
+            # server-side even though the client never saw the success response (e.g.
+            # a connection reset right after the request landed). Blindly requeuing
+            # buffer_snapshot here would duplicate this exact chunk on the next flush
+            # if that happened, so verify the blob's actual size before deciding
+            # whether it's actually safe to retry.
+            landed = False
             try:
-                temp_blob.delete()
+                check_blob = self.gcs_bucket_obj.blob(self.gcs_blob_name)
+                check_blob.reload()
+                landed = check_blob.size == expected_size_after
             except Exception:
-                pass
-            with self._gcs_buffer_lock:
-                self.gcs_write_buffer = buffer_snapshot + self.gcs_write_buffer
-            return
+                pass  # can't verify (e.g. blob doesn't exist yet) — fall through to safe requeue
+            if landed:
+                print('  GCS mutation actually landed despite the error — treating as success, not requeuing.')
+                main_blob = check_blob
+                if is_first_chunk:
+                    temp_blob = None  # rename landed server-side; source is gone
+            else:
+                # Try to clean up the orphaned temp blob, then requeue
+                try:
+                    if temp_blob is not None:
+                        temp_blob.delete()
+                except Exception:
+                    pass
+                with self._gcs_buffer_lock:
+                    self.gcs_write_buffer = buffer_snapshot + self.gcs_write_buffer
+                return
 
         # 5. Clean up the temporary chunk blob (only needed after compose, not after rename)
         if temp_blob is not None:
@@ -1562,7 +1594,11 @@ class TimeStampBasedReader:
                     # Pass data with timestamp of first word
                     self.data_queue.put((output_data, first_word_timestamp), timeout=0.2)
                 except queue.Full:
-                    pass
+                    self.data_queue_full_drops += 1
+                    print(
+                        f'⚠️  data_queue full — dropped raw chunk ({len(output_data)} words), '
+                        f'total drops={self.data_queue_full_drops}'
+                    )
 
                 # Dual-antenna: extract the other RX0 stream (opposite I/Q) and feed
                 # the secondary reader's queue so it decodes in parallel.
@@ -1576,7 +1612,11 @@ class TimeStampBasedReader:
                         # print("appending to second queue",sec_data.shape,sec_data[:10])
                         self.secondary_reader.data_queue.put_nowait((sec_data, sec_first_ts))
                     except queue.Full:
-                        pass
+                        self.secondary_reader.data_queue_full_drops += 1
+                        print(
+                            f'⚠️  secondary data_queue full — dropped raw chunk ({len(sec_data)} words), '
+                            f'total drops={self.secondary_reader.data_queue_full_drops}'
+                        )
 
         except Exception as exc:
             print(f'RX thread error: {exc}')
@@ -1585,11 +1625,15 @@ class TimeStampBasedReader:
             self.channel2.enable = False
             try:
                 self.data_queue.put(None, timeout=0.2)
+            except queue.Full:
+                print('⚠️  data_queue full — stop signal (None) could not be delivered within timeout')
             except Exception:
                 pass
             if self.secondary_reader is not None:
                 try:
                     self.secondary_reader.data_queue.put(None, timeout=0.2)
+                except queue.Full:
+                    print('⚠️  secondary data_queue full — stop signal (None) could not be delivered within timeout')
                 except Exception:
                     pass
 
@@ -2823,6 +2867,7 @@ class TimeStampBasedReader:
         print(f'  Placeholder inserts (cross): {self.placeholder_inserts_cross_chunk:6d}')
         print(f'  Placeholder inserts (intra): {self.placeholder_inserts_intra_chunk:6d}')
         print(f'  Placeholder inserts (group): {self.placeholder_inserts_group_builder:6d}')
+        print(f'  RX queue full drops:         {self.data_queue_full_drops:6d}')
         print(
             f'  Gap estimate agree/disagree: {self.gap_estimate_agree_count:6d}/{self.gap_estimate_disagree_count:6d}'
         )
