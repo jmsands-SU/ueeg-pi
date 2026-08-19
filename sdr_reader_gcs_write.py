@@ -181,6 +181,17 @@ class TimeStampBasedReader:
         self._gcs_recording_start_time = None
         self._gcs_recording_start_time_created = None  # GCS server clock at first-chunk write (see _write_gcs_metadata)
         self._gcs_buffer_lock = threading.RLock()
+        # Serializes the entire body of _flush_gcs_buffer (not just the buffer
+        # snapshot swap) so the async uploader thread and any synchronous
+        # force=True caller (stop/trigger/watchdog/shutdown paths) can never run
+        # a GCS compose() concurrently, which could otherwise append chunks out
+        # of order or race on the blob's generation.
+        self._gcs_flush_lock = threading.Lock()
+        # Wakes the uploader thread when _append_gcs_group has buffered enough
+        # rows to flush. Flushing off this event (rather than calling
+        # _flush_gcs_buffer inline) keeps GCS network latency off the decode/RX
+        # hot path — see _gcs_uploader_thread_func.
+        self._gcs_flush_event = threading.Event()
         self.gcs_temp_name = f"{self.gcs_blob_name}.temp" if self.gcs_blob_name else None
         self.gcs_samples_written = 0
         # Per-channel last-good value for NaN carry-forward (shape (4,) per channel)
@@ -242,12 +253,14 @@ class TimeStampBasedReader:
         # can garble decoded values while packets keep arriving at the expected
         # rate — sometimes with v1/v2 still agreeing on the (wrong) decode — so
         # neither the drop-rate check above (quality==0 only) nor the throughput
-        # check catches it. packet_sequence_anomaly_count/packet_sequence_header_drops
-        # (see _extract_channel_packets) already detect this directly via observed
-        # vs. expected packet numbering; this tracks their rate per watchdog window
-        # and restarts on sustained misalignment rather than letting it run for hours.
-        self.sdr_restart_anomaly_rate_threshold = 0.02  # fraction of expected samples/window
-        self.sdr_restart_anomaly_consecutive_windows = 3
+        # check catches it. This tracks the rate of placeholder frames inserted
+        # (placeholder_inserts_cross_chunk + _intra_chunk + _group_builder — see
+        # _extract_channel_packets/_decode_packet_groups) per watchdog window and
+        # restarts on sustained misalignment rather than letting it run for hours.
+        # Threshold/window count are a first-pass estimate (not yet validated
+        # against a known-bad recording) — tune once real cases are observed.
+        self.sdr_restart_anomaly_rate_threshold = 0.01  # fraction of expected frames/window
+        self.sdr_restart_anomaly_consecutive_windows = 5
 
         self._last_decoded_sample_time = None      # wall-clock time of most recent quality append
         self._last_chunk_end_word_timestamp = None  # wall-clock end of last consumed chunk
@@ -794,6 +807,28 @@ class TimeStampBasedReader:
             self._last_timestamp_checkpoint = new_checkpoint
             self._append_gcs_timestamp_checkpoint(new_checkpoint)
         if should_flush:
+            # Hand off to the uploader thread instead of flushing inline — GCS
+            # network latency here would otherwise stall this decode thread,
+            # back up self.data_queue, and cause rx_thread to silently drop raw
+            # SDR chunks (see queue.Full handling in rx_thread).
+            self._gcs_flush_event.set()
+
+    def _gcs_uploader_thread_func(self):
+        """Performs GCS flushes off the decode/RX hot path.
+
+        Woken by _gcs_flush_event whenever _append_gcs_group has buffered enough
+        rows; also polls periodically so a flush that arrived just before the
+        buffer threshold was reached isn't stuck waiting indefinitely for the
+        next group. force=True flushes (stop/trigger/watchdog/shutdown) still
+        call _flush_gcs_buffer directly from whichever thread triggers them —
+        _gcs_flush_lock (acquired inside _flush_gcs_buffer) keeps those from
+        ever overlapping with this thread's in-flight flush.
+        """
+        while self.running:
+            self._gcs_flush_event.wait(timeout=0.5)
+            self._gcs_flush_event.clear()
+            if not self.enable_gcs:
+                continue
             self._flush_gcs_buffer(force=False)
 
     def _flush_gcs_buffer(self, force=False):
@@ -802,6 +837,10 @@ class TimeStampBasedReader:
         if not self.gcs_blob_name or not self.gcs_temp_name:
             return
 
+        with self._gcs_flush_lock:
+            self._flush_gcs_buffer_locked(force=force)
+
+    def _flush_gcs_buffer_locked(self, force=False):
         with self._gcs_buffer_lock:
             if len(self.gcs_write_buffer) == 0:
                 return
@@ -1216,10 +1255,18 @@ class TimeStampBasedReader:
         t_before = time.time()
         rate_high_strikes = 0  # consecutive windows above the upper rate limit
         rate_low_strikes = 0   # consecutive windows below the lower rate limit
-        anomaly_strikes = 0    # consecutive windows above the packet-alignment anomaly rate
-        anomaly_count_before = self.packet_sequence_anomaly_count + self.packet_sequence_header_drops
+        anomaly_strikes = 0    # consecutive windows above the placeholder-fill rate
+        anomaly_count_before = (
+            self.placeholder_inserts_cross_chunk
+            + self.placeholder_inserts_intra_chunk
+            + self.placeholder_inserts_group_builder
+        )
         sec_anomaly_count_before = (
-            self.secondary_reader.packet_sequence_anomaly_count + self.secondary_reader.packet_sequence_header_drops
+            (
+                self.secondary_reader.placeholder_inserts_cross_chunk
+                + self.secondary_reader.placeholder_inserts_intra_chunk
+                + self.secondary_reader.placeholder_inserts_group_builder
+            )
             if self.secondary_reader is not None else 0
         )
 
@@ -1328,32 +1375,43 @@ class TimeStampBasedReader:
             # Packet-alignment watchdog: sustained interference can shift frame/bit
             # alignment enough that both v1/v2 copies decode the same garbled value
             # (still "matched" quality) while throughput stays ~nominal — invisible
-            # to the drop-rate and rate checks above, but visible directly as a spike
-            # in observed-vs-expected packet numbering (see _extract_channel_packets).
-            expected_samples_per_window = self.sdr_watchdog_window_seconds * self.output_rate_hz
-            anomaly_count_after = self.packet_sequence_anomaly_count + self.packet_sequence_header_drops
+            # to the drop-rate and rate checks above. The complete, non-double-counted
+            # signal for this is total placeholder frames inserted (cross-chunk gap +
+            # intra-chunk fill + group-builder fill — see _extract_channel_packets /
+            # _decode_packet_groups): packet_sequence_anomaly_count only catches
+            # numbering *mismatches* and misses the far more common case where the
+            # distance-based gap estimator agrees with the (possibly-misaligned)
+            # packet number and just quietly fills placeholders every window.
+            frames_per_second = self.bit_clock_hz / float(np.mean(list(self.accepted_frame_lengths)))
+            expected_frames_per_window = self.sdr_watchdog_window_seconds * frames_per_second
+            anomaly_count_after = (
+                self.placeholder_inserts_cross_chunk
+                + self.placeholder_inserts_intra_chunk
+                + self.placeholder_inserts_group_builder
+            )
             anomaly_delta = anomaly_count_after - anomaly_count_before
             anomaly_count_before = anomaly_count_after
-            anomaly_rate = anomaly_delta / expected_samples_per_window if expected_samples_per_window > 0 else 0.0
+            anomaly_rate = anomaly_delta / expected_frames_per_window if expected_frames_per_window > 0 else 0.0
 
             if anomaly_delta > 0:
-                print(f'[{ts}] Watchdog cycle {cycle}: packet-alignment anomalies this window={anomaly_delta} '
-                      f'({anomaly_rate*100:.2f}% of expected samples, threshold='
+                print(f'[{ts}] Watchdog cycle {cycle}: placeholder frames inserted this window={anomaly_delta} '
+                      f'({anomaly_rate*100:.2f}% of expected frames, threshold='
                       f'{self.sdr_restart_anomaly_rate_threshold*100:.1f}%)')
 
             if anomaly_rate > self.sdr_restart_anomaly_rate_threshold:
                 sec_anomaly_rate = None
                 if self.secondary_reader is not None:
                     sec_anomaly_count_after = (
-                        self.secondary_reader.packet_sequence_anomaly_count
-                        + self.secondary_reader.packet_sequence_header_drops
+                        self.secondary_reader.placeholder_inserts_cross_chunk
+                        + self.secondary_reader.placeholder_inserts_intra_chunk
+                        + self.secondary_reader.placeholder_inserts_group_builder
                     )
                     sec_anomaly_delta = sec_anomaly_count_after - sec_anomaly_count_before
                     sec_anomaly_count_before = sec_anomaly_count_after
-                    sec_anomaly_rate = sec_anomaly_delta / expected_samples_per_window if expected_samples_per_window > 0 else 0.0
+                    sec_anomaly_rate = sec_anomaly_delta / expected_frames_per_window if expected_frames_per_window > 0 else 0.0
                     if sec_anomaly_rate <= self.sdr_restart_anomaly_rate_threshold:
                         print(
-                            f'⚠️  Watchdog: primary packet-alignment anomaly rate {anomaly_rate*100:.2f}% is high but '
+                            f'⚠️  Watchdog: primary placeholder-fill rate {anomaly_rate*100:.2f}% is high but '
                             f'secondary is healthy ({sec_anomaly_rate*100:.2f}%) — not exiting.'
                         )
                         anomaly_strikes = 0
@@ -1362,14 +1420,14 @@ class TimeStampBasedReader:
                 anomaly_strikes += 1
                 if anomaly_strikes >= max(1, int(self.sdr_restart_anomaly_consecutive_windows)):
                     print(
-                        f'⚠️  Watchdog: packet-alignment anomaly rate {anomaly_rate*100:.2f}% > '
+                        f'⚠️  Watchdog: placeholder-fill rate {anomaly_rate*100:.2f}% > '
                         f'{self.sdr_restart_anomaly_rate_threshold*100:.1f}% threshold for {anomaly_strikes} '
                         f'consecutive windows — exiting for monitor-driven restart.'
                     )
                     self.running = False
                     continue
                 print(
-                    f'⚠️  Watchdog: packet-alignment anomaly rate {anomaly_rate*100:.2f}% exceeds threshold — '
+                    f'⚠️  Watchdog: placeholder-fill rate {anomaly_rate*100:.2f}% exceeds threshold — '
                     f'transient (strike {anomaly_strikes}/{self.sdr_restart_anomaly_consecutive_windows}), '
                     f'confirming next window before restart.'
                 )
@@ -3129,6 +3187,9 @@ class TimeStampBasedReader:
         proc_t = threading.Thread(target=self.processing_thread, daemon=True)
         self._proc_thread_ref = proc_t
         watchdog_t = threading.Thread(target=self._watchdog_thread_func, daemon=True)
+        # Runs GCS uploads off the decode thread so network latency can't stall
+        # rx_thread/processing_thread — see _gcs_uploader_thread_func.
+        gcs_uploader_t = threading.Thread(target=self._gcs_uploader_thread_func, daemon=True)
         trig_t = None
 
         if self.enable_gcs and self.enable_gcs_trigger:
@@ -3138,18 +3199,25 @@ class TimeStampBasedReader:
         # Trigger start/stop is forwarded from the primary reader's _handle_gcs_trigger_message,
         # so no separate trigger poller is needed for the secondary.
         sec_proc_t = None
+        sec_gcs_uploader_t = None
         if self.secondary_reader is not None:
             self.secondary_reader.running = True
             sec_proc_t = threading.Thread(target=self.secondary_reader.processing_thread, daemon=True)
             self._secondary_proc_thread = sec_proc_t
+            sec_gcs_uploader_t = threading.Thread(
+                target=self.secondary_reader._gcs_uploader_thread_func, daemon=True
+            )
 
         rx_t.start()
         proc_t.start()
         watchdog_t.start()
+        gcs_uploader_t.start()
         if trig_t is not None:
             trig_t.start()
         if sec_proc_t is not None:
             sec_proc_t.start()
+        if sec_gcs_uploader_t is not None:
+            sec_gcs_uploader_t.start()
 
         print('Capture started (MATLAB-style timestamp/frame decoder active).')
         if self.secondary_reader is not None:
